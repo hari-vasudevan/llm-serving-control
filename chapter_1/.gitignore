@@ -37,9 +37,6 @@ work/
 # Crash dumps
 *.mdmp
 
-# MATLAB project internal metadata (regenerated on open)
-resources/
-
 # Build output
 build/
 bin/
