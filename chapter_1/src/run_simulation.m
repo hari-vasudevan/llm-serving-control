@@ -47,12 +47,12 @@ for k = 1:T-1
     % 1. Plant output at current state
     [~, L_mean(k), L_p95(k)] = llm_plant(q(k), B_act(k), lambda(k), perturbed);
 
-    % 2. Deviations from equilibrium
-    dq = q(k) - q0;
+    % 2. Error (Franklin 8.5.1: e = r - y = q0 - q)
+    ek = q0 - q(k);
 
-    % 3. Control law: ΔB = -K_q·Δq - K_i·xi
-    dB     = -K_q * dq  -  K_i * xi(k);
-    B_raw  = B0 + dB;
+    % 3. Control law: B = B0 + K_q*e + K_i*xi
+    dB    = K_q * ek  +  K_i * xi(k);
+    B_raw = B0 + dB;
 
     % 4. Actuator saturation
     B_act(k+1) = min(perturbed.B_max, max(perturbed.B_min, B_raw));
@@ -60,10 +60,11 @@ for k = 1:T-1
     % 5. Plant state update (nonlinear)
     q(k+1) = llm_plant(q(k), B_act(k+1), lambda(k), perturbed);
 
-    % 6. Integral state update with anti-windup
+    % 6. Integral state update with anti-windup  (Franklin 8.5.1)
+    %    ξ[k+1] = ξ[k] + e[k]  where e[k] = q0 - q[k]
     %    Only integrate when actuator is NOT saturated
     if B_act(k+1) == B_raw          % unsaturated — normal update
-        xi(k+1) = xi(k) + dq;
+        xi(k+1) = xi(k) + ek;       % Franklin: accumulate error e = q0 - q
     else                             % saturated — freeze integrator
         xi(k+1) = xi(k);
     end
@@ -78,7 +79,8 @@ end
 spike_idx = t >= 5  & t < 15;
 post_idx  = t >= 15;
 
-fprintf('=== Simulation Results  [%s] ===\n', upper(controller.method));
+method_str = 'POLE_PLACEMENT'; if controller.method_id == 1; method_str = 'LQR'; end
+fprintf('=== Simulation Results  [%s] ===\n', method_str);
 fprintf('  p95 latency:  mean = %.1f ms,   max = %.1f ms\n', ...
         mean(L_p95), max(L_p95));
 fprintf('  SLA soft violations  (L_p95 > %.0f ms): %.1f%%\n', ...
@@ -94,7 +96,7 @@ fprintf('  Post-spike    (t>15 s):    mean L_p95 = %.1f ms\n\n', ...
         mean(L_p95(post_idx)));
 
 % ── Plot ──────────────────────────────────────────────────────────────────────
-fig = figure('Name', sprintf('LLM Serving — %s', upper(controller.method)), ...
+fig = figure('Name', sprintf('LLM Serving -- %s', method_str), ...
              'Position', [100 80 1000 850]);
 
 % Row 1: arrival rate
@@ -143,10 +145,10 @@ grid on; xlim([0 t(end)]);
 linkaxes([ax1 ax2 ax3 ax4], 'x');
 
 sgtitle(sprintf('LLM Inference Serving — Integral State-Feedback Regulator  [%s]', ...
-                upper(controller.method)), 'FontSize', 12, 'FontWeight', 'bold');
+                method_str), 'FontSize', 12, 'FontWeight', 'bold');
 
 out_path = fullfile('/Users/hvasudevan/Documents/MATLAB/llm_control_v2', ...
-                    sprintf('results_%s.png', controller.method));
+                    sprintf('results_%s.png', lower(method_str)));
 saveas(fig, out_path);
 fprintf('  Figure saved: %s\n', out_path);
 
