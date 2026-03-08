@@ -1,79 +1,74 @@
-%% setup_plant.m
-% Entry point. Defines plant parameters in 'perturbed', computes the
-% equilibrium (B0, q0), designs the controller, then runs the simulation.
+%% setup_plant.m  — chapter 2
 %
-% Change 'method' below to switch between 'lqr' and 'pole_placement'.
+%  entry point.  defines plant parameters in 'perturbed', then calls
+%  design_controller.m to produce the 'controller' struct used by simulink.
+%
+%  controller architecture:
+%    direct loop  b[k] -> l_p95[k]
+%    augmented state: x = [dq ; xi]  where xi integrates latency error
+%
+%  change 'method' to switch between 'lqr' and 'pole_placement'.
 
 clear; clc;
 addpath(fileparts(mfilename('fullpath')));
 
-% -- 1. Plant parameters ------------------------------------------------------
-perturbed.alpha = 10;    % ms  -- linear service-time coefficient
-perturbed.gamma = 0.8;   % ms  -- quadratic service-time coefficient
-perturbed.beta  = 2;     % ms  -- queuing latency per waiting request
-perturbed.delta = 15;    % ms  -- p95 spread coefficient
-
-perturbed.dt    = 0.1;   % s   -- scheduling tick (discrete sample time)
-perturbed.B_min = 1;     % --  -- batch size lower bound (saturation)
-perturbed.B_max = 32;    % --  -- batch size upper bound (VRAM constraint)
-perturbed.q_max = 30;
-perturbed.L_p95_target = 150;  % ms -- warm-start value for rolling buffer
-
-% -- 2. Operating conditions --------------------------------------------------
-perturbed.lambda_mean  = 8;    % req/tick -- mean arrival rate at equilibrium
-perturbed.L_p95_target = 150;  % ms       -- SLA target (determines q0)
-
-% -- 3. Equilibrium (B0, q0) --------------------------------------------------
+% ── plant parameters ───────────────────────────────────────────────────────
 %
-% Condition 1 -- queue balance at steady state:
-%   q[k+1] = q[k]  ->  lambda - B0 = 0  ->  B0 = lambda_mean
+%   latency model:  l_p95 = alpha*b + gamma*b^2 + beta*q + 1.645*delta/sqrt(b)
 %
-% Condition 2 -- SLA met at equilibrium:
-%   L_p95(B0, q0) = L_p95_target  ->  solve for q0:
+%   alpha   : linear service-time coefficient         [ms per req in batch]
+%   gamma   : quadratic service-time coefficient      [ms per req^2]
+%   beta    : queue-to-latency sensitivity            [ms per waiting req]
+%   delta   : p95 spread coefficient                  [ms * sqrt(req)]
+%             (noise term is (delta/sqrt(b))*randn per tick,
+%              so p95 offset above mean = 1.645*delta/sqrt(b))
+
+perturbed.alpha  = 10;    % ms
+perturbed.gamma  = 0.8;   % ms
+perturbed.beta   = 2;     % ms/req
+perturbed.delta  = 15;    % ms*sqrt(req)
+
+perturbed.dt     = 0.1;   % s  — scheduling tick
+perturbed.B_min  = 1;     % req/tick — minimum allowed batch size
+perturbed.B_max  = 32;    % req/tick — maximum allowed batch size (vram limit)
+perturbed.q_max  = 30;    % req      — integrator saturation bound
+
+% ── operating conditions ───────────────────────────────────────────────────
+perturbed.lambda_mean  = 8;    % req/tick — mean arrival rate
+perturbed.L_p95_target = 150;  % ms       — sla target for l_p95
+
+% ── lqr weights ────────────────────────────────────────────────────────────
 %
-%   q0 = ( L_p95_target - alpha*B0 - gamma*B0^2 - 1.645*delta/sqrt(B0) ) / beta
+%   q penalises state cost, r penalises control effort.
+%
+%   lqr_q  : cost on dq  (queue deviation)
+%              larger => controller reacts faster to queue changes,
+%              more aggressive b swings
+%
+%   lqr_xi : cost on xi  (latency integrator state)
+%              larger => faster integral wind-up removal
+%
+%   lqr_r  : cost on db  (batch size change)
+%              larger => smoother b, slower latency correction
+%              increasing r is the practical way to detune away from
+%              the nmp zero without explicit bandwidth constraints
 
-perturbed.B0 = perturbed.lambda_mean;
+perturbed.lqr_q  = 1;     % cost on dq
+perturbed.lqr_xi = 0.1;   % cost on xi
+perturbed.lqr_r  = 50;    % cost on db  (high => slow, safe w.r.t. nmp)
 
-perturbed.q0 = ( perturbed.L_p95_target ...
-               - perturbed.alpha * perturbed.B0 ...
-               - perturbed.gamma * perturbed.B0^2 ...
-               - 1.645 * perturbed.delta / sqrt(perturbed.B0) ) ...
-               / perturbed.beta;
+% ── pole placement parameters ─────────────────────────────────────────────
+%
+%   nmp zero at z = 1.088  =>  tau_nmp ~ 1.2s
+%   practical guideline: tau >= 1.0s to keep undershoot below ~2ms.
+%   poles faster than tau_nmp are stable but produce larger undershoot.
 
-% Sanity check -- evaluate nonlinear plant at equilibrium
-[~, L_mean_eq, L_p95_eq] = llm_plant(perturbed.q0, perturbed.B0, ...
-                                       perturbed.lambda_mean, perturbed);
-fprintf('=== Equilibrium ===\n');
-fprintf('  B0     = %.4f  req/tick\n', perturbed.B0);
-fprintf('  q0     = %.4f  requests\n', perturbed.q0);
-fprintf('  L_mean = %.2f  ms\n', L_mean_eq);
-fprintf('  L_p95  = %.2f  ms  (target = %.0f ms)\n\n', L_p95_eq, perturbed.L_p95_target);
+perturbed.pp_tau1 = 2.0;   % s — dominant closed-loop time constant
+perturbed.pp_tau2 = 4.0;   % s — second pole (slower, supports integrator)
 
-% -- 4. Design controller -----------------------------------------------------
-%   Change method here:  'lqr'  or  'pole_placement'
+% ── method selection ───────────────────────────────────────────────────────
 method = 'lqr';
-method = 'pole_placement';
+% method = 'pole_placement';
 
-% Pole placement parameters (only used when method = 'pole_placement')
-%
-%   pp_f = 0  (non-oscillatory): set pp_tau1 and pp_tau2 independently
-%     -> z_i = exp(-dt / tau_i)
-%     -> pp_tau1 = pp_tau2 gives a repeated real pole (critically damped)
-%
-%   pp_f > 0  (oscillatory): set pp_tau (envelope) and pp_f (ring freq)
-%     -> s = -1/pp_tau +/- j*2*pi*pp_f,  z = exp(s*dt)
-%
-% Examples:
-%   tau1=0.5, tau2=1.0, f=0   -> two real poles at z=0.607 and z=0.905
-%   tau1=0.5, tau2=0.5, f=0   -> repeated real pole at z=0.607
-%   tau=1.0,  f=0.5           -> oscillatory at 0.5 Hz, 1 s envelope
-perturbed.pp_tau1 = 0.25;   % s  -- time constant of pole 1 (non-oscillatory)
-perturbed.pp_tau2 = 0.5;   % s  -- time constant of pole 2 (non-oscillatory)
-perturbed.pp_tau  = 1.0/3;   % s  -- envelope time constant  (oscillatory)
-perturbed.pp_f    = 0;     % Hz -- damped frequency (0 = non-oscillatory)
-
+% ── design controller ──────────────────────────────────────────────────────
 controller = design_controller(perturbed, method);
-
-% -- 5. Run closed-loop simulation --------------------------------------------
-% run_simulation(perturbed, controller);
