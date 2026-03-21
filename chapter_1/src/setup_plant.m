@@ -16,7 +16,7 @@ perturbed.delta = 15;    % ms  -- p95 spread coefficient
 perturbed.dt    = 0.1;   % s   -- scheduling tick (discrete sample time)
 perturbed.B_min = 1;     % --  -- batch size lower bound (saturation)
 perturbed.B_max = 32;    % --  -- batch size upper bound (VRAM constraint)
-perturbed.q_max = 100;
+perturbed.q_max = 30;
 
 % -- 2. Operating conditions --------------------------------------------------
 perturbed.lambda_mean  = 8;    % req/tick -- mean arrival rate at equilibrium
@@ -52,6 +52,7 @@ fprintf('  L_p95  = %.2f  ms  (target = %.0f ms)\n\n', L_p95_eq, perturbed.L_p95
 % -- 4. Design controller -----------------------------------------------------
 %   Change method here:  'lqr'  or  'pole_placement'
 method = 'lqr';
+method = 'pole_placement';
 
 % Pole placement parameters (only used when method = 'pole_placement')
 %
@@ -66,12 +67,12 @@ method = 'lqr';
 %   tau1=0.5, tau2=1.0, f=0   -> two real poles at z=0.607 and z=0.905
 %   tau1=0.5, tau2=0.5, f=0   -> repeated real pole at z=0.607
 %   tau=1.0,  f=0.5           -> oscillatory at 0.5 Hz, 1 s envelope
-perturbed.pp_tau1 = 0.5;   % s  -- time constant of pole 1 (non-oscillatory)
-perturbed.pp_tau2 = 1.0;   % s  -- time constant of pole 2 (non-oscillatory)
-perturbed.pp_tau  = 1.0;   % s  -- envelope time constant  (oscillatory)
+perturbed.pp_tau1 = 0.25;   % s  -- time constant of pole 1 (non-oscillatory)
+perturbed.pp_tau2 = 0.5;   % s  -- time constant of pole 2 (non-oscillatory)
+perturbed.pp_tau  = 1.0/3;   % s  -- envelope time constant  (oscillatory)
 perturbed.pp_f    = 0;     % Hz -- damped frequency (0 = non-oscillatory)
 
 controller = design_controller(perturbed, method);
 
 % -- 5. Run closed-loop simulation --------------------------------------------
-run_simulation(perturbed, controller);
+% run_simulation(perturbed, controller);
