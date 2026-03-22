@@ -201,13 +201,13 @@ for bi = 1:n_b
         futures = cell(b, 1);
         for i = 1:b
             prompt = cfg.prompts{mod(i-1, numel(cfg.prompts))+1};
-            futures{i} = parfeval(@vllm_e2e, 1, ...
-                cfg.gen_url, cfg.model, prompt, cfg.e2e_tokens, cfg.timeout);
+            futures{i} = parfeval(@vllm_ttft, 1, ...
+                cfg.gen_url, cfg.model, prompt, cfg.num_predict, cfg.timeout);
         end
 
-        % Read queue depth immediately after submitting (before collecting)
-        % This gives the num_requests_waiting at peak load
-        pause(0.1);   % 100ms: e2e requests are ~400ms so queue is visible here
+        % Read queue depth -- TTFT requests complete quickly so q stays 0 here.
+        % This is expected and correct for Stage 2 (q=0 B-sweep).
+        pause(0.05);
         try
             raw = webread(cfg.metrics_url, weboptions('Timeout',3,'ContentType','text'));
             m   = parse_vllm_metrics(raw);
@@ -306,9 +306,10 @@ for tick = 1:(cfg.build_ticks + cfg.n_queue_meas)
             cfg.gen_url, cfg.model, prompt, cfg.e2e_tokens, cfg.timeout);
     end
 
-    % Read queue depth 100ms after submitting.
-    % End-to-end requests take ~400ms so the queue is still full at 100ms.
-    pause(0.1);
+    % Read queue depth 600ms after submitting.
+    % parfeval workers take ~455ms to all send HTTP requests, so the queue
+    % only becomes visible at ~650ms. 600ms gives reliable q readings.
+    pause(0.6);
     q_meas = 0;
     try
         raw = webread(cfg.metrics_url, weboptions('Timeout',3,'ContentType','text'));
@@ -401,7 +402,7 @@ for li = 1:n_lam
             futures{i} = parfeval(@vllm_e2e, 1, ...
                 cfg.gen_url, cfg.model, prompt, cfg.e2e_tokens, cfg.timeout);
         end
-        pause(0.1);   % 100ms: e2e requests are ~400ms so queue is visible here
+        pause(0.6);   % 600ms: parfeval workers need ~455ms to all submit requests
         q_meas4 = 0;
         try
             raw = webread(cfg.metrics_url,weboptions('Timeout',3,'ContentType','text'));
