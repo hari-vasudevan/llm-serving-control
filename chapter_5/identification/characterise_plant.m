@@ -61,13 +61,13 @@ cfg.n_reps      = 5;
 % Stage 3: sustained load to identify beta
 cfg.s3_rate     = 16;        % req/s fed to vLLM (> max_num_seqs*2 = 8)
 cfg.s3_workers  = 16;        % Python threads
-cfg.build_ticks = 20;        % ticks with load before measuring
-cfg.meas_ticks3 = 15;
+cfg.build_ticks = 12;        % ticks with load before measuring
+cfg.meas_ticks3 = 8;
 
 % Stage 4: envelope
 cfg.lambda_sweep = [2 4 6 8 12 16];  % req/s for Python load generator
-cfg.settle_ticks = 15;
-cfg.meas_ticks4  = 10;
+cfg.settle_ticks = 10;
+cfg.meas_ticks4  = 8;
 
 cfg.prompts = {'What is 2+2?'; 'Name a colour.'; 'Capital of France?'; 'Days in a week?'; 'Name a planet.'};
 
@@ -409,32 +409,25 @@ function l_ms = get_ttft_mean_ms(m)
 end
 
 function drain_queue(metrics_url)
-% Block until vLLM reports both running=0 AND waiting=0.
-% Polls every 0.5s, times out after 60s with a warning.
-    fprintf('  [drain] Waiting for queue to empty...');
-    t0 = tic;
-    while toc(t0) < 60
-        try
-            raw = webread(metrics_url, weboptions('Timeout',3,'ContentType','text'));
-            running = 0; waiting = 0;
-            for line = strsplit(raw, newline)
-                s = strtrim(line{1});
-                if isempty(s)||s(1)=='#'; continue; end
-                c = strtrim(regexprep(s,'\{[^}]*\}',''));
-                p = regexp(c,'\s+','split');
-                if numel(p)<2; continue; end
-                v = str2double(p{2}); if isnan(v); continue; end
-                if contains(p{1},'num_requests_running'); running=running+v; end
-                if contains(p{1},'num_requests_waiting'); waiting=waiting+v; end
-            end
-            if running == 0 && waiting == 0
-                fprintf(' done (%.0fs)  running=%g  waiting=%g\n', toc(t0), running, waiting);
-                return
-            end
-        catch; end
-        pause(0.5);
+% Wait for vLLM queue to drain after stopping the load generator.
+% With max_num_seqs=4 and ~265ms/request, any queue drains in well
+% under 10 seconds. We use a fixed pause rather than polling to avoid
+% getting stuck on a stale gauge value.
+    fprintf('  [drain] Pausing 8s for queue to drain...');
+    pause(8);
+    try
+        raw  = webread(metrics_url, weboptions('Timeout',3,'ContentType','text'));
+        r    = regexp(strtrim(regexprep(raw,'\{[^}]*\}','')), ...
+                      'vllm:num_requests_waiting\s+([\d.]+)', 'tokens');
+        if ~isempty(r) && numel(r{1}) >= 1
+            q_left = str2double(r{1}{1});
+            fprintf(' q_remaining=%g\n', q_left);
+        else
+            fprintf(' done\n');
+        end
+    catch
+        fprintf(' done\n');
     end
-    fprintf(' TIMEOUT after 60s\n');
 end
 
 function stop_load_gen(pid_file)
