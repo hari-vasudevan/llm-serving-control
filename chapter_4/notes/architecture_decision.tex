@@ -1,0 +1,159 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{parskip}
+
+\title{Chapter 4 Architecture Decision Note\\
+       \large Why the Cascade Controller Was Replaced by a Single-State Integrator}
+\author{LLM Serving Control Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Background}
+
+Chapters 1--3 of this project applied classical cascade control to an LLM
+inference serving system.  The inner loop regulated queue depth~$q$ by
+adjusting batch size~$B$, and the outer loop regulated p95 latency~$\ell$
+by setting the queue setpoint~$q_{\mathrm{ref}}$.  The plant model assumed:
+
+\begin{equation}
+    \ell[k] = \alpha B[k] + \gamma B[k]^2 + \beta\, q[k]
+    \label{eq:model}
+\end{equation}
+
+with parameters $\alpha = 0.1$, $\gamma = 0.8$, $\beta = 2.0$ taken from a
+theoretical stochastic simulation.  The key structural assumption was that
+a persistent request queue~$q$ builds up and directly contributes to latency
+via the term~$\beta q$.
+
+\section{What We Found in Practice}
+
+When the cascade controller was connected to a real \texttt{qwen2.5:3b}
+model served by Ollama (Chapter~3), plant identification revealed two
+critical discrepancies.
+
+\subsection{The queue term is unidentifiable}
+
+The Stage~2 identification experiment ran sustained Poisson arrivals at
+$\lambda \in \{2, 3, 5, 7, 9\}$ requests per tick, with a drain rule
+$B[k] = \min(B_{\max},\, q[k] + a[k])$.  In every case the measured
+queue depth settled to $q \approx 0$ regardless of $\lambda$.
+
+The root cause is how Ollama processes requests internally.  Unlike a
+production serving engine such as vLLM---which maintains an explicit
+scheduler queue and can hold requests pending while others are
+processed---Ollama dispatches each HTTP request immediately to an available
+inference slot.  Requests that arrive when all slots are occupied are queued
+inside Ollama's internal HTTP stack, not in a user-visible counter.  From
+MATLAB's perspective, the drain rule always matched arrivals, so the
+software queue counter never accumulated.  The $\beta q$ term in
+equation~\eqref{eq:model} has no observable counterpart in the real system.
+
+\subsection{TTFT is a direct function of concurrency, not queue depth}
+
+The Stage~1 identification swept concurrent batch size $B \in \{1, \ldots, 12\}$
+by firing $B$ requests \emph{simultaneously} via \texttt{parfeval}.  The
+measured Time to First Token (TTFT) followed a clear nonlinear curve:
+
+\begin{equation}
+    \ell(B) = c_0 + c_1 B + c_2 B^2
+    \label{eq:fit}
+\end{equation}
+
+with fitted parameters:
+\begin{align*}
+    c_0 &= 97.16 \;\text{ms} \qquad \text{(idle prefill offset)} \\
+    c_1 &= 30.35 \;\text{ms/req} \qquad \text{(linear contention)} \\
+    c_2 &= -1.44 \;\text{ms/req}^2 \qquad \text{(saturation effect)}
+\end{align*}
+
+with $R^2 = 0.815$.  The negative $c_2$ reflects the fact that at high
+concurrency Ollama spreads load across multiple GPU inference slots
+(configured via \texttt{OLLAMA\_NUM\_PARALLEL=16}), partially counteracting
+the linear contention.
+
+The physical mechanism is GPU KV-cache memory bandwidth competition: when
+$B$ sequences are processed in parallel, each competes for bandwidth, raising
+TTFT.  This is a concurrency effect, not a queueing effect.
+
+\subsection{The assumed $\beta$ was wrong by 8$\times$}
+
+Linearising equation~\eqref{eq:fit} at the operating point $B_0 = 5$:
+
+\begin{equation}
+    \beta_{\mathrm{eff}} = \left.\frac{d\ell}{dB}\right|_{B_0}
+    = c_1 + 2c_2 B_0 = 30.35 - 2(1.44)(5) = 15.97 \;\text{ms/req}
+\end{equation}
+
+The assumed $\beta = 2.0\;\text{ms/req}$ was $8\times$ too small.  The
+outer-loop integral gain $K_{il} = (e^{-\Delta t/\tau} - 1)/\beta$ was
+therefore $8\times$ too aggressive, causing the outer integrator to
+over-correct on every tick.
+
+\section{Revised Architecture: Single-State Integral Controller}
+
+Since $q \approx 0$ always and the plant reduces to the static map
+$\ell \approx f(B)$, the cascade architecture adds no value.  The inner
+loop was regulating a state that does not exist in the real system.
+
+The revised Chapter~4 controller is a single-state discrete-time integrator:
+
+\begin{align}
+    e[k]      &= \ell_{\mathrm{target}} - \ell_{\mathrm{meas}}[k] \\
+    \xi[k+1]  &= \xi[k] + e[k] \label{eq:int}\\
+    B[k]      &= \mathrm{clamp}\!\left(B_0 - K_{il}\,\xi[k],\; B_{\min},\; B_{\max}\right)
+\end{align}
+
+The closed-loop characteristic equation is:
+
+\begin{equation}
+    z_{\mathrm{cl}} = 1 + \beta_{\mathrm{eff}}\, K_{il}
+\end{equation}
+
+Setting $z_{\mathrm{cl}} = e^{-\Delta t / \tau_{\mathrm{cl}}}$ with
+$\tau_{\mathrm{cl}} = 20\;\text{s}$ and $\Delta t = 1\;\text{s}$:
+
+\begin{equation}
+    K_{il} = \frac{e^{-\Delta t/\tau_{\mathrm{cl}}} - 1}{\beta_{\mathrm{eff}}}
+           = \frac{e^{-0.05} - 1}{15.97}
+           = -0.003054 \;\text{req/ms}
+\end{equation}
+
+The anti-windup limits on $\xi$ are derived from the actuator bounds:
+
+\begin{equation}
+    \xi \in \left[\frac{B_0 - B_{\max}}{K_{il}},\;
+                   \frac{B_0 - B_{\min}}{K_{il}}\right]
+         = [-1310,\; 2292]
+\end{equation}
+
+\section{Summary}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+& \textbf{Chapter 3 (cascade)} & \textbf{Chapter 4 (single-loop)} \\
+\midrule
+Plant model       & $\ell = \alpha B + \gamma B^2 + \beta q$ & $\ell = f(B)$ (identified) \\
+Controller states & $\xi_q$ (inner) + $\xi_l$ (outer)        & $\xi$ (one integrator) \\
+Actuator          & $q_{\mathrm{ref}} \to B$ via inner loop   & $B$ directly \\
+$\beta$ used      & 2.0 (assumed)                             & 15.97 (measured) \\
+$K_{il}$          & $-0.0164$ ($8\times$ too aggressive)      & $-0.003054$ (correct) \\
+Queue state       & Tracked in software                       & Not needed ($q \approx 0$) \\
+\bottomrule
+\end{tabular}
+\caption{Architecture comparison between Chapter 3 and Chapter 4.}
+\end{table}
+
+The key insight is that \textbf{Ollama does not expose true request queueing
+at the application level}.  TTFT is determined by GPU concurrency, not by
+a waiting queue.  A single integral controller acting directly on batch size
+is both sufficient and correct for this plant.  The cascade was solving a
+problem that did not exist in the real system.
+
+\end{document}
