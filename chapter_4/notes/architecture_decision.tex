@@ -4,126 +4,174 @@
 \usepackage{booktabs}
 \usepackage{hyperref}
 \usepackage{parskip}
+\usepackage{xcolor}
 
-\title{Chapter 4 Architecture Decision Note\\
-       \large Why the Cascade Controller Was Replaced by a Single-State Integrator}
-\author{LLM Serving Control Project}
+\title{Why We Threw Away the Cascade Controller\\
+       \large A Chapter 4 Architecture Decision Note}
+\author{Hari Vasudevan}
 \date{\today}
 
 \begin{document}
 \maketitle
 
-\section{Background}
+\textit{Chapters 1 through 3 of this series applied classical cascade
+control to LLM inference serving.  It was elegant on paper and worked
+reasonably well in simulation.  Then we connected it to a real GPU and it
+told us something we did not expect: the plant we had been designing for
+does not exist.  This note documents what we found, why it happened, and
+what we built instead.}
 
-Chapters 1--3 of this project applied classical cascade control to an LLM
-inference serving system.  The inner loop regulated queue depth~$q$ by
-adjusting batch size~$B$, and the outer loop regulated p95 latency~$\ell$
-by setting the queue setpoint~$q_{\mathrm{ref}}$.  The plant model assumed:
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{Where We Started}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The core assumption running through Chapters 1--3 was that an LLM inference
+server behaves like a service queue.  Requests arrive at rate $\lambda$,
+the server processes them in batches of size $B$, and any excess builds up
+as a pending queue of depth $q$.  Under that assumption, the p95 latency is
+well-described by:
 
 \begin{equation}
     \ell[k] = \alpha B[k] + \gamma B[k]^2 + \beta\, q[k]
     \label{eq:model}
 \end{equation}
 
-with parameters $\alpha = 0.1$, $\gamma = 0.8$, $\beta = 2.0$ taken from a
-theoretical stochastic simulation.  The key structural assumption was that
-a persistent request queue~$q$ builds up and directly contributes to latency
-via the term~$\beta q$.
+The three terms capture service time (linear and quadratic in batch size)
+and queueing delay (linear in queue depth).  We set $\alpha = 0.1$,
+$\gamma = 0.8$, and $\beta = 2.0\;\text{ms/req}$ from a theoretical
+stochastic simulation, and designed a two-loop cascade controller around
+this model.  The inner loop regulated $q$ by adjusting $B$, and the outer
+loop regulated $\ell$ by setting the queue setpoint $q_{\mathrm{ref}}$.
 
-\section{What We Found in Practice}
+The model was reasonable.  The problem was that it described a different
+system than the one we were actually running against.
 
-When the cascade controller was connected to a real \texttt{qwen2.5:3b}
-model served by Ollama (Chapter~3), plant identification revealed two
-critical discrepancies.
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{What the Real System Told Us}
+% ─────────────────────────────────────────────────────────────────────────────
 
-\subsection{The queue term is unidentifiable}
+When we connected the Chapter~3 cascade controller to a live
+\texttt{qwen2.5:3b} model served by Ollama on an M2 MacBook Air, two things
+became apparent almost immediately.
 
-The Stage~2 identification experiment ran sustained Poisson arrivals at
-$\lambda \in \{2, 3, 5, 7, 9\}$ requests per tick, with a drain rule
-$B[k] = \min(B_{\max},\, q[k] + a[k])$.  In every case the measured
-queue depth settled to $q \approx 0$ regardless of $\lambda$.
+\subsection*{The queue never builds}
 
-The root cause is how Ollama processes requests internally.  Unlike a
-production serving engine such as vLLM---which maintains an explicit
-scheduler queue and can hold requests pending while others are
-processed---Ollama dispatches each HTTP request immediately to an available
-inference slot.  Requests that arrive when all slots are occupied are queued
-inside Ollama's internal HTTP stack, not in a user-visible counter.  From
-MATLAB's perspective, the drain rule always matched arrivals, so the
-software queue counter never accumulated.  The $\beta q$ term in
-equation~\eqref{eq:model} has no observable counterpart in the real system.
+We ran a plant identification experiment: sustained Poisson arrivals at
+five different rates $\lambda \in \{2, 3, 5, 7, 9\}$ requests per tick,
+each run for 35 ticks.  The drain rule was straightforward --- set
+$B[k] = \min(B_{\max},\, q[k] + a[k])$ so the server tries to absorb
+everything it receives.  We expected to see different steady-state queue
+depths at different lambda values.  Instead, we saw $q \approx 0$ in every
+single run, regardless of load.
 
-\subsection{TTFT is a direct function of concurrency, not queue depth}
+The reason is structural.  Unlike a production serving engine such as vLLM,
+which maintains an explicit scheduler queue and can hold requests pending
+while others are processed, Ollama dispatches each incoming HTTP request
+immediately to an available inference slot.  When all slots are occupied,
+requests wait inside Ollama's internal HTTP stack --- not in a counter that
+MATLAB can observe.  From our software queue's perspective, arrivals were
+always matched immediately.  The $\beta q$ term in
+equation~\eqref{eq:model} has no observable counterpart in this system.
 
-The Stage~1 identification swept concurrent batch size $B \in \{1, \ldots, 12\}$
-by firing $B$ requests \emph{simultaneously} via \texttt{parfeval}.  The
-measured Time to First Token (TTFT) followed a clear nonlinear curve:
+This is not a bug in our experiment.  It is a fundamental property of how
+Ollama is architected.  Chapter~4 will be honest about this distinction:
+Ollama is a development tool, not a production serving engine.  The right
+conclusions here carry over to vLLM, which does expose true queue depth ---
+but that is Chapter~5's problem.
+
+\subsection*{Latency is a function of concurrency, not queue depth}
+
+Having established that $q \approx 0$ always, we re-ran the identification
+with a different question: how does TTFT (Time to First Token) change as we
+fire more requests \emph{simultaneously}?  We swept $B \in \{1, \ldots, 12\}$
+by submitting $B$ requests concurrently via \texttt{parfeval}, measured the
+mean TTFT across five repetitions at each point, and fitted a quadratic:
 
 \begin{equation}
     \ell(B) = c_0 + c_1 B + c_2 B^2
     \label{eq:fit}
 \end{equation}
 
-with fitted parameters:
+The fit came back:
 \begin{align*}
-    c_0 &= 97.16 \;\text{ms} \qquad \text{(idle prefill offset)} \\
-    c_1 &= 30.35 \;\text{ms/req} \qquad \text{(linear contention)} \\
-    c_2 &= -1.44 \;\text{ms/req}^2 \qquad \text{(saturation effect)}
+    c_0 &= 97.16 \;\text{ms} \qquad \text{(prefill cost with no contention)} \\
+    c_1 &= 30.35 \;\text{ms/req} \qquad \text{(linear contention growth)} \\
+    c_2 &= -1.44 \;\text{ms/req}^2 \qquad \text{(concavity at high $B$)}
 \end{align*}
 
-with $R^2 = 0.815$.  The negative $c_2$ reflects the fact that at high
-concurrency Ollama spreads load across multiple GPU inference slots
-(configured via \texttt{OLLAMA\_NUM\_PARALLEL=16}), partially counteracting
-the linear contention.
+with $R^2 = 0.815$.  The physical story here is GPU KV-cache memory
+bandwidth competition.  When $B$ sequences are processed in parallel, they
+compete for the same memory bus, and prefill time rises.  The negative $c_2$
+reflects the fact that at high concurrency Ollama spreads load across
+multiple inference slots (we had configured
+\texttt{OLLAMA\_NUM\_PARALLEL=16}), partially offsetting the linear term.
+This is a concurrency effect, not a queueing effect.
 
-The physical mechanism is GPU KV-cache memory bandwidth competition: when
-$B$ sequences are processed in parallel, each competes for bandwidth, raising
-TTFT.  This is a concurrency effect, not a queueing effect.
+\subsection*{Our assumed $\beta$ was off by $8\times$}
 
-\subsection{The assumed $\beta$ was wrong by 8$\times$}
-
-Linearising equation~\eqref{eq:fit} at the operating point $B_0 = 5$:
+This is where the cascade controller design unravelled.  Linearising
+equation~\eqref{eq:fit} at our chosen operating point $B_0 = 5$:
 
 \begin{equation}
-    \beta_{\mathrm{eff}} = \left.\frac{d\ell}{dB}\right|_{B_0}
-    = c_1 + 2c_2 B_0 = 30.35 - 2(1.44)(5) = 15.97 \;\text{ms/req}
+    \beta_{\mathrm{eff}}
+      = \left.\frac{d\ell}{dB}\right|_{B_0}
+      = c_1 + 2c_2 B_0
+      = 30.35 - 2(1.44)(5)
+      = 15.97 \;\text{ms/req}
 \end{equation}
 
-The assumed $\beta = 2.0\;\text{ms/req}$ was $8\times$ too small.  The
-outer-loop integral gain $K_{il} = (e^{-\Delta t/\tau} - 1)/\beta$ was
-therefore $8\times$ too aggressive, causing the outer integrator to
-over-correct on every tick.
+We had been designing the outer loop with $\beta = 2.0\;\text{ms/req}$.
+The real sensitivity was $15.97\;\text{ms/req}$ --- an eightfold difference.
+Since the integral gain is $K_{il} = (e^{-\Delta t/\tau} - 1)/\beta$, we
+had been running a controller that was $8\times$ more aggressive than the
+plant required.  The integrator was over-correcting on every tick, which
+explains the oscillatory behaviour we observed in the Chapter~3 runs.
 
-\section{Revised Architecture: Single-State Integral Controller}
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{The Revised Architecture}
+% ─────────────────────────────────────────────────────────────────────────────
 
-Since $q \approx 0$ always and the plant reduces to the static map
-$\ell \approx f(B)$, the cascade architecture adds no value.  The inner
-loop was regulating a state that does not exist in the real system.
+Once we accepted that $q \approx 0$ always and the plant reduces to the
+static map $\ell \approx f(B)$, the case for the cascade evaporated.  The
+inner loop had been regulating a state that does not exist in the real
+system.  The outer loop was commanding a queue setpoint that always resolved
+to zero.  The complexity was not earning us anything.
 
-The revised Chapter~4 controller is a single-state discrete-time integrator:
+The Chapter~4 controller is a single-state discrete-time integrator that
+observes TTFT and adjusts $B$ directly:
 
 \begin{align}
     e[k]      &= \ell_{\mathrm{target}} - \ell_{\mathrm{meas}}[k] \\
-    \xi[k+1]  &= \xi[k] + e[k] \label{eq:int}\\
-    B[k]      &= \mathrm{clamp}\!\left(B_0 - K_{il}\,\xi[k],\; B_{\min},\; B_{\max}\right)
+    \xi[k+1]  &= \xi[k] + e[k] \label{eq:int} \\
+    B[k]      &= \mathrm{clamp}\!\left(B_0 - K_{il}\,\xi[k],\;
+                                       B_{\min},\; B_{\max}\right)
 \end{align}
 
-The closed-loop characteristic equation is:
+The closed-loop characteristic equation follows from substituting the
+control law back into the integrator update and using $\ell = \beta_{\mathrm{eff}} \Delta B$:
 
 \begin{equation}
     z_{\mathrm{cl}} = 1 + \beta_{\mathrm{eff}}\, K_{il}
 \end{equation}
 
-Setting $z_{\mathrm{cl}} = e^{-\Delta t / \tau_{\mathrm{cl}}}$ with
-$\tau_{\mathrm{cl}} = 20\;\text{s}$ and $\Delta t = 1\;\text{s}$:
+We want this pole at $z_{\mathrm{cl}} = e^{-\Delta t / \tau_{\mathrm{cl}}}$,
+which gives the gain analytically:
 
 \begin{equation}
     K_{il} = \frac{e^{-\Delta t/\tau_{\mathrm{cl}}} - 1}{\beta_{\mathrm{eff}}}
-           = \frac{e^{-0.05} - 1}{15.97}
+           = \frac{e^{-1/20} - 1}{15.97}
            = -0.003054 \;\text{req/ms}
 \end{equation}
 
-The anti-windup limits on $\xi$ are derived from the actuator bounds:
+We chose $\tau_{\mathrm{cl}} = 20\;\text{s}$ to ensure the closed-loop
+bandwidth sits comfortably below the measurement lag introduced by the
+20-sample rolling window used to compute $\ell_{\mathrm{meas}}$.  Pushing
+the controller faster than the measurement filter is a reliable recipe for
+integrator windup, and we had already learned that lesson in Chapter~3.
+
+The anti-windup bounds on the integrator state $\xi$ are derived directly
+from the actuator limits.  Since $B = B_0 - K_{il}\xi$ and
+$B \in [B_{\min}, B_{\max}]$, the admissible range for $\xi$ is:
 
 \begin{equation}
     \xi \in \left[\frac{B_0 - B_{\max}}{K_{il}},\;
@@ -131,29 +179,72 @@ The anti-windup limits on $\xi$ are derived from the actuator bounds:
          = [-1310,\; 2292]
 \end{equation}
 
-\section{Summary}
+These are wide bounds by design.  We have only one integrator now, and
+we want it to have full authority over the $B$ range $[1, 12]$ without
+unnecessary clamping during normal operation.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{What Changed and Why It Matters}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The table below summarises the difference between the Chapter~3 and
+Chapter~4 architectures.  The number of controller states halved.  The
+assumed $\beta$ was replaced by a measured one.  The resulting gain is
+$5.4\times$ smaller in magnitude, which matches what the real GPU-memory
+dynamics actually require.
 
 \begin{table}[h]
 \centering
-\begin{tabular}{lll}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{p{3.5cm} p{5.5cm} p{5.5cm}}
 \toprule
 & \textbf{Chapter 3 (cascade)} & \textbf{Chapter 4 (single-loop)} \\
 \midrule
-Plant model       & $\ell = \alpha B + \gamma B^2 + \beta q$ & $\ell = f(B)$ (identified) \\
-Controller states & $\xi_q$ (inner) + $\xi_l$ (outer)        & $\xi$ (one integrator) \\
-Actuator          & $q_{\mathrm{ref}} \to B$ via inner loop   & $B$ directly \\
-$\beta$ used      & 2.0 (assumed)                             & 15.97 (measured) \\
-$K_{il}$          & $-0.0164$ ($8\times$ too aggressive)      & $-0.003054$ (correct) \\
-Queue state       & Tracked in software                       & Not needed ($q \approx 0$) \\
+Plant model
+  & $\ell = \alpha B + \gamma B^2 + \beta q$ (assumed)
+  & $\ell = c_0 + c_1 B + c_2 B^2$ (measured) \\
+Controller states
+  & $\xi_q$ (inner) $+$ $\xi_l$ (outer)
+  & $\xi$ (one integrator) \\
+Actuator path
+  & $\xi_l \to q_{\mathrm{ref}} \to \xi_q \to B$
+  & $\xi \to B$ directly \\
+$\beta$ used
+  & 2.0 ms/req (from simulation)
+  & 15.97 ms/req (from identification) \\
+$K_{il}$
+  & $-0.0164$ ($8\times$ too aggressive)
+  & $-0.003054$ (matched to plant) \\
+Queue state
+  & Tracked in software, used as control state
+  & Not needed ($q \approx 0$ always in Ollama) \\
 \bottomrule
 \end{tabular}
-\caption{Architecture comparison between Chapter 3 and Chapter 4.}
+\caption{Architecture comparison between Chapter~3 and Chapter~4.}
 \end{table}
 
-The key insight is that \textbf{Ollama does not expose true request queueing
-at the application level}.  TTFT is determined by GPU concurrency, not by
-a waiting queue.  A single integral controller acting directly on batch size
-is both sufficient and correct for this plant.  The cascade was solving a
-problem that did not exist in the real system.
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{What This Means for Chapter 5 (vLLM)}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The most important takeaway from this exercise is not the gain value or the
+controller simplification --- it is the distinction between Ollama and a
+production serving engine.  In vLLM, the queue depth \texttt{num\_requests\_waiting}
+is a real, observable, controllable state exposed via the Prometheus metrics
+endpoint.  The cascade architecture from Chapters 2b and 3 is not wrong; it
+is just solving the right problem for the wrong plant.
+
+Chapter~5 will reconnect the inner queue-regulation loop.  The outer loop
+integral gain will need to be re-identified against vLLM's actual response
+surface, which includes true scheduler-level queueing, preemption, and
+continuous batching dynamics that have no analogue in Ollama.  We expect
+$\beta$ to be much closer to our original assumed value of 2~ms/req in that
+setting, because the $\beta q$ term in equation~\eqref{eq:model} will
+finally have a real plant to act on.
+
+The architectural simplification in Chapter~4 is therefore a deliberate
+choice, not a permanent one.  We are building the simplest correct
+controller for the plant we actually have, rather than forcing a more
+complex architecture onto a system that cannot support it.
 
 \end{document}
