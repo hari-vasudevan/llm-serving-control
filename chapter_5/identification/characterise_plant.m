@@ -17,23 +17,34 @@
 %
 % WHAT THIS SCRIPT DOES
 % ----------------------
+% Two latency metrics are used deliberately:
+%   Stage 2 uses TTFT (vllm_ttft): measures pure concurrency cost at q=0.
+%     With num_predict=1, requests complete in ~50-100ms.  This is correct
+%     for fitting alpha/gamma because we want l(B, q=0) cleanly.
+%
+%   Stages 3/4 use end-to-end (vllm_e2e) with num_predict=E2E_TOKENS:
+%     With TTFT only, vLLM frees the scheduler slot after the first token.
+%     Requests complete in ~50ms so the scheduler queue drains between ticks
+%     and num_requests_waiting stays at 0.  End-to-end keeps the slot
+%     occupied for num_predict token steps (~20ms/token on 0.6B), giving
+%     the queue time to build and persist within a 1-second tick.
+%
 % Stage 1 -- Metrics endpoint smoke test
 %   Confirm vLLM is up, parse /metrics, print key gauges.
 %
-% Stage 2 -- B sweep at q=0 (fit alpha, gamma)
-%   Fire B concurrent requests when the server is idle (queue empty).
-%   TTFT(B, q=0) = alpha*B + gamma*B^2.
-%   Uses parfeval so all B requests hit the GPU simultaneously.
+% Stage 2 -- B sweep at q=0  (fit alpha, gamma)
+%   Fire B requests concurrently.  TTFT(B,q=0) = alpha*B + gamma*B^2.
+%   Metric: TTFT via vllm_ttft, num_predict=1.
 %
-% Stage 3 -- Queue buildup sweep (fit beta)
-%   Sustain arrival rate lambda > max_num_seqs for several ticks to force
-%   num_requests_waiting > 0, then measure TTFT at known (B, q).
-%   Residual latency above the service term = beta * q_measured.
+% Stage 3 -- Queue buildup  (fit beta)
+%   Fire lambda_build > max_num_seqs requests per tick with end-to-end
+%   latency so slots stay occupied long enough for q to build.
+%   Residual l_ss - (alpha*B_ss + gamma*B_ss^2) = beta*q_ss.
+%   Metric: end-to-end via vllm_e2e, num_predict=E2E_TOKENS.
 %
 % Stage 4 -- Operating envelope
-%   Sweep lambda from 1 to lambda_max, let queue settle at each value,
-%   record steady-state (lambda, B_ss, q_ss, TTFT_ss).
-%   Identifies the controllable region for the cascade controller.
+%   Sweep lambda, let queue settle, record (lambda, B_ss, q_ss, l_ss).
+%   Metric: end-to-end via vllm_e2e, num_predict=E2E_TOKENS.
 %
 % HOW TO RUN
 % ----------
@@ -68,7 +79,9 @@ cfg.model        = 'mlx-community/Qwen3-0.6B-4bit';
 cfg.metrics_url  = 'http://localhost:8001/metrics';
 cfg.gen_url      = 'http://localhost:8001/v1/completions';
 cfg.timeout      = 30;      % s per request
-cfg.num_predict  = 1;       % tokens to generate (minimise gen time for TTFT)
+cfg.num_predict  = 1;       % tokens for Stage 2 TTFT sweep (minimise gen time)
+cfg.e2e_tokens   = 20;      % tokens for Stage 3/4: keeps scheduler slots occupied
+                             % ~20ms/token on 0.6B -> 400ms/request -> queue persists
 cfg.dt           = 1.0;     % s -- tick duration (matches controller)
 
 % Stage 2: B sweep
@@ -188,13 +201,13 @@ for bi = 1:n_b
         futures = cell(b, 1);
         for i = 1:b
             prompt = cfg.prompts{mod(i-1, numel(cfg.prompts))+1};
-            futures{i} = parfeval(@vllm_ttft, 1, ...
-                cfg.gen_url, cfg.model, prompt, cfg.num_predict, cfg.timeout);
+            futures{i} = parfeval(@vllm_e2e, 1, ...
+                cfg.gen_url, cfg.model, prompt, cfg.e2e_tokens, cfg.timeout);
         end
 
         % Read queue depth immediately after submitting (before collecting)
         % This gives the num_requests_waiting at peak load
-        pause(0.05);
+        pause(0.1);   % 100ms: e2e requests are ~400ms so queue is visible here
         try
             raw = webread(cfg.metrics_url, weboptions('Timeout',3,'ContentType','text'));
             m   = parse_vllm_metrics(raw);
@@ -289,12 +302,13 @@ for tick = 1:(cfg.build_ticks + cfg.n_queue_meas)
     futures = cell(b_k, 1);
     for i = 1:b_k
         prompt = cfg.prompts{mod(i-1, numel(cfg.prompts))+1};
-        futures{i} = parfeval(@vllm_ttft, 1, ...
-            cfg.gen_url, cfg.model, prompt, cfg.num_predict, cfg.timeout);
+        futures{i} = parfeval(@vllm_e2e, 1, ...
+            cfg.gen_url, cfg.model, prompt, cfg.e2e_tokens, cfg.timeout);
     end
 
-    % Read queue depth from metrics immediately after submitting
-    pause(0.05);
+    % Read queue depth 100ms after submitting.
+    % End-to-end requests take ~400ms so the queue is still full at 100ms.
+    pause(0.1);
     q_meas = 0;
     try
         raw = webread(cfg.metrics_url, weboptions('Timeout',3,'ContentType','text'));
@@ -384,10 +398,10 @@ for li = 1:n_lam
         t_tick  = tic;
         for i = 1:b_k
             prompt = cfg.prompts{mod(i-1,numel(cfg.prompts))+1};
-            futures{i} = parfeval(@vllm_ttft, 1, ...
-                cfg.gen_url, cfg.model, prompt, cfg.num_predict, cfg.timeout);
+            futures{i} = parfeval(@vllm_e2e, 1, ...
+                cfg.gen_url, cfg.model, prompt, cfg.e2e_tokens, cfg.timeout);
         end
-        pause(0.05);
+        pause(0.1);   % 100ms: e2e requests are ~400ms so queue is visible here
         q_meas4 = 0;
         try
             raw = webread(cfg.metrics_url,weboptions('Timeout',3,'ContentType','text'));
