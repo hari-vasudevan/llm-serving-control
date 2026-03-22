@@ -1,0 +1,7 @@
+================================================================
+  Plant identification: qwen2.5:3b
+================================================================
+
+Warming up qwen2.5:3b (4 requests)...
+  Latencies: ['20000', '20000', '20000', '20000'] ms
+  WARNING: all warm-up requests timed out — is Ollama running?

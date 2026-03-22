@@ -56,14 +56,14 @@ fprintf('  Real Ollama target:     L_mean=%.0f ms, L_p95=%.0f ms\n\n', ...
 
 % -- 5. Inner loop pole placement params ----------------------------------------
 %   Time constants must be >> dt=1s and << tau_out=30s
-perturbed.pp_tau1 = 2.0;    % s -- inner pole 1
-perturbed.pp_tau2 = 4.0;    % s -- inner pole 2
+perturbed.pp_tau1 = 5.0;    % s -- inner pole 1
+perturbed.pp_tau2 = 8.0;    % s -- inner pole 2
 perturbed.pp_tau  = 3.0;    % s -- oscillatory envelope (if pp_f>0)
 perturbed.pp_f    = 0;      % Hz -- 0 = non-oscillatory
 
 % -- 6. Outer loop time constant ------------------------------------------------
 %   tau_out >> N_win*dt = 20s measurement lag
-perturbed.tau_out = 10;     % s -- outer CL time constant
+perturbed.tau_out = 30;     % s -- outer CL time constant
 
 % -- 7. Design cascade controller -----------------------------------------------
 % method = 'lqr';
