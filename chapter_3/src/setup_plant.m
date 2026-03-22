@@ -63,7 +63,7 @@ perturbed.pp_f    = 0;      % Hz -- 0 = non-oscillatory
 
 % -- 6. Outer loop time constant ------------------------------------------------
 %   tau_out >> N_win*dt = 20s measurement lag
-perturbed.tau_out = 30;     % s -- outer CL time constant
+perturbed.tau_out = 10;     % s -- outer CL time constant
 
 % -- 7. Design cascade controller -----------------------------------------------
 % method = 'lqr';
@@ -84,7 +84,8 @@ ollama.http_timeout  = 10;    % s -- abort after 10s
 ollama.n_warmup      = 4;
 ollama.q_max         = perturbed.q_max;
 ollama.b_min         = perturbed.B_min;
-ollama.b_max         = perturbed.B_max;   % = 12
+ollama.b_max                = perturbed.B_max;   % = 12
+ollama.arrival_noise_factor = 0.3;  % 0=deterministic, 1=full Poisson, 0.3=reduced noise
 ollama.prompts_path  = fullfile(fileparts(mfilename('fullpath')), ...
     '..', 'llm_requirements', 'prompts.txt');
 

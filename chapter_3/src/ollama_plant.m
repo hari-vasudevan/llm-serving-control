@@ -23,6 +23,11 @@ classdef ollama_plant < matlab.System
         b_max         = 12
         prompts_path  = '/Users/hvasudevan/Documents/MATLAB/llm_control_v2/chapter_3/llm_requirements/prompts.txt'
         n_warmup      = 4
+        % arrival_noise_factor: scales stochasticity of arrivals around lambda_k.
+        %   0.0 = deterministic: a_k = round(lambda_k), zero variance
+        %   0.3 = reduced noise: Std(a_k) = 0.3*sqrt(lambda_k)  <-- default
+        %   1.0 = full Poisson:  a_k ~ Poisson(lambda_k), Std = sqrt(lambda_k)
+        arrival_noise_factor = 0.3
     end
 
     properties (Nontunable)
@@ -116,7 +121,12 @@ classdef ollama_plant < matlab.System
         function [l_mean_out, l_p95_out, a_k_out, qkp1_out] = stepImpl(obj, lambda_k, bk, qk)
             bk_safe   = max(obj.b_min, min(obj.b_max, round(double(bk))));
             n_prompts = numel(obj.prompt_list);
-            a_k       = poissrnd(max(0, double(lambda_k)));
+            % Scaled Poisson arrivals.
+            % a_k = lambda + noise_factor*(Poisson_sample - lambda)
+            % Std(a_k) = noise_factor * sqrt(lambda_k)
+            lk_safe   = max(0, double(lambda_k));
+            pois_draw = double(poissrnd(lk_safe));
+            a_k = max(0, round(lk_safe + obj.arrival_noise_factor * (pois_draw - lk_safe)));
             req_f = cell(bk_safe, 1);
             for i = 1:bk_safe
                 prompt = obj.prompt_list{randi(n_prompts)};
