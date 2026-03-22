@@ -2,37 +2,51 @@
 """
 design_controller.py  --  Chapter 5: Cascade controller design
 
-For Chapter 5 with vLLM on Apple Silicon the effective plant is:
+PLANT MODEL
+-----------
+    l_total(B, q) = alpha*B + gamma*B^2 + (q/B)*dt*1000
 
-    TTFT(B) = alpha*B + gamma*B^2    (q≈0 always in vllm-metal)
+where q = q_sw is the software FIFO depth (requests enqueued but not yet
+dispatched) and l_total is measured from enqueue to first token.
 
-This is an INVERTED sign relative to the classic queuing cascade:
-  * In queuing theory:  more B → drains queue → lower latency
-  * In our GPU system:  more B → more contention → HIGHER TTFT
+LINEARISATION at (B0, q0=0):
+    dl/dq |_{B0,q0} = dt*1000 / B0       = beta_q    [analytical]
+    dl/dB |_{B0,q0} = alpha + 2*gamma*B0 = beta_eff  [from B sweep fit]
 
-Therefore the controller must DECREASE B when latency exceeds target.
+CASCADE CONTROLLER SIGN ANALYSIS
+---------------------------------
+Outer loop  (l_total -> q_ref):
 
-We design a single integral controller (degenerate cascade, q-loop bypassed):
+    e_l = L_target - l_total
+    xi_l[k+1] = xi_l[k] + e_l[k]
+    q_ref[k]  = q0 + K_il * xi_l[k]
 
-    e_l[k]      = L_target - l_meas[k]
-    xi_l[k+1]   = xi_l[k] + e_l[k]
-    B[k]        = clamp(round(B0 + K_il * xi_l[k]), B_min, B_max)
+    We need K_il < 0 so that:
+      l > target  (e_l < 0)  -> xi_l decreases
+                              -> K_il*xi_l increases (less negative)
+                              -> q_ref increases
+                              -> inner raises B to drain queue
+                              -> queue_wait drops -> l_total drops  ✓
 
-Gain from desired closed-loop pole:
-    Linearised plant:  Δl = beta_eff * ΔB
-    where beta_eff = d(TTFT)/dB|_{B0} = alpha + 2*gamma*B0  > 0
+    Gain from desired outer CL pole z_out = exp(-dt/tau_out):
+      z_out = 1 + beta_q * K_il     [linearised CL char. eqn.]
+      K_il  = (z_out - 1) / beta_q  [NEGATIVE since z_out < 1, beta_q > 0]
 
-    CL characteristic:  z = 1 - K_il * beta_eff  (note: MINUS, not plus)
-    Target pole:        z_cl = exp(-dt / tau_cl)
-    Gain:               K_il = (1 - z_cl) / beta_eff   [POSITIVE]
+Inner loop  (q_ref -> B via queue error):
 
-Sign check:
-    K_il > 0, beta_eff > 0.
-    When l > target:  e_l < 0 → xi_l decreases → K_il*xi_l decreases → B decreases ✓
-    When l < target:  e_l > 0 → xi_l increases → B increases ✓
+    e_q  = q_ref - q_sw
+    xi_q[k+1] = xi_q[k] + e_q[k]
+    dB[k]     = -(K_q * e_q[k] + K_i * xi_q[k])
+    B[k]      = clamp(round(B0 + dB[k]), B_min, B_max)
+
+    We need K_q > 0 so that:
+      q_sw > q_ref  (e_q < 0)  -> dB = -(K_q * neg) > 0
+                                -> B increases -> faster drain  ✓
+      q_sw < q_ref  (e_q > 0)  -> dB = -(K_q * pos) < 0
+                                -> B decreases -> queue builds  ✓
 
 Usage:
-    python3 design_controller.py [--params identified_params.json]
+    python3 design_controller.py [--params identified_params.json] [options]
 """
 
 import argparse
@@ -45,110 +59,141 @@ DEFAULT_PARAMS = Path(__file__).parent / "identified_params.json"
 DEFAULT_OUT    = Path(__file__).parent / "controller_params.json"
 
 
-def design_integral(alpha: float, gamma: float, B0: int, dt: float,
-                    tau_cl: float, B_min: int, B_max: int) -> dict:
+def design_inner(dt, B_min, B_max, B0, tau1, tau2):
     """
-    Single integral controller correctly signed for GPU-contention plant.
+    Franklin augmented pole placement for SOFTWARE FIFO plant.
+    FIFO: q[k+1]=q[k]+a-B, e_q=q_ref-q_sw
+    => A_aug=[[1,0],[1,1]], B_aug=[[1],[0]]  (opposite sign from Ch2b)
+    Ackermann gives K_q>0, K_i>0 directly. No negation needed.
+    Law: dB = -(K_q*e_q + K_i*xi_q)
+    Check: q_sw>q_ref -> e_q<0 -> dB=-(K_q*neg)>0 -> B up -> drains FIFO
     """
-    beta_eff = alpha + 2 * gamma * B0   # d(TTFT)/dB at B0
-    z_cl     = math.exp(-dt / tau_cl)
-    K_il     = (1.0 - z_cl) / beta_eff  # POSITIVE
+    A = np.array([[1.0, 0.0], [1.0, 1.0]])   # FIFO plant (NOT Ch2b sign)
+    B = np.array([[1.0], [0.0]])
+    z1 = math.exp(-dt / tau1)
+    z2 = math.exp(-dt / tau2)
+    C   = np.hstack([B, A @ B])
+    e2  = np.array([[0.0, 1.0]])
+    p_A = A @ A - (z1+z2)*A + z1*z2*np.eye(2)
+    K   = (e2 @ np.linalg.inv(C) @ p_A).flatten()   # no negation; K_q>0 naturally
+    K_q, K_i = float(K[0]), float(K[1])
 
-    # Verify stability
-    z_actual = 1.0 - K_il * beta_eff
-    stable   = abs(z_actual) < 1.0
+    if abs(K_i) > 1e-12:
+        bounds   = [(B0-B_max)/K_i, (B0-B_min)/K_i]
+        xi_q_min = min(bounds); xi_q_max = max(bounds)
+    else:
+        xi_q_min, xi_q_max = -1e6, 1e6
 
-    print(f"  [integral] beta_eff = {beta_eff:.4f} ms/req  (alpha + 2*gamma*B0)")
-    print(f"  [integral] K_il     = {K_il:.8f}  (positive → reduces B when l > target)")
-    print(f"  [integral] z_cl     = {z_actual:.6f}  stable={stable}")
+    A_cl  = A - B @ K.reshape(1, 2)
+    poles = np.linalg.eigvals(A_cl).real.tolist()
+    assert K_q > 0, f"K_q={K_q:.4f} should be positive"
+    assert K_i > 0, f"K_i={K_i:.4f} should be positive"
 
-    # Anti-windup: B = B0 + K_il * xi_l in [B_min, B_max]
-    # K_il > 0 → xi_l range: [(B_min - B0)/K_il, (B_max - B0)/K_il]
-    xi_min = (B_min - B0) / K_il
-    xi_max = (B_max - B0) / K_il
-    print(f"  [integral] xi_l range: [{xi_min:.1f}, {xi_max:.1f}]")
+    print(f"  [inner] K_q={K_q:.4f} (>0 ✓)  K_i={K_i:.4f} (>0 ✓)")
+    print(f"  [inner] CL poles: z1={z1:.4f}  z2={z2:.4f}  actual={[f'{p:.4f}' for p in poles]}")
+    return {"K_q": K_q, "K_i": K_i, "xi_q_min": xi_q_min, "xi_q_max": xi_q_max,
+            "poles_cl": poles, "B0": B0, "B_min": B_min, "B_max": B_max}
 
-    return {
-        "K_il":     K_il,
-        "z_cl":     z_actual,
-        "tau_cl":   tau_cl,
-        "beta_eff": beta_eff,
-        "B0":       B0,
-        "B_min":    B_min,
-        "B_max":    B_max,
-        "xi_min":   xi_min,
-        "xi_max":   xi_max,
-    }
+
+def design_outer(beta_q, dt, tau_out, q0, q_max):
+    """
+    Integral outer loop using beta_q = dt*1000/B0  (analytical).
+    K_il = (z_out - 1) / beta_q  [NEGATIVE]
+    """
+    z_out = math.exp(-dt / tau_out)
+    K_il  = (z_out - 1.0) / beta_q
+    assert K_il < 0, f"K_il={K_il:.6f} should be negative"
+
+    if abs(K_il) > 1e-12:
+        bounds   = [(0-q0)/K_il, (q_max-q0)/K_il]
+        xi_l_min = min(bounds); xi_l_max = max(bounds)
+    else:
+        xi_l_min, xi_l_max = -1e6, 1e6
+
+    print(f"  [outer] beta_q = {beta_q:.4f} ms/req = dt*1000/B0  (analytical)")
+    print(f"  [outer] K_il   = {K_il:.8f}  (<0 ✓)")
+    print(f"  [outer] z_out  = {z_out:.6f}  tau_out={tau_out:.0f}s")
+    return {"K_il": K_il, "z_out": z_out, "tau_out": tau_out, "beta_q": beta_q,
+            "q0": q0, "q_max": q_max, "xi_l_min": xi_l_min, "xi_l_max": xi_l_max}
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--params",  default=str(DEFAULT_PARAMS))
-    ap.add_argument("--out",     default=str(DEFAULT_OUT))
-    ap.add_argument("--alpha",   type=float, default=None)
-    ap.add_argument("--gamma",   type=float, default=None)
-    ap.add_argument("--B0",      type=int,   default=3)
-    ap.add_argument("--B_min",   type=int,   default=1)
-    ap.add_argument("--B_max",   type=int,   default=8)
-    ap.add_argument("--L_target",type=float, default=250.0,
-                    help="Latency target [ms]. Set near/below typical TTFT "
-                         "so controller has to actively regulate.")
-    ap.add_argument("--dt",      type=float, default=1.0)
-    ap.add_argument("--tau_cl",  type=float, default=10.0,
-                    help="Closed-loop time constant [s]")
+    ap.add_argument("--params",   default=str(DEFAULT_PARAMS))
+    ap.add_argument("--out",      default=str(DEFAULT_OUT))
+    ap.add_argument("--alpha",    type=float, default=None)
+    ap.add_argument("--gamma",    type=float, default=None)
+    ap.add_argument("--B0",       type=int,   default=3)
+    ap.add_argument("--B_min",    type=int,   default=1)
+    ap.add_argument("--B_max",    type=int,   default=8)
+    ap.add_argument("--q_max",    type=int,   default=30)
+    ap.add_argument("--q0",       type=int,   default=0)
+    ap.add_argument("--L_target", type=float, default=150.0)
+    ap.add_argument("--dt",       type=float, default=1.0)
+    ap.add_argument("--tau1",     type=float, default=2.0)
+    ap.add_argument("--tau2",     type=float, default=3.0)
+    ap.add_argument("--tau_out",  type=float, default=20.0)
     args = ap.parse_args()
 
-    # Load identified params
     identified = {}
     if Path(args.params).exists():
         with open(args.params) as f:
             identified = json.load(f)
         print(f"Loaded: {args.params}")
-    else:
-        print(f"[warn] {args.params} not found, using defaults")
 
-    alpha = args.alpha if args.alpha is not None else identified.get("alpha", 143.89)
-    gamma = args.gamma if args.gamma is not None else identified.get("gamma", -5.25)
+    alpha = args.alpha if args.alpha is not None else identified.get("alpha")
+    gamma = args.gamma if args.gamma is not None else identified.get("gamma")
+    if alpha is None or gamma is None:
+        ap.error("alpha/gamma not in identified_params.json -- run characterise.py first")
 
-    print(f"\n=== Plant parameters ===")
-    print(f"  alpha = {alpha:.4f} ms/req")
-    print(f"  gamma = {gamma:.4f} ms/req²")
-    print(f"  B0={args.B0}  B range=[{args.B_min}, {args.B_max}]")
-    print(f"  L_target={args.L_target:.0f} ms  dt={args.dt}s  tau_cl={args.tau_cl}s\n")
+    # beta_q: analytical from dt and B0
+    # This is d(l_total)/d(q) at B0 -- the queue contribution to latency slope
+    beta_q = (args.dt * 1000.0) / args.B0
 
-    print("=== Integral controller design ===")
-    ctrl = design_integral(
-        alpha  = alpha,
-        gamma  = gamma,
-        B0     = args.B0,
-        dt     = args.dt,
-        tau_cl = args.tau_cl,
-        B_min  = args.B_min,
-        B_max  = args.B_max,
-    )
+    # beta_eff: from fit, d(l_total)/d(B) at B0 (informational, not used for gain)
+    beta_eff = alpha + 2*gamma*args.B0
+    ttft_B0  = alpha*args.B0 + gamma*args.B0**2
 
-    print(f"\n╔{'═'*62}╗")
-    print(f"║  CONTROLLER DESIGN  --  Chapter 5")
-    print(f"╠{'═'*62}╣")
-    print(f"║  Plant:  alpha={alpha:.4f}  gamma={gamma:.4f}")
-    print(f"║          beta_eff={ctrl['beta_eff']:.4f} ms/req @ B0={args.B0}")
-    print(f"║  Gain:   K_il={ctrl['K_il']:.8f}  (positive)")
-    print(f"║  Pole:   z_cl={ctrl['z_cl']:.4f}  tau_cl={ctrl['tau_cl']:.0f}s")
-    print(f"║  Target: L_target={args.L_target:.0f} ms")
-    print(f"║  Law:    B[k] = clamp(B0 + K_il*xi_l[k], {args.B_min}, {args.B_max})")
-    print(f"║          xi_l[k+1] = xi_l[k] + (L_target - l_meas[k])")
-    print(f"╚{'═'*62}╝\n")
+    print(f"\n=== Plant ===")
+    print(f"  l_total(B,q) = alpha*B + gamma*B^2 + (q/B)*dt*1000")
+    print(f"  alpha   = {alpha:.4f} ms/req")
+    print(f"  gamma   = {gamma:.4f} ms/req^2")
+    print(f"  B0={args.B0}  TTFT(B0)={ttft_B0:.2f} ms")
+    print(f"  beta_q  = dt*1000/B0 = {args.dt*1000:.0f}/{args.B0} = {beta_q:.2f} ms/req  [ANALYTICAL]")
+    print(f"  beta_eff= alpha+2*gamma*B0 = {beta_eff:.4f} ms/req  [TTFT slope, informational]\n")
+
+    print("=== Inner loop ===")
+    inner = design_inner(args.dt, args.B_min, args.B_max, args.B0, args.tau1, args.tau2)
+
+    print("\n=== Outer loop ===")
+    outer = design_outer(beta_q, args.dt, args.tau_out, args.q0, args.q_max)
+
+    print(f"\n╔{'═'*66}╗")
+    print(f"║  CASCADE CONTROLLER  --  Chapter 5")
+    print(f"╠{'═'*66}╣")
+    print(f"║  Plant:  l_total(B,q) = {alpha:.3f}*B + ({gamma:.4f})*B^2 + (q/B)*{args.dt*1000:.0f}")
+    print(f"║          beta_q = {beta_q:.2f} ms/req  [d(l_total)/d(q), analytical]")
+    print(f"║")
+    print(f"║  Outer:  K_il={outer['K_il']:.8f}  z_out={outer['z_out']:.4f}  tau_out={args.tau_out:.0f}s")
+    print(f"║          e_l = L_target - l_total,  q_ref = q0 + K_il*xi_l")
+    print(f"║")
+    print(f"║  Inner:  K_q={inner['K_q']:.4f}  K_i={inner['K_i']:.4f}")
+    print(f"║          CL poles ≈ {inner['poles_cl']}")
+    print(f"║          dB = -(K_q*e_q + K_i*xi_q),  e_q = q_ref - q_sw")
+    print(f"║")
+    print(f"║  L_target={args.L_target:.0f} ms    B0={args.B0}    q0={args.q0}")
+    print(f"╚{'═'*66}╝\n")
 
     result = {
-        "model":     identified.get("model", "unknown"),
-        "alpha":     alpha,
-        "gamma":     gamma,
-        "B0":        args.B0,
-        "B_min":     args.B_min,
-        "B_max":     args.B_max,
-        "L_target":  args.L_target,
-        "dt":        args.dt,
-        "controller": ctrl,
+        "model":    identified.get("model", "unknown"),
+        "alpha": alpha, "gamma": gamma,
+        "beta_q": beta_q, "beta_eff": beta_eff,
+        "B0": args.B0, "q0": args.q0,
+        "B_min": args.B_min, "B_max": args.B_max, "q_max": args.q_max,
+        "L_target": args.L_target, "dt": args.dt,
+        "inner": inner, "outer": outer,
+        "latency_definition": "l_total = t_first_token - t_enqueue",
+        "plant_model": "l_total(B,q) = alpha*B + gamma*B^2 + (q/B)*dt*1000",
     }
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
