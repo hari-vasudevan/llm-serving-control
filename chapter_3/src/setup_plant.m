@@ -1,109 +1,102 @@
-%% setup_plant.m  —  Chapter 2b: Cascade Control
-% Entry point. Defines plant parameters, computes equilibrium, designs
-% the cascade controller (inner: B->q, outer: q_ref->l_p95), then runs
-% the MATLAB-only simulation.
+%% setup_plant.m  --  Chapter 3: Cascade Control on Real Ollama Inference
+% Entry point. Defines plant parameters, designs the cascade controller,
+% and instantiates the ollama_plant System object for Simulink.
 %
-% Change 'method' to switch between 'lqr' and 'pole_placement'.
+% IMPORTANT: run this script BEFORE pressing Run in Simulink.
+% The Simulink model reads perturbed, controller, and ollama from the
+% base workspace at simulation start.
+%
+% Plant switching (inside Plant1 subsystem in Simulink):
+%   Stochastic model  ->  fcn MATLAB Function block connected
+%   Real Ollama       ->  ollama_plant MATLAB System block connected
 
 clear; clc;
 addpath(fileparts(mfilename('fullpath')));
 
-% -- 1. Plant parameters ------------------------------------------------------
-perturbed.alpha = 0.1;    % ms   -- linear service-time coefficient
-perturbed.gamma = 0.8;   % ms   -- quadratic service-time coefficient
-perturbed.beta  = 2;     % ms   -- queuing latency per waiting request
-perturbed.delta = 15;    % ms   -- p95 spread coefficient
+% -- 1. Plant parameters -------------------------------------------------------
+% alpha/gamma/delta are used by the stochastic plant only.
+% The real Ollama plant measures latency directly from wall-clock time.
+perturbed.alpha = 0.1;   % ms -- stochastic plant: linear service-time coeff
+perturbed.gamma = 0.8;   % ms -- stochastic plant: quadratic coeff
+perturbed.beta  = 2;     % ms/req -- queuing latency (used for outer loop gain)
+perturbed.delta = 15;    % ms -- stochastic plant: p95 spread coeff
 
-perturbed.dt    = 1.0;   % s    -- scheduling tick (1 s for real Ollama; warm latency ~500 ms/req)
-perturbed.B_min = 1;     %      -- batch size lower bound
-perturbed.B_max = 32*2;    %      -- batch size upper bound (VRAM)
-perturbed.q_max = 3000;    %      -- queue depth upper bound
+perturbed.dt    = 1.0;   % s   -- scheduling tick
+perturbed.B_min = 1;     %     -- batch size lower bound
+perturbed.B_max = 8;     %     -- cap at 2x OLLAMA_NUM_PARALLEL=4
+perturbed.q_max = 20;    %     -- realistic queue cap for local Ollama
 
-% -- 2. Operating conditions --------------------------------------------------
-perturbed.lambda_mean  = 5;    % req/tick -- mean arrival rate
-perturbed.L_p95_target = 100;  % ms       -- SLA target
-perturbed.L_mean_target = 25;  % ms       -- SLA target
+% -- 2. Operating conditions ---------------------------------------------------
+% Tuned for qwen2.5:7b on M2, num_predict=1:
+%   Measured single-request warm latency:  ~175-240 ms
+%   4 concurrent requests wall-clock time: ~200 ms
+perturbed.lambda_mean   = 1;    % req/tick -- 1 arrival/s (B=2 sweet spot)
+perturbed.L_p95_target  = 350;  % ms -- realistic p95 (measured at B=2)
+perturbed.L_mean_target = 200;  % ms -- realistic mean TTFT target at B=2
 
-% -- 3. Rolling window (measurement, used upstream of outer controller) --------
-perturbed.N_win = 20;    % samples -- l_p95 rolling window length (T_win = 20 s at dt=1s)
+% -- 3. Rolling window ----------------------------------------------------------
+perturbed.N_win = 2;    % samples -- rolling window (20 s at dt=1 s)
 
-% -- 4. Equilibrium -----------------------------------------------------------
-%
-%   Queue balance:  q[k+1] = q[k]  =>  B0 = lambda_mean
-%
-%   SLA met at equilibrium:
-%     q0 = ( L_p95_target - alpha*B0 - gamma*B0^2 - 1.645*delta/sqrt(B0) ) / beta
+% -- 4. Equilibrium -------------------------------------------------------------
+%   Queue balance: B0 = lambda_mean
+%   q0: initial queue setpoint. Set to lambda_mean so the system starts
+%       near natural balance. The outer loop drives latency from here.
+perturbed.B0 = perturbed.lambda_mean;   % = 2
+perturbed.q0 = perturbed.lambda_mean;   % = 2 requests (initial setpoint)
 
-perturbed.B0 = perturbed.lambda_mean;
-
-% perturbed.q0 = ( perturbed.L_p95_target ...
-%                - perturbed.alpha  * perturbed.B0 ...
-%                - perturbed.gamma  * perturbed.B0^2 ...
-%                - 1.645 * perturbed.delta / sqrt(perturbed.B0) ) ...
-%                / perturbed.beta;
-
-perturbed.q0 = ( perturbed.L_mean_target ...
-               - perturbed.alpha * perturbed.B0 ...
-               - perturbed.gamma * perturbed.B0^2 ) ...
-               / perturbed.beta;
-
+% Evaluate stochastic plant at equilibrium (sanity check only)
 [~, L_mean_eq, L_p95_eq] = llm_plant(perturbed.q0, perturbed.B0, ...
-                                       perturbed.lambda_mean, perturbed);
-fprintf('=== Equilibrium (computed from mean-latency target) ===\n');
-fprintf('  B0      = %.4f  req/tick\n', perturbed.B0);
-fprintf('  q0      = %.4f  requests\n', perturbed.q0);
-fprintf('  L_mean  = %.2f  ms  (target = %.2f ms)\n', L_mean_eq, perturbed.L_mean_target);
-fprintf('  L_p95   = %.2f  ms  (reported only; not used for equilibrium)\n\n', L_p95_eq);
+    perturbed.lambda_mean, perturbed);
+fprintf('=== Equilibrium ===\n');
+fprintf('  B0  = %.2f  req/tick\n', perturbed.B0);
+fprintf('  q0  = %.2f  requests\n', perturbed.q0);
+fprintf('  Stochastic plant at eq: L_mean=%.1f ms, L_p95=%.1f ms\n', L_mean_eq, L_p95_eq);
+fprintf('  Real Ollama target:     L_mean=%.0f ms, L_p95=%.0f ms\n\n', ...
+    perturbed.L_mean_target, perturbed.L_p95_target);
 
-% -- 5. Inner loop pole placement parameters (only used when method = 'pole_placement')
-perturbed.pp_tau1 = 0.25;   % s  -- inner pole 1 time constant
-perturbed.pp_tau2 = 0.5;    % s  -- inner pole 2 time constant
-perturbed.pp_tau  = 1.0/3;  % s  -- inner oscillatory envelope (if pp_f > 0)
-perturbed.pp_f    = 0;      % Hz -- inner damped frequency (0 = non-oscillatory)
+% -- 5. Inner loop pole placement params ----------------------------------------
+%   Time constants must be >> dt=1s and << tau_out=30s
+perturbed.pp_tau1 = .20;    % s -- inner pole 1
+perturbed.pp_tau2 = .40;    % s -- inner pole 2
+perturbed.pp_tau  = .30;    % s -- oscillatory envelope (if pp_f>0)
+perturbed.pp_f    = 0;      % Hz -- 0 = non-oscillatory
 
-% -- 6. Outer loop time constant -----------------------------------------------
-%   Integral-only design. One parameter sets the closed-loop pole analytically:
-%     K_il = (exp(-dt/tau_out) - 1) / beta
-%   Must be >> tau_win (3 s) and >> tau_inner (~0.5 s).  10 s is a safe start.
-perturbed.tau_out = 60;  % s  -- desired outer CL time constant (slow; respects 10s measurement lag)
+% -- 6. Outer loop time constant ------------------------------------------------
+%   tau_out >> N_win*dt = 20s measurement lag
+perturbed.tau_out = 3;     % s -- outer CL time constant
 
-% -- 7. Design cascade controller ---------------------------------------------
-% method     = 'lqr';
-method   = 'pole_placement';
+% -- 7. Design cascade controller -----------------------------------------------
+% method = 'lqr';
+method = 'pole_placement';
 
 controller = design_controller(perturbed, method);
 
-% -- 8. Run MATLAB simulation -------------------------------------------------
-% run_simulation(perturbed, controller);
-
-% -- 9. Ollama plant object (Chapter 3 only) ---------------------------------
-%   Instantiate here so Simulink can find it in the base workspace.
-%   Switch between plants in Simulink by swapping the block inside Plant1:
-%     - Stochastic model : keep the existing MATLAB Function block (fcn)
-%     - Real Ollama      : replace with a MATLAB System block -> ollama_plant
-%
-%   ollama config is decoupled from perturbed so it can be changed without
-%   rerunning the controller design.
-ollama_cfg.url          = 'http://localhost:11434/api/generate';
-ollama_cfg.model_name   = 'qwen2.5:7b';
-ollama_cfg.num_predict  = 50;     % tokens per response (controls latency floor)
-ollama_cfg.n_win        = perturbed.N_win;  % reuse rolling window size from plant
-ollama_cfg.http_timeout = 30;     % s  -- request timeout (abort + penalty if exceeded)
-ollama_cfg.n_warmup     = 4;      % dummy requests to warm GPU before sim starts
-ollama_cfg.prompts_path = fullfile(fileparts(mfilename('fullpath')), ...
-    '..' , 'llm_requirements', 'prompts.txt');
-
-% Construct the system object (Simulink reads it from base workspace)
+% -- 8. Ollama plant object (Chapter 3) ----------------------------------------
+%   Prompts loaded HERE (not inside setupImpl) so Simulink propagation
+%   pass never touches fopen/regexprep.
+%   Parallel pool also opened here.
 ollama = ollama_plant();
-ollama.ollama_url    = ollama_cfg.url;
-ollama.model_name    = ollama_cfg.model_name;
-ollama.num_predict   = ollama_cfg.num_predict;
-ollama.n_win         = ollama_cfg.n_win;
-ollama.http_timeout  = ollama_cfg.http_timeout;
-ollama.n_warmup      = ollama_cfg.n_warmup;
-ollama.prompts_path  = ollama_cfg.prompts_path;
+ollama.ollama_url    = 'http://localhost:11434/api/generate';
+ollama.model_name    = 'qwen2.5:7b';
+ollama.num_predict   = 1;     % 1 token: ~175-200 ms/req on M2 (fastest)
+ollama.n_win         = perturbed.N_win;
+ollama.http_timeout  = 10;    % s -- abort after 10s
+ollama.n_warmup      = 4;
 ollama.q_max         = perturbed.q_max;
 ollama.b_min         = perturbed.B_min;
-ollama.b_max         = perturbed.B_max;
+ollama.b_max         = perturbed.B_max;   % = 4
+ollama.prompts_path  = fullfile(fileparts(mfilename('fullpath')), ...
+    '..', 'llm_requirements', 'prompts.txt');
 
-fprintf('ollama_plant object ready. Switch Plant1 block to use real inference.\n');
+load_prompts(ollama);
+
+if isempty(gcp('nocreate'))
+    parpool('local', min(ollama.b_max, feature('numcores')));
+end
+% Attach src directory to pool workers so ollama_ttft.m is findable
+src_path = fileparts(mfilename('fullpath'));
+addAttachedFiles(gcp, src_path);
+
+fprintf('ollama_plant ready: %d prompts. num_predict=%d. B_max=%d.\n', ...
+    numel(ollama.prompt_list), ollama.num_predict, ollama.b_max);
+fprintf('z^-1 IC = perturbed.q0 = %.2f  (set in Simulink z^-1 block)\n', perturbed.q0);
