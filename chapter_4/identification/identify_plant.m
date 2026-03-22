@@ -87,7 +87,7 @@ if isempty(pool)
 end
 fprintf('[pool] Attaching src dir to workers...\n');
 addAttachedFiles(gcp, src_dir);
-fprintf('[pool] Pool ready: %d workers.\n\n', gcp.NumWorkers);
+fprintf('[pool] Pool ready: %d workers.\n\n', gcp().NumWorkers);
 
 % -------------------------------------------------------------------------
 % Warm-up: load model weights into GPU before data collection
