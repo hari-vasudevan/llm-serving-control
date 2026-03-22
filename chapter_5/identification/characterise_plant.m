@@ -500,21 +500,38 @@ fprintf('  perturbed.beta  = identified.beta;\n');
 
 % =========================================================================
 % =========================================================================
+% =========================================================================
 % HELPER FUNCTIONS
 % =========================================================================
 function metrics = parse_vllm_metrics(raw_text)
-%PARSE_VLLM_METRICS  Parse Prometheus text format from vLLM /metrics endpoint.
+%PARSE_VLLM_METRICS  Parse Prometheus text format from the vLLM /metrics endpoint.
+%
+% vLLM labels every metric line with {engine="0",model_name="..."}, e.g.:
+%   vllm:num_requests_waiting{engine="0",model_name="..."} 2.0
+%
+% Strategy: strip the label block {...} before splitting on space.
+% For metrics that appear multiple times (e.g. multiple engines) we
+% accumulate the sum -- consistent with how Prometheus treats Gauges.
     metrics = struct();
     lines   = strsplit(raw_text, newline);
     for i = 1:numel(lines)
         line = strtrim(lines{i});
         if isempty(line); continue; end
-        if line(1) == '#'; continue; end
-        if any(line == '{'); continue; end
-        parts = strsplit(line, ' ');
+        if line(1) == '#'; continue; end   % comment line
+        % Strip label block: "metric_name{...} value" -> "metric_name value"
+        clean = regexprep(line, '\{[^}]*\}', '');
+        clean = strtrim(clean);
+        if isempty(clean); continue; end
+        % Split on whitespace: [metric_name, value, optional_timestamp]
+        parts = regexp(clean, '\s+', 'split');
         if numel(parts) < 2; continue; end
         val = str2double(parts{2});
         if isnan(val); continue; end
-        metrics.(matlab.lang.makeValidName(parts{1})) = val;
+        field = matlab.lang.makeValidName(parts{1});
+        if isfield(metrics, field)
+            metrics.(field) = metrics.(field) + val;  % sum across engines
+        else
+            metrics.(field) = val;
+        end
     end
 end
