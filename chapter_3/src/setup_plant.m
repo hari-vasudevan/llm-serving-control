@@ -75,3 +75,35 @@ controller = design_controller(perturbed, method);
 
 % -- 8. Run MATLAB simulation -------------------------------------------------
 % run_simulation(perturbed, controller);
+
+% -- 9. Ollama plant object (Chapter 3 only) ---------------------------------
+%   Instantiate here so Simulink can find it in the base workspace.
+%   Switch between plants in Simulink by swapping the block inside Plant1:
+%     - Stochastic model : keep the existing MATLAB Function block (fcn)
+%     - Real Ollama      : replace with a MATLAB System block -> ollama_plant
+%
+%   ollama config is decoupled from perturbed so it can be changed without
+%   rerunning the controller design.
+ollama_cfg.url          = 'http://localhost:11434/api/generate';
+ollama_cfg.model_name   = 'qwen2.5:7b';
+ollama_cfg.num_predict  = 50;     % tokens per response (controls latency floor)
+ollama_cfg.n_win        = perturbed.N_win;  % reuse rolling window size from plant
+ollama_cfg.http_timeout = 30;     % s  -- request timeout (abort + penalty if exceeded)
+ollama_cfg.n_warmup     = 4;      % dummy requests to warm GPU before sim starts
+ollama_cfg.prompts_path = fullfile(fileparts(mfilename('fullpath')), ...
+    '..' , 'llm_requirements', 'prompts.txt');
+
+% Construct the system object (Simulink reads it from base workspace)
+ollama = ollama_plant();
+ollama.ollama_url    = ollama_cfg.url;
+ollama.model_name    = ollama_cfg.model_name;
+ollama.num_predict   = ollama_cfg.num_predict;
+ollama.n_win         = ollama_cfg.n_win;
+ollama.http_timeout  = ollama_cfg.http_timeout;
+ollama.n_warmup      = ollama_cfg.n_warmup;
+ollama.prompts_path  = ollama_cfg.prompts_path;
+ollama.q_max         = perturbed.q_max;
+ollama.b_min         = perturbed.B_min;
+ollama.b_max         = perturbed.B_max;
+
+fprintf('ollama_plant object ready. Switch Plant1 block to use real inference.\n');
