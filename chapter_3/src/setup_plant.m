@@ -23,16 +23,16 @@ perturbed.delta = 15;    % ms -- stochastic plant: p95 spread coeff
 
 perturbed.dt    = 1.0;   % s   -- scheduling tick
 perturbed.B_min = 1;     %     -- batch size lower bound
-perturbed.B_max = 8;     %     -- cap at 2x OLLAMA_NUM_PARALLEL=4
-perturbed.q_max = 20;    %     -- realistic queue cap for local Ollama
+perturbed.B_max = 6;     %     -- 2x lambda_mean; real drain authority
+perturbed.q_max = 6;     %     -- ~2x lambda_mean; prevents excess windup
 
 % -- 2. Operating conditions ---------------------------------------------------
 % Tuned for qwen2.5:7b on M2, num_predict=1:
 %   Measured single-request warm latency:  ~175-240 ms
 %   4 concurrent requests wall-clock time: ~200 ms
-perturbed.lambda_mean   = 1;    % req/tick -- 1 arrival/s (B=2 sweet spot)
-perturbed.L_p95_target  = 350;  % ms -- realistic p95 (measured at B=2)
-perturbed.L_mean_target = 200;  % ms -- realistic mean TTFT target at B=2
+perturbed.lambda_mean   = 3;    % req/tick -- 3 arrivals/s: B0=3 at ~500ms TTFT
+perturbed.L_p95_target  = 600;  % ms -- realistic p95 at lambda=3 equilibrium
+perturbed.L_mean_target = 350;  % ms -- between no-queue 175ms and eq 500ms
 
 % -- 3. Rolling window ----------------------------------------------------------
 perturbed.N_win = 2;    % samples -- rolling window (20 s at dt=1 s)
@@ -41,8 +41,8 @@ perturbed.N_win = 2;    % samples -- rolling window (20 s at dt=1 s)
 %   Queue balance: B0 = lambda_mean
 %   q0: initial queue setpoint. Set to lambda_mean so the system starts
 %       near natural balance. The outer loop drives latency from here.
-perturbed.B0 = perturbed.lambda_mean;   % = 2
-perturbed.q0 = perturbed.lambda_mean;   % = 2 requests (initial setpoint)
+perturbed.B0 = perturbed.lambda_mean;   % = 3
+perturbed.q0 = perturbed.lambda_mean;   % = 3 requests (initial setpoint)
 
 % Evaluate stochastic plant at equilibrium (sanity check only)
 [~, L_mean_eq, L_p95_eq] = llm_plant(perturbed.q0, perturbed.B0, ...
@@ -84,7 +84,7 @@ ollama.http_timeout  = 10;    % s -- abort after 10s
 ollama.n_warmup      = 4;
 ollama.q_max         = perturbed.q_max;
 ollama.b_min         = perturbed.B_min;
-ollama.b_max         = perturbed.B_max;   % = 4
+ollama.b_max         = perturbed.B_max;   % = 6
 ollama.prompts_path  = fullfile(fileparts(mfilename('fullpath')), ...
     '..', 'llm_requirements', 'prompts.txt');
 
