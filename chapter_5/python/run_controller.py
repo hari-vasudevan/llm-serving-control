@@ -2,27 +2,41 @@
 """
 run_controller.py  --  Chapter 5: Closed-loop integral controller on live vLLM
 
-Controller law (correctly signed for GPU-contention plant):
+CONTROLLER LAW (single integral, correctly signed for GPU contention):
+    e_l[k]       = L_target[k] - l_meas[k]
+    xi_l[k+1]    = clip(xi_l[k] + e_l[k], xi_min, xi_max)  (anti-windup)
+    B[k]         = clamp(round(B0 + K_il * xi_l[k]), B_min, B_max)
 
-    e_l[k]      = L_target - l_meas[k]      # positive when below target
-    xi_l[k+1]   = xi_l[k] + e_l[k]          # integral of error
-    B[k]        = clamp(B0 + K_il*xi_l[k], B_min, B_max)
+    K_il > 0: when l_meas > L_target, xi_l decreases, B decreases → less contention.
+    K_il > 0: when l_meas < L_target, xi_l increases,  B increases → more contention.
 
-    When l > target:  e_l < 0 → xi_l ↓ → K_il*xi_l ↓ → B ↓ → less contention → l ↓  ✓
-    When l < target:  e_l > 0 → xi_l ↑ → B ↑ → more throughput                        ✓
+LOAD MODEL WITH FIFO QUEUE:
+    Each tick k:
+      1. a_k ~ Poisson(lambda[k]) new requests arrive → pushed onto software FIFO
+      2. n_dispatch = min(B_cmd, len(queue)) requests dequeued and fired concurrently
+      3. TTFT measured as mean of n_dispatch results via Prometheus histogram delta
+         (fallback: direct timing from a single request)
+    This makes lambda genuinely matter:
+      lambda > B_cmd → queue builds → only B_cmd served per tick
+      lambda < B_cmd → queue drains → fewer than B_cmd served (limited by demand)
 
-Latency measurement: rolling mean of the last N raw TTFT samples from
-the vLLM Prometheus histogram (per-tick deltas). Rolling mean smooths
-the noisy per-tick measurements without adding lag beyond N/2 ticks.
+DISTURBANCE SCHEDULE (via --schedule JSON or built-in presets):
+    Each segment: {"ticks": N, "lambda": λ, "L_target": L}
+    Segments run consecutively.
+
+Built-in preset 'rich' (used by default):
+    0-29:   Steady state         λ=3  L=300ms
+    30-59:  Lambda SPIKE UP      λ=6  L=300ms  (excess demand, queue builds)
+    60-89:  Return to nominal    λ=3  L=300ms
+    90-119: Lambda DROP          λ=1  L=300ms  (scarce demand, TTFT falls)
+    120-149:Return to nominal    λ=3  L=300ms
+    150-179:Target STEP DOWN     λ=3  L=200ms  (tighten SLA, controller must reduce B)
+    180-209:Return to nominal    λ=3  L=300ms
 
 Usage:
-    python3 run_controller.py [--params controller_params.json] [options]
-
-    # Steady-state test (60 ticks):
-    python3 run_controller.py --n_ticks 60
-
-    # Step-load spike:
-    python3 run_controller.py --n_ticks 90 --spike_on 30 --spike_off 60 --spike_mult 3
+    python3 run_controller.py                        # full rich preset
+    python3 run_controller.py --preset spike_only    # lambda spike only
+    python3 run_controller.py --n_ticks 60 --lambda_mean 3  # simple steady-state
 """
 
 import argparse
@@ -33,7 +47,7 @@ import threading
 import time
 import statistics
 import sys
-from collections import deque
+import collections
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -43,27 +57,49 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 DEFAULT_PARAMS = Path(__file__).parent / "controller_params.json"
 DEFAULT_URL    = "http://localhost:8001"
 DEFAULT_MODEL  = "mlx-community/Qwen3-0.6B-4bit"
 
 PROMPTS = [
-    "What is 2+2?",
-    "Name a colour.",
-    "What is the capital of France?",
-    "How many days in a week?",
-    "Name a planet.",
-    "What is the speed of light?",
-    "Name a mammal.",
-    "What is 10 times 10?",
+    "What is 2+2?", "Name a colour.", "What is the capital of France?",
+    "How many days in a week?", "Name a planet.", "What is the speed of light?",
+    "Name a mammal.", "What is 10 times 10?", "What colour is the sky?",
+    "Name a fruit.", "How many hours in a day?", "What is 5 squared?",
 ]
+
+# ---------------------------------------------------------------------------
+# Disturbance schedule presets
+# ---------------------------------------------------------------------------
+PRESETS = {
+    "rich": [
+        {"ticks": 30, "lambda": 3, "L_target": 300, "label": "Steady"},
+        {"ticks": 30, "lambda": 6, "L_target": 300, "label": "λ↑ Spike"},
+        {"ticks": 30, "lambda": 3, "L_target": 300, "label": "Recovery"},
+        {"ticks": 30, "lambda": 1, "L_target": 300, "label": "λ↓ Drop"},
+        {"ticks": 30, "lambda": 3, "L_target": 300, "label": "Recovery"},
+        {"ticks": 30, "lambda": 3, "L_target": 200, "label": "Target↓"},
+        {"ticks": 30, "lambda": 3, "L_target": 300, "label": "Target restore"},
+    ],
+    "spike_only": [
+        {"ticks": 20, "lambda": 3, "L_target": 300, "label": "Steady"},
+        {"ticks": 20, "lambda": 6, "L_target": 300, "label": "λ↑ Spike"},
+        {"ticks": 20, "lambda": 3, "L_target": 300, "label": "Recovery"},
+    ],
+    "target_step": [
+        {"ticks": 20, "lambda": 3, "L_target": 300, "label": "Steady"},
+        {"ticks": 30, "lambda": 3, "L_target": 200, "label": "Target↓"},
+        {"ticks": 20, "lambda": 3, "L_target": 300, "label": "Restore"},
+    ],
+}
 
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
-def ttft_ms(url: str, model: str, prompt: str, timeout: int = 30) -> float:
+def ttft_once(url: str, model: str, prompt: str, timeout: int = 30) -> float:
     body = json.dumps({"model": model, "prompt": prompt,
                        "max_tokens": 1, "stream": True})
     t0 = time.perf_counter()
@@ -91,161 +127,169 @@ def get_metrics(url: str) -> dict:
             v = float(parts[1])
         except ValueError:
             continue
-        out[parts[0]] = out.get(parts[0], 0.0) + v
+        k = parts[0]
+        out[k] = out.get(k, 0.0) + v
     return out
 
 
-def fire_b_concurrent(url: str, model: str, b: int,
-                      results: list, timeout: int = 30):
-    """Fire B TTFT requests concurrently, filling results list in-place."""
-    def worker(i):
+def fire_concurrent_ttft(url: str, model: str, prompts: list[str],
+                          timeout: int = 30) -> list[float]:
+    """Fire len(prompts) requests concurrently, return list of TTFTs."""
+    results = [float("nan")] * len(prompts)
+
+    def worker(i, prompt):
         try:
-            results[i] = ttft_ms(url, model, PROMPTS[i % len(PROMPTS)], timeout)
+            results[i] = ttft_once(url, model, prompt, timeout)
         except Exception:
-            results[i] = float("nan")
+            pass
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(b)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    threads = [threading.Thread(target=worker, args=(i, p), daemon=True)
+               for i, p in enumerate(prompts)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Latency smoother
+# Latency measurer using Prometheus histogram deltas
 # ---------------------------------------------------------------------------
-class RollingMean:
-    """Rolling mean over the last N samples. Returns NaN until primed."""
-    def __init__(self, n: int, init_val: float = None):
-        self._buf  = deque(maxlen=n)
-        self._n    = n
-        if init_val is not None:
-            for _ in range(n):
-                self._buf.append(init_val)
+class HistogramDelta:
+    def __init__(self, url: str):
+        self.url    = url
+        self._ps    = 0.0  # prev sum
+        self._pc    = 0.0  # prev count
 
-    def update(self, val: float) -> float:
-        if not math.isnan(val):
-            self._buf.append(val)
-        if len(self._buf) == 0:
-            return float("nan")
-        valid = [x for x in self._buf if not math.isnan(x)]
-        return statistics.mean(valid) if valid else float("nan")
+    def update(self, metrics: dict) -> float:
+        s  = metrics.get("vllm:time_to_first_token_seconds_sum",   0.0)
+        c  = metrics.get("vllm:time_to_first_token_seconds_count", 0.0)
+        ds = s  - self._ps
+        dc = c  - self._pc
+        self._ps, self._pc = s, c
+        return (ds / dc) * 1000.0 if dc > 0 else float("nan")
 
 
 # ---------------------------------------------------------------------------
 # Controller
 # ---------------------------------------------------------------------------
 class IntegralController:
-    """
-    Single integral controller: B[k] = B0 + K_il * xi_l[k]
-    K_il > 0 (positive) for GPU-contention plant where more B → more latency.
-    """
     def __init__(self, p: dict):
         c = p["controller"]
-        self.K_il     = c["K_il"]         # positive
-        self.B0       = c["B0"]
-        self.B_min    = c["B_min"]
-        self.B_max    = c["B_max"]
-        self.xi_min   = c["xi_min"]
-        self.xi_max   = c["xi_max"]
+        self.K_il    = c["K_il"]     # positive
+        self.xi      = 0.0
+        self.xi_min  = c["xi_min"]
+        self.xi_max  = c["xi_max"]
+        self.B0      = c["B0"]
+        self.B_min   = c["B_min"]
+        self.B_max   = c["B_max"]
         self.L_target = p["L_target"]
-        self.xi_l     = 0.0
 
-    def step(self, l_meas: float) -> tuple:
-        e_l      = self.L_target - l_meas
-        xi_sat   = max(self.xi_min, min(self.xi_max, self.xi_l))
-        B_raw    = self.B0 + self.K_il * xi_sat
-        B_cmd    = int(np.clip(round(B_raw), self.B_min, self.B_max))
+    def step(self, l_meas: float, L_target_override: Optional[float] = None) -> tuple:
+        L_tgt = L_target_override if L_target_override is not None else self.L_target
+        e     = L_tgt - l_meas      # + when too fast, - when too slow
 
-        # Conditional anti-windup
-        at_min = B_cmd <= self.B_min and e_l < 0   # latency above target, B already min
-        at_max = B_cmd >= self.B_max and e_l > 0   # latency below target, B already max
-        if not (at_min or at_max):
-            self.xi_l = max(self.xi_min, min(self.xi_max, xi_sat + e_l))
+        xi_sat = max(self.xi_min, min(self.xi_max, self.xi))
+        B_raw  = self.B0 + self.K_il * xi_sat
+        B_cmd  = int(np.clip(round(B_raw), self.B_min, self.B_max))
+
+        # Anti-windup: freeze if saturated in direction of error
+        at_lo = (B_cmd <= self.B_min) and (e > 0)   # want more but can't go lower
+        at_hi = (B_cmd >= self.B_max) and (e < 0)   # want less but can't go higher
+        if not (at_lo or at_hi):
+            self.xi = max(self.xi_min, min(self.xi_max, xi_sat + e))
         else:
-            self.xi_l = xi_sat
+            self.xi = xi_sat
 
-        return B_cmd, float(B_raw), e_l, xi_sat
+        return B_cmd, B_raw, e, xi_sat
 
 
 # ---------------------------------------------------------------------------
-# Experiment
+# Main experiment
 # ---------------------------------------------------------------------------
-def run_experiment(url, model, ctrl, params, n_ticks, lambda_mean,
-                   spike_on, spike_off, spike_mult, dt, n_smooth):
+def run(url: str, model: str, ctrl: IntegralController,
+        schedule: list[dict], dt: float, out_dir: Path) -> dict:
 
-    L_target = ctrl.L_target
-    smoother = RollingMean(n_smooth, init_val=L_target)
-
-    # Prime histogram baseline
-    metrics0 = get_metrics(url)
-    prev_s   = metrics0.get("vllm:time_to_first_token_seconds_sum",   0.0)
-    prev_c   = metrics0.get("vllm:time_to_first_token_seconds_count", 0.0)
-
-    log = {k: [] for k in ["tick","lam","B","l_raw","l_smooth",
-                            "l_target","e_l","xi_l","B_raw"]}
-
+    total_ticks = sum(s["ticks"] for s in schedule)
     print(f"\n{'═'*68}")
-    print(f"CLOSED-LOOP RUN  --  {n_ticks} ticks  dt={dt}s  λ={lambda_mean}")
-    if spike_on:
-        print(f"  Spike ticks {spike_on}–{spike_off}: λ × {spike_mult:.0f}")
-    print(f"  L_target={L_target:.0f} ms  K_il={ctrl.K_il:.6f}  B0={ctrl.B0}")
+    print(f"CLOSED-LOOP RUN  --  {total_ticks} ticks  dt={dt}s")
+    for s in schedule:
+        print(f"  {s['ticks']:3d} ticks: λ={s['lambda']}  L_target={s['L_target']} ms"
+              f"  [{s['label']}]")
     print(f"{'═'*68}\n")
-    print(f"{'k':>4} {'λ':>4} {'B':>3} {'l_raw':>7} {'l_sm':>7} {'e_l':>7} {'xi_l':>8}  note")
+    print(f"{'tick':>5} {'λ':>3} {'L_tgt':>6} {'q_sw':>5} "
+          f"{'B':>3} {'l_meas':>7} {'e_l':>7}  label")
     print("-" * 68)
 
-    for tick in range(n_ticks):
-        lam = lambda_mean * spike_mult if (spike_on and spike_off
-              and spike_on <= tick < spike_off) else lambda_mean
+    # Build tick-by-tick schedule
+    tick_schedule = []
+    for seg in schedule:
+        tick_schedule.extend([seg] * seg["ticks"])
+
+    # Software FIFO queue of pending prompts
+    queue: collections.deque = collections.deque()
+    prompt_idx = 0
+
+    # Latency measurer
+    hist = HistogramDelta(url)
+    m0   = get_metrics(url)
+    hist.update(m0)   # prime baseline
+
+    log = {"tick": [], "lambda": [], "L_target": [],
+           "q_sw": [], "B": [], "B_raw": [],
+           "l_meas": [], "e_l": [], "xi": [], "label": []}
+
+    for tick, seg in enumerate(tick_schedule):
+        lam     = seg["lambda"]
+        L_tgt   = seg["L_target"]
+        label   = seg["label"]
+        t_tick  = time.perf_counter()
+
+        # 1. Observe latency from Prometheus histogram delta
+        m      = get_metrics(url)
+        l_meas = hist.update(m)
+        if math.isnan(l_meas):
+            l_meas = L_tgt   # fallback on cold tick
+
+        # 2. Poisson arrivals → push to FIFO
         a_k = int(np.random.poisson(lam))
+        for _ in range(a_k):
+            queue.append(PROMPTS[prompt_idx % len(PROMPTS)])
+            prompt_idx += 1
 
-        t0 = time.perf_counter()
+        q_sw = len(queue)
 
-        # --- Measure latency from histogram delta ---
-        m  = get_metrics(url)
-        cs = m.get("vllm:time_to_first_token_seconds_sum",   0.0)
-        cc = m.get("vllm:time_to_first_token_seconds_count", 0.0)
-        dc = cc - prev_c
-        ds = cs - prev_s
-        l_raw = (ds / dc) * 1000.0 if dc > 0 else float("nan")
-        prev_s, prev_c = cs, cc
+        # 3. Control
+        B_cmd, B_raw, e_l, xi = ctrl.step(l_meas, L_tgt)
 
-        l_smooth = smoother.update(l_raw)
+        # 4. Dispatch min(B_cmd, queue_len) concurrently
+        n_dispatch = min(B_cmd, len(queue))
+        prompts_to_fire = [queue.popleft() for _ in range(n_dispatch)]
 
-        # Use smoothed value for control; fall back to target on NaN
-        l_ctrl = l_smooth if not math.isnan(l_smooth) else L_target
+        if prompts_to_fire:
+            # Fire concurrently, non-blocking (daemon threads)
+            def _fire(ps=prompts_to_fire):
+                fire_concurrent_ttft(url, model, ps)
+            threading.Thread(target=_fire, daemon=True).start()
 
-        # --- Control ---
-        B_cmd, B_raw, e_l, xi_l = ctrl.step(l_ctrl)
-
-        # --- Actuate: fire exactly B_cmd concurrent TTFT requests ---
-        results = [float("nan")] * B_cmd
-        fire_b_concurrent(url, model, B_cmd, results)
-
-        # Also update smoother with direct measurements if histogram was stale
-        valid = [x for x in results if not math.isnan(x)]
-        if valid and math.isnan(l_raw):
-            l_raw    = statistics.mean(valid)
-            l_smooth = smoother.update(l_raw)
-
-        note = "SPIKE" if (spike_on and spike_off and spike_on <= tick < spike_off) else ""
-        l_raw_str    = f"{l_raw:.0f}"    if not math.isnan(l_raw)    else "  NaN"
-        l_smooth_str = f"{l_smooth:.0f}" if not math.isnan(l_smooth) else "  NaN"
-
-        print(f"{tick+1:4d} {lam:4.0f} {B_cmd:3d} {l_raw_str:>7} "
-              f"{l_smooth_str:>7} {e_l:>7.1f} {xi_l:>8.1f}  {note}")
-
-        log["tick"].append(tick + 1)
-        log["lam"].append(lam)
-        log["B"].append(B_cmd)
-        log["l_raw"].append(l_raw if not math.isnan(l_raw) else None)
-        log["l_smooth"].append(l_smooth if not math.isnan(l_smooth) else None)
-        log["l_target"].append(L_target)
-        log["e_l"].append(e_l)
-        log["xi_l"].append(xi_l)
-        log["B_raw"].append(B_raw)
-
-        elapsed = time.perf_counter() - t0
+        # 5. Tick clock
+        elapsed = time.perf_counter() - t_tick
         if elapsed < dt:
             time.sleep(dt - elapsed)
+
+        print(f"{tick+1:5d} {lam:3.0f} {L_tgt:6.0f} {q_sw:5d} "
+              f"{B_cmd:3d} {l_meas:7.1f} {e_l:7.1f}  {label}")
+
+        log["tick"].append(tick + 1)
+        log["lambda"].append(lam)
+        log["L_target"].append(L_tgt)
+        log["q_sw"].append(q_sw)
+        log["B"].append(B_cmd)
+        log["B_raw"].append(B_raw)
+        log["l_meas"].append(l_meas)
+        log["e_l"].append(e_l)
+        log["xi"].append(xi)
+        log["label"].append(label)
 
     return log
 
@@ -253,62 +297,66 @@ def run_experiment(url, model, ctrl, params, n_ticks, lambda_mean,
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
-def plot_results(log, params, out_dir, label=""):
+def plot_results(log: dict, schedule: list[dict], params: dict,
+                 out_dir: Path) -> Path:
+
     ticks     = log["tick"]
-    L_tgt     = params["L_target"]
-    spike_on  = params.get("spike_on")
-    spike_off = params.get("spike_off")
+    n         = len(ticks)
 
-    # Replace None with NaN for plotting
-    l_raw    = [x if x is not None else float("nan") for x in log["l_raw"]]
-    l_smooth = [x if x is not None else float("nan") for x in log["l_smooth"]]
+    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+    fig.suptitle("Chapter 5 — Closed-loop integral controller on live vLLM",
+                 fontsize=13, fontweight="bold")
 
-    fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+    # Shade segments
+    COLORS = ["#f0f0f0", "#ffe8e8", "#e8ffe8", "#e8e8ff",
+              "#fff8e8", "#ffe8ff", "#e8f8ff"]
+    seg_start = 0
+    for ci, seg in enumerate(schedule):
+        seg_end = seg_start + seg["ticks"]
+        for ax in axes:
+            ax.axvspan(seg_start + 1, seg_end + 1,
+                       alpha=0.35, color=COLORS[ci % len(COLORS)], zorder=0)
+        axes[0].text((seg_start + seg_end) / 2 + 1, 0.97,
+                     seg["label"], transform=axes[0].get_xaxis_transform(),
+                     ha="center", va="top", fontsize=7.5, color="#333333")
+        seg_start = seg_end
 
-    # Panel 1: Latency
+    # Panel 1: latency + target
     ax = axes[0]
-    ax.plot(ticks, l_raw,    color="lightblue", linewidth=0.8,
-            alpha=0.6, label="l_raw (per-tick)")
-    ax.plot(ticks, l_smooth, color="blue", linewidth=1.8,
-            label="l_smooth (rolling mean)")
-    ax.axhline(L_tgt, color="black", linestyle="--", linewidth=1.5,
-               label=f"L_target = {L_tgt:.0f} ms")
-    if spike_on and spike_off:
-        ax.axvspan(spike_on, spike_off, alpha=0.12, color="orange",
-                   label="Load spike")
+    ax.plot(ticks, log["l_meas"], "b-", linewidth=1.3, label="l_meas (TTFT) [ms]", zorder=3)
+    ax.step(ticks, log["L_target"], "k--", linewidth=1.5,
+            where="post", label="L_target [ms]", zorder=3)
     ax.set_ylabel("TTFT [ms]")
-    ax.set_title(f"Chapter 5 — Closed-loop integral controller  {label}")
-    ax.legend(loc="upper right"); ax.grid(True, alpha=0.4)
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.4)
 
-    # Panel 2: Batch size B
+    # Panel 2: batch size B + lambda
     ax = axes[1]
-    ax.step(ticks, log["B"], color="purple", linewidth=1.5,
-            where="post", label="B (batch size commanded)")
-    ax.axhline(params["B0"], color="gray", linestyle=":",
-               label=f"B0 = {params['B0']}")
-    if spike_on and spike_off:
-        ax.axvspan(spike_on, spike_off, alpha=0.12, color="orange")
-    ax.set_ylabel("Batch size B [req]")
-    ax.set_ylim(max(0, params["B_min"] - 0.5), params["B_max"] + 0.5)
-    ax.legend(loc="upper right"); ax.grid(True, alpha=0.4)
+    ax.step(ticks, log["B"], "m-", linewidth=1.5, where="post",
+            label="B (dispatched)", zorder=3)
+    ax.step(ticks, log["lambda"], "k--", linewidth=1.0, where="post",
+            label="λ (arrivals)", zorder=3)
+    ax.set_ylabel("Requests / tick")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.4)
 
-    # Panel 3: Arrival rate and integrator state
-    ax  = axes[2]
-    ax2 = ax.twinx()
-    ax.step(ticks, log["lam"], "k--", linewidth=1.2,
-            where="post", label="λ (arrivals/tick)")
-    ax2.plot(ticks, log["xi_l"], color="green", linewidth=1.2,
-             alpha=0.7, label="ξ_l (integrator)")
-    ax2.axhline(0, color="green", linestyle=":", alpha=0.4)
-    if spike_on and spike_off:
-        ax.axvspan(spike_on, spike_off, alpha=0.12, color="orange")
+    # Panel 3: software queue depth
+    ax = axes[2]
+    ax.fill_between(ticks, log["q_sw"], step="post",
+                    color="orange", alpha=0.5, label="q_sw (FIFO depth)", zorder=3)
+    ax.step(ticks, log["q_sw"], "darkorange", linewidth=1.2, where="post", zorder=3)
+    ax.set_ylabel("Software queue [req]")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.4)
+
+    # Panel 4: integrator state xi
+    ax = axes[3]
+    ax.plot(ticks, log["xi"], "g-", linewidth=1.2, label="ξ (integrator state)", zorder=3)
+    ax.axhline(0, color="k", linewidth=0.7, linestyle="--")
+    ax.set_ylabel("ξ")
     ax.set_xlabel("Tick [k]")
-    ax.set_ylabel("Arrivals / tick")
-    ax2.set_ylabel("ξ_l  (integrator state)", color="green")
-    lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2,
-              loc="upper right"); ax.grid(True, alpha=0.4)
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.4)
 
     fig.tight_layout()
     ts   = datetime.now().strftime("%H%M%S")
@@ -323,88 +371,100 @@ def plot_results(log, params, out_dir, label=""):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--params",       default=str(DEFAULT_PARAMS))
-    ap.add_argument("--url",          default=DEFAULT_URL)
-    ap.add_argument("--model",        default=DEFAULT_MODEL)
-    ap.add_argument("--n_ticks",      type=int,   default=60)
-    ap.add_argument("--dt",           type=float, default=1.0)
-    ap.add_argument("--lambda_mean",  type=float, default=3.0)
-    ap.add_argument("--spike_on",     type=int,   default=None)
-    ap.add_argument("--spike_off",    type=int,   default=None)
-    ap.add_argument("--spike_mult",   type=float, default=3.0)
-    ap.add_argument("--n_smooth",     type=int,   default=6,
-                    help="Rolling window for latency smoothing")
-    ap.add_argument("--out_dir",      default=str(Path(__file__).parent))
-    ap.add_argument("--L_target",     type=float, default=None)
+    ap = argparse.ArgumentParser(
+        description="Chapter 5 closed-loop controller -- rich disturbance experiment")
+    ap.add_argument("--params",   default=str(DEFAULT_PARAMS))
+    ap.add_argument("--url",      default=DEFAULT_URL)
+    ap.add_argument("--model",    default=DEFAULT_MODEL)
+    ap.add_argument("--dt",       type=float, default=1.0)
+    ap.add_argument("--preset",   default="rich",
+                    choices=list(PRESETS.keys()),
+                    help="Disturbance schedule preset")
+    ap.add_argument("--schedule", default=None,
+                    help="JSON string: list of {ticks,lambda,L_target,label}")
+    ap.add_argument("--out_dir",  default=str(Path(__file__).parent))
+
+    # Simple overrides for quick one-liners
+    ap.add_argument("--n_ticks",     type=int,   default=None)
+    ap.add_argument("--lambda_mean", type=float, default=None)
+    ap.add_argument("--L_target",    type=float, default=None)
     args = ap.parse_args()
 
+    # Load controller params
     if not Path(args.params).exists():
-        sys.exit(f"Not found: {args.params}\nRun: python3 design_controller.py first.")
-
+        sys.exit(f"Controller params not found: {args.params}\n"
+                 f"Run: python3 design_controller.py first.")
     with open(args.params) as f:
         params = json.load(f)
-    print(f"Loaded: {args.params}")
+    print(f"Loaded controller: {args.params}")
+    c = params["controller"]
+    print(f"  K_il={c['K_il']:.6f}  z_cl={c['z_cl']:.4f}  "
+          f"B0={c['B0']}  B range=[{c['B_min']},{c['B_max']}]")
+    print(f"  L_target={params['L_target']:.0f} ms  "
+          f"tau_cl={c.get('tau_cl','?')}s  dt={params['dt']}s\n")
 
-    if args.L_target is not None:
-        params["L_target"] = args.L_target
-        params["controller"]["xi_min"] = (params["B_min"] - params["B0"]) / params["controller"]["K_il"]
-        params["controller"]["xi_max"] = (params["B_max"] - params["B0"]) / params["controller"]["K_il"]
-        print(f"L_target overridden to {args.L_target:.0f} ms")
+    # Build schedule
+    if args.schedule:
+        schedule = json.loads(args.schedule)
+    elif args.n_ticks:
+        # Simple single-segment run
+        schedule = [{"ticks": args.n_ticks,
+                     "lambda": args.lambda_mean or 3,
+                     "L_target": args.L_target or params["L_target"],
+                     "label": "Steady"}]
+    else:
+        schedule = PRESETS[args.preset]
+        if args.L_target:
+            for seg in schedule:
+                seg["L_target"] = args.L_target
 
+    # Health check
     try:
         requests.get(f"{args.url}/health", timeout=5).raise_for_status()
         print(f"vLLM healthy at {args.url}")
     except Exception as e:
-        sys.exit(f"vLLM not reachable: {e}")
+        sys.exit(f"vLLM not reachable: {e}\nRun: ./start_vllm.sh --bg")
 
-    ctrl = IntegralController(params)
-    print(f"Controller: K_il={ctrl.K_il:.6f}  B0={ctrl.B0}  "
-          f"B=[{ctrl.B_min},{ctrl.B_max}]  L_target={ctrl.L_target:.0f} ms")
-
+    ctrl    = IntegralController(params)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    params["spike_on"]  = args.spike_on
-    params["spike_off"] = args.spike_off
-
-    log = run_experiment(
-        url         = args.url,
-        model       = args.model,
-        ctrl        = ctrl,
-        params      = params,
-        n_ticks     = args.n_ticks,
-        lambda_mean = args.lambda_mean,
-        spike_on    = args.spike_on,
-        spike_off   = args.spike_off,
-        spike_mult  = args.spike_mult,
-        dt          = args.dt,
-        n_smooth    = args.n_smooth,
+    log = run(
+        url      = args.url,
+        model    = args.model,
+        ctrl     = ctrl,
+        schedule = schedule,
+        dt       = args.dt,
+        out_dir  = out_dir,
     )
 
-    # Summary
-    valid_raw    = [x for x in log["l_raw"]    if x is not None]
-    valid_smooth = [x for x in log["l_smooth"] if x is not None]
-    print("\n=== Run summary ===")
-    if valid_smooth:
-        p95 = sorted(valid_smooth)[int(0.95 * len(valid_smooth))]
-        print(f"  l_smooth: mean={statistics.mean(valid_smooth):.1f} ms  "
-              f"p95={p95:.1f} ms  target={params['L_target']:.0f} ms")
-    if valid_raw:
-        print(f"  l_raw:    mean={statistics.mean(valid_raw):.1f} ms  "
-              f"max={max(valid_raw):.1f} ms")
-    b_vals = log["B"]
-    print(f"  B:        mean={statistics.mean(b_vals):.2f}  "
-          f"min={min(b_vals)}  max={max(b_vals)}")
+    # Stats by segment
+    print("\n=== Per-segment summary ===")
+    seg_start = 0
+    for seg in schedule:
+        seg_end = seg_start + seg["ticks"]
+        sl = log["l_meas"][seg_start:seg_end]
+        sb = log["B"][seg_start:seg_end]
+        sq = log["q_sw"][seg_start:seg_end]
+        valid = [x for x in sl if not math.isnan(x)]
+        if valid:
+            p95 = sorted(valid)[int(0.95*len(valid))]
+            print(f"  {seg['label']:20s}  λ={seg['lambda']}  "
+                  f"L_tgt={seg['L_target']}  "
+                  f"l_mean={statistics.mean(valid):.0f}ms  "
+                  f"l_p95={p95:.0f}ms  "
+                  f"B_mean={statistics.mean(sb):.1f}  "
+                  f"q_max={max(sq)}")
+        seg_start = seg_end
 
-    ts  = datetime.now().strftime("%H%M%S")
-    lp  = out_dir / f"ch5_run_log_{ts}.json"
-    with open(lp, "w") as f:
-        json.dump({"params": params, "log": log}, f, indent=2)
-    print(f"  Log: {lp}")
+    # Save
+    ts       = datetime.now().strftime("%H%M%S")
+    log_path = out_dir / f"ch5_run_log_{ts}.json"
+    with open(log_path, "w") as f:
+        json.dump({"params": params, "schedule": schedule, "log": log}, f, indent=2)
+    print(f"\n  Log: {log_path}")
 
-    plot_results(log, params, out_dir,
-                 label=f"λ={args.lambda_mean}  dt={args.dt}s")
+    plot_results(log, schedule, params, out_dir)
 
 
 if __name__ == "__main__":
