@@ -113,8 +113,8 @@ fprintf('  TTFT(B0,q=0) = %.1f ms  (identified curve)\n\n', l_ttft_eq);
 % -------------------------------------------------------------------------
 % Inner loop dynamics: q[k+1] = q[k] - B[k] + arrivals
 % dt=1s ticks. Queue settles in ~2-3 ticks -> tau1=2s, tau2=3s is appropriate.
-perturbed.pp_tau1 = 2.0;   % s
-perturbed.pp_tau2 = 3.0;   % s
+perturbed.pp_tau1 = .20;   % s
+perturbed.pp_tau2 = .30;   % s
 perturbed.pp_f    = 0;     % non-oscillatory
 
 % -------------------------------------------------------------------------
@@ -123,7 +123,7 @@ perturbed.pp_f    = 0;     % non-oscillatory
 % Outer loop integrates latency error, commands q_ref.
 % Must be >> inner settling time (~3s) and >> measurement lag.
 % Use 20s: conservative, avoids oscillation given large beta.
-perturbed.tau_out = 20.0;  % s
+perturbed.tau_out = 2.00;  % s
 
 % -------------------------------------------------------------------------
 % 7. Design cascade controller

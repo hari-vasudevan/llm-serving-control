@@ -2,39 +2,45 @@
 %
 % Standalone -- no dependency on setup_plant.m.
 %
-% ROOT CAUSE OF PREVIOUS q=0 RESULTS
-% ------------------------------------
-% Blocking tick:  fire B requests → fetchOutputs (waits ALL ~2400ms) → read q
-%   By the time the next tick starts, all requests have completed.
-%   q is always 0 at tick boundaries. Beta is unidentifiable.
+% WHY PREVIOUS ATTEMPTS FAILED
+% -----------------------------
+% We tried using MATLAB parfeval workers as a load generator.
+% The problem: parfeval takes ~600ms to dispatch 8 calls because each
+% worker has inter-process overhead (~75ms per call).  With requests
+% completing in ~265ms each, by the time the last request reaches vLLM,
+% the first ones have finished.  The queue never accumulates.
 %
-% Non-blocking tick (this script):
-%   fire B requests → pause(dt=1s) → read q → fire next batch
-%   After 1s, the first batch is still in flight (completes at ~2400ms).
-%   vLLM has running=3, waiting=4 at the 1s tick boundary.
-%   q is non-zero. Beta is identifiable.
+% THE FIX
+% -------
+% Separate load generation from measurement:
+%   - load_gen.py runs in the background using Python threads.
+%     Python can fire concurrent HTTP requests with near-zero overhead,
+%     saturating vLLM's scheduler at any desired rate.
+%   - MATLAB reads /metrics at each tick boundary to observe q[k] and l[k].
+%   - MATLAB controls the experiment timing; Python drives the load.
 %
-% TICK STRUCTURE (Stages 3 and 4):
-%   1. Read q[k] from /metrics  <- queue from previous tick's overflow
-%   2. Fire b_k requests concurrently (non-blocking: do NOT fetchOutputs yet)
-%   3. pause(dt) to tick the clock
-%   4. Repeat
-%   After all ticks: collect all futures, compute latency statistics.
-%
-% Stage 2 keeps the blocking structure (we WANT q=0 for alpha/gamma fit).
+% STAGES
+%   1 -- /metrics smoke test  (confirms queue metrics are readable)
+%   2 -- B sweep at q=0       (blocking parfeval, TTFT, fits alpha+gamma)
+%   3 -- Queue buildup        (Python load at lambda > max_num_seqs, fits beta)
+%   4 -- Operating envelope   (Python load at swept lambda values)
 %
 % HOW TO RUN
 %   1. ./start_vllm.sh --bg
 %   2. curl http://localhost:8001/health
-%   3. Run this script from MATLAB
+%   3. Run this script from MATLAB (it manages load_gen.py automatically)
 
 clear; clc;
 
 id_dir  = fileparts(mfilename('fullpath'));
 src_dir = fullfile(id_dir, '..', 'src');
+py_gen  = fullfile(id_dir, '..', 'load_gen.py');
+pid_file = '/tmp/load_gen.pid';
 addpath(src_dir);
+
 fprintf('[init] id_dir  = %s\n', id_dir);
-fprintf('[init] src_dir = %s\n\n', src_dir);
+fprintf('[init] src_dir = %s\n', src_dir);
+fprintf('[init] load_gen= %s\n\n', py_gen);
 
 % -------------------------------------------------------------------------
 % Configuration
@@ -44,31 +50,31 @@ cfg.model       = 'mlx-community/Qwen3-0.6B-4bit';
 cfg.metrics_url = 'http://localhost:8001/metrics';
 cfg.gen_url     = 'http://localhost:8001/v1/completions';
 cfg.timeout     = 30;
-cfg.dt          = 1.0;      % s -- tick clock for Stages 3/4
+cfg.dt          = 1.0;       % s -- observation tick
 
-cfg.num_predict = 1;        % Stage 2: TTFT, q=0
-cfg.e2e_tokens  = 20;       % Stages 3/4: ~250ms/req -> queue persists across ticks
+cfg.num_predict = 1;         % Stage 2: TTFT
+cfg.e2e_tokens  = 20;        % Stage 2 e2e and load_gen tokens
 
 cfg.b_sweep     = [1 2 3 4 5 6 8];
 cfg.n_reps      = 5;
 
-cfg.lambda_build = 10;      % req/tick for Stage 3 (> max_num_seqs=4)
-cfg.b_max        = 8;       % worker pool cap
-cfg.build_ticks  = 15;
-cfg.meas_ticks3  = 10;
+% Stage 3: sustained load to identify beta
+cfg.s3_rate     = 16;        % req/s fed to vLLM (> max_num_seqs*2 = 8)
+cfg.s3_workers  = 16;        % Python threads
+cfg.build_ticks = 20;        % ticks with load before measuring
+cfg.meas_ticks3 = 15;
 
-cfg.lambda_sweep = [1 2 3 4 6 8];
+% Stage 4: envelope
+cfg.lambda_sweep = [2 4 6 8 12 16];  % req/s for Python load generator
 cfg.settle_ticks = 15;
 cfg.meas_ticks4  = 10;
 
 cfg.prompts = {'What is 2+2?'; 'Name a colour.'; 'Capital of France?'; 'Days in a week?'; 'Name a planet.'};
 
 fprintf('[config] model        = %s\n',   cfg.model);
-fprintf('[config] dt           = %.1fs\n',cfg.dt);
-fprintf('[config] e2e_tokens   = %d\n',   cfg.e2e_tokens);
-fprintf('[config] lambda_build = %d\n',   cfg.lambda_build);
-fprintf('[config] lambda_sweep = %s\n',   num2str(cfg.lambda_sweep));
-fprintf('[config] b_max        = %d\n\n', cfg.b_max);
+fprintf('[config] dt           = %.1fs\n', cfg.dt);
+fprintf('[config] s3_rate      = %d req/s\n', cfg.s3_rate);
+fprintf('[config] lambda_sweep = %s req/s\n\n', num2str(cfg.lambda_sweep));
 
 % =========================================================================
 % STAGE 1 -- Smoke test
@@ -79,30 +85,35 @@ fprintf('═══════════════════════�
 
 try
     webread([cfg.base_url '/health'], weboptions('Timeout',5));
-    fprintf('[stage1] Health: OK\n');
+    fprintf('[stage1] vLLM health: OK\n');
 catch e
     error('vLLM not reachable: %s', e.message);
 end
 
-try
-    m = read_metrics(cfg.metrics_url);
-    fprintf('[stage1] num_requests_running = %g\n', safe_get(m,'vllm_num_requests_running'));
-    fprintf('[stage1] num_requests_waiting = %g\n', safe_get(m,'vllm_num_requests_waiting'));
-    fprintf('[stage1] Metrics OK.\n\n');
-catch e
-    fprintf('[stage1] Metrics warning: %s\n\n', e.message);
+m = read_metrics(cfg.metrics_url);
+fprintf('[stage1] num_requests_running = %g\n', safe_field(m,'vllm_num_requests_running'));
+fprintf('[stage1] num_requests_waiting = %g\n', safe_field(m,'vllm_num_requests_waiting'));
+
+% Confirm Python and load_gen.py are available
+[rc, ~] = system('python3 --version 2>&1');
+if rc ~= 0
+    error('python3 not found -- needed for load generator');
 end
+if ~exist(py_gen, 'file')
+    error('load_gen.py not found at %s', py_gen);
+end
+fprintf('[stage1] Python3 OK, load_gen.py found.\n\n');
 
 % =========================================================================
-% STAGE 2 -- B sweep at q=0  (BLOCKING, TTFT)
+% STAGE 2 -- B sweep at q=0  (blocking parfeval, TTFT)
 % =========================================================================
 fprintf('═══════════════════════════════════════════════════════════════\n');
-fprintf('STAGE 2: B sweep at q=0  [TTFT, blocking]\n');
+fprintf('STAGE 2: B sweep at q=0  [TTFT, blocking parfeval]\n');
 fprintf('═══════════════════════════════════════════════════════════════\n\n');
 
 pool = gcp('nocreate');
 if isempty(pool)
-    parpool('local', min(cfg.b_max+2, feature('numcores')));
+    parpool('local', min(max(cfg.b_sweep)+2, feature('numcores')));
 end
 addAttachedFiles(gcp(), src_dir);
 fprintf('[stage2] Pool: %d workers\n\n', gcp().NumWorkers);
@@ -110,8 +121,7 @@ fprintf('[stage2] Pool: %d workers\n\n', gcp().NumWorkers);
 fprintf('[stage2] Warming up...\n');
 for w = 1:3
     f = parfeval(@vllm_ttft, 1, cfg.gen_url, cfg.model, 'Hello', cfg.num_predict, cfg.timeout);
-    try; lat = fetchOutputs(f); fprintf('  warmup %d: %.0fms\n',w,lat);
-    catch e; fprintf('  warmup %d: error\n',w); end
+    try; lat = fetchOutputs(f); fprintf('  warmup %d: %.0fms\n',w,lat); catch; end
 end
 fprintf('\n');
 
@@ -141,7 +151,7 @@ for bi = 1:n_b
     fprintf('  --> %.1f ± %.1f ms\n\n', l_mean_b(bi), l_std_b(bi));
 end
 
-v = isfinite(l_mean_b) & l_mean_b > 0;
+v  = isfinite(l_mean_b) & l_mean_b > 0;
 p2 = [cfg.b_sweep(v)', cfg.b_sweep(v)'.^2] \ l_mean_b(v);
 alpha_id = p2(1); gamma_id = p2(2);
 l_fit = [cfg.b_sweep(v)', cfg.b_sweep(v)'.^2] * p2;
@@ -153,26 +163,35 @@ fprintf('[stage2] R^2   = %.4f\n\n',        r2_s2);
 
 fig2 = figure('Visible','off');
 errorbar(cfg.b_sweep, l_mean_b, l_std_b, 'bo','MarkerFaceColor','b','LineWidth',1.2); hold on;
-bf = linspace(0.5, max(cfg.b_sweep)+0.5, 200);
+bf = linspace(0.5,max(cfg.b_sweep)+0.5,200);
 plot(bf, alpha_id*bf+gamma_id*bf.^2, 'r-','LineWidth',2);
 xlabel('B [req]'); ylabel('TTFT [ms]');
-title(sprintf('Stage 2 (q=0)\nalpha=%.3f  gamma=%.4f  R^2=%.3f',alpha_id,gamma_id,r2_s2));
+title(sprintf('Stage 2 (q=0): alpha=%.3f  gamma=%.4f  R^2=%.3f',alpha_id,gamma_id,r2_s2));
 grid on; saveas(fig2, fullfile(id_dir,'ch5_stage2_b_sweep.png'));
 fprintf('[stage2] Plot saved.\n\n');
 
 % =========================================================================
-% STAGE 3 -- Queue buildup  (NON-BLOCKING tick, e2e)
+% STAGE 3 -- Queue buildup  (Python load generator, MATLAB observes)
 % =========================================================================
 fprintf('═══════════════════════════════════════════════════════════════\n');
-fprintf('STAGE 3: Queue buildup  [e2e %dtok, NON-BLOCKING dt=%.1fs]\n', cfg.e2e_tokens, cfg.dt);
+fprintf('STAGE 3: Queue buildup  [Python load gen, MATLAB observes]\n');
 fprintf('═══════════════════════════════════════════════════════════════\n\n');
-fprintf('Tick structure: read q → fire b_k requests → pause(dt) → repeat\n');
-fprintf('Requests fire faster than they complete -> queue builds in vLLM.\n\n');
+fprintf('Strategy:\n');
+fprintf('  Python fires %d req/s continuously in background threads.\n', cfg.s3_rate);
+fprintf('  MATLAB reads /metrics every dt=%.1fs to observe q[k].\n', cfg.dt);
+fprintf('  Residual l_ss - (alpha*B_ss + gamma*B_ss^2) = beta * q_ss\n\n');
 
-n3    = cfg.build_ticks + cfg.meas_ticks3;
-b_k3  = min(cfg.lambda_build, cfg.b_max);
-q_log3 = zeros(n3,1);
-all_fut3 = {};   % accumulate all futures -- collect at end
+% Start Python load generator
+stop_load_gen(pid_file);   % kill any existing instance
+cmd = sprintf('source ~/.venv-vllm-metal/bin/activate && python3 %s --rate %d --workers %d --tokens %d --port 8001 --pid_file %s > /tmp/load_gen.log 2>&1 &', ...
+    py_gen, cfg.s3_rate, cfg.s3_workers, cfg.e2e_tokens, pid_file);
+system(cmd);
+pause(2);  % let load generator start up
+fprintf('[stage3] Load generator started at %d req/s\n', cfg.s3_rate);
+
+n3      = cfg.build_ticks + cfg.meas_ticks3;
+q_log3  = zeros(n3,1);
+l_log3  = zeros(n3,1);
 
 for tick = 1:n3
     phase = 'build';
@@ -180,132 +199,120 @@ for tick = 1:n3
 
     t_tick = tic;
 
-    % 1. Read q[k] -- leftover from previous tick's requests still in vLLM
-    q_k = 0;
-    try
-        m   = read_metrics(cfg.metrics_url);
-        q_k = safe_get(m,'vllm_num_requests_waiting');
-    catch; end
-
-    % 2. Fire b_k3 requests (non-blocking)
-    for i = 1:b_k3
-        all_fut3{end+1} = parfeval(@vllm_e2e, 1, cfg.gen_url, cfg.model, ...
-            cfg.prompts{mod(i-1,numel(cfg.prompts))+1}, cfg.e2e_tokens, cfg.timeout);
-    end
-
-    % 3. Tick clock: wait remaining dt
-    elapsed = toc(t_tick);
-    if elapsed < cfg.dt
-        pause(cfg.dt - elapsed);
-    end
+    % Read q[k] and l_meas from vLLM metrics
+    m    = read_metrics(cfg.metrics_url);
+    q_k  = safe_field(m,'vllm_num_requests_waiting');
+    % l_p95 from histogram sum/count
+    l_k  = get_ttft_mean_ms(m);
 
     q_log3(tick) = q_k;
-    fprintf('  tick %3d [%s]  q=%5.1f  b=%d  (wall=%.0fms)\n', ...
-        tick, phase, q_k, b_k3, toc(t_tick)*1000);
+    l_log3(tick) = l_k;
+
+    fprintf('  tick %3d [%s]  q=%5.1f  l=%5.0f ms\n', tick, phase, q_k, l_k);
+
+    % Wait remainder of dt
+    elapsed = toc(t_tick);
+    if elapsed < cfg.dt; pause(cfg.dt - elapsed); end
 end
 
-% Collect all futures (blocks here, after ticks are done)
-fprintf('\n[stage3] Collecting %d futures...\n', numel(all_fut3));
-lats3 = zeros(1,numel(all_fut3));
-for i = 1:numel(all_fut3)
-    try; lats3(i) = fetchOutputs(all_fut3{i}); catch; lats3(i) = NaN; end
-end
+% Stop load generator
+stop_load_gen(pid_file);
+fprintf('[stage3] Load generator stopped.\n\n');
 
-% Latency for measurement window = futures from last meas_ticks3 * b_k3 requests
-n_meas_fut3 = cfg.meas_ticks3 * b_k3;
-l_ss3 = mean(lats3(end-n_meas_fut3+1:end), 'omitnan');
-q_ss3 = mean(q_log3(cfg.build_ticks+1:end));
-b_ss3 = b_k3;
+meas3 = (cfg.build_ticks+1):n3;
+q_ss3 = mean(q_log3(meas3));
+l_ss3 = mean(l_log3(meas3));
+% Use mode of b during meas window from vLLM perspective (running + waiting capped at max_num_seqs*2)
+% We don't have b_ss directly -- approximate from running at measurement time
+m_tmp = read_metrics(cfg.metrics_url);
+b_ss3 = safe_field(m_tmp,'vllm_num_requests_running');  % after load stops, ~0
+% Use alpha/gamma fit to estimate effective B during load
+% b_ss ≈ min(rate, max_num_seqs) = 4
+b_ss3 = 4;  % max_num_seqs
 svc3  = alpha_id*b_ss3 + gamma_id*b_ss3^2;
 
-fprintf('[stage3] q_ss=%.2f  b_ss=%d  l_ss=%.0fms  svc=%.0fms\n', q_ss3, b_ss3, l_ss3, svc3);
+fprintf('[stage3] q_ss=%.2f  l_ss=%.0fms  b_ss(approx)=%d  svc=%.0fms\n', ...
+    q_ss3, l_ss3, b_ss3, svc3);
 
-if q_ss3 > 0.1
+if q_ss3 > 0.5 && ~isnan(l_ss3)
     beta_id = (l_ss3 - svc3) / q_ss3;
     fprintf('[stage3] beta = %.4f ms/req\n\n', beta_id);
 else
     beta_id = NaN;
-    fprintf('[stage3] WARNING: q_ss still 0. Try larger lambda_build or smaller dt.\n\n');
+    fprintf('[stage3] WARNING: q_ss=%.2f or l_ss=NaN -- queue did not build.\n\n', q_ss3);
 end
 
 fig3 = figure('Visible','off');
-plot(1:n3, q_log3, 'b-o','LineWidth',1.5); hold on;
-xline(cfg.build_ticks+0.5,'r--','Measurement window');
-xlabel('Tick'); ylabel('num\_requests\_waiting');
-title('Stage 3 — Queue buildup (non-blocking ticks)'); grid on;
+yyaxis left;
+plot(1:n3, q_log3, 'b-o','LineWidth',1.5); ylabel('q [req]');
+yyaxis right;
+plot(1:n3, l_log3, 'r-s','LineWidth',1.5); ylabel('l_{meas} [ms]');
+hold on; xline(cfg.build_ticks+0.5,'k--','Measurement window');
+xlabel('Tick'); title('Stage 3 — Queue buildup (Python load generator)'); grid on;
 saveas(fig3, fullfile(id_dir,'ch5_stage3_queue.png'));
 fprintf('[stage3] Plot saved.\n\n');
 
 % =========================================================================
-% STAGE 4 -- Operating envelope  (NON-BLOCKING tick, e2e)
+% STAGE 4 -- Operating envelope
 % =========================================================================
 fprintf('═══════════════════════════════════════════════════════════════\n');
-fprintf('STAGE 4: Operating envelope  [e2e, NON-BLOCKING dt=%.1fs]\n', cfg.dt);
+fprintf('STAGE 4: Operating envelope  [Python load swept over lambda]\n');
 fprintf('═══════════════════════════════════════════════════════════════\n\n');
 
-n_lam    = numel(cfg.lambda_sweep);
-env_q    = zeros(n_lam,1);
-env_b    = zeros(n_lam,1);
-env_l    = zeros(n_lam,1);
+n_lam = numel(cfg.lambda_sweep);
+env_q = zeros(n_lam,1);
+env_l = zeros(n_lam,1);
 
 for li = 1:n_lam
-    lam = cfg.lambda_sweep(li);
-    b_k = min(lam, cfg.b_max);
-    n4  = cfg.settle_ticks + cfg.meas_ticks4;
-    fprintf('[stage4] lambda=%d  b=%d  (%d settle + %d meas)...\n', ...
-        lam, b_k, cfg.settle_ticks, cfg.meas_ticks4);
+    rate = cfg.lambda_sweep(li);
+    workers = max(rate, 8);   % enough threads to sustain the rate
+    fprintf('[stage4] rate=%d req/s  workers=%d  (%d settle + %d meas ticks)...\n', ...
+        rate, workers, cfg.settle_ticks, cfg.meas_ticks4);
 
-    q_all4  = zeros(n4,1);
-    all_fut4 = {};
+    % Start load generator at this rate
+    stop_load_gen(pid_file);
+    cmd = sprintf('source ~/.venv-vllm-metal/bin/activate && python3 %s --rate %d --workers %d --tokens %d --port 8001 --pid_file %s > /tmp/load_gen.log 2>&1 &', ...
+        py_gen, rate, workers, cfg.e2e_tokens, pid_file);
+    system(cmd);
+    pause(2);
+
+    n4 = cfg.settle_ticks + cfg.meas_ticks4;
+    q_all = zeros(n4,1);
+    l_all = zeros(n4,1);
 
     for tick = 1:n4
         phase = 'settle'; if tick > cfg.settle_ticks; phase = 'MEAS  '; end
         t_tick = tic;
 
-        % 1. Read q[k]
-        q_k4 = 0;
-        try; m = read_metrics(cfg.metrics_url); q_k4 = safe_get(m,'vllm_num_requests_waiting'); catch; end
+        m   = read_metrics(cfg.metrics_url);
+        q_k = safe_field(m,'vllm_num_requests_waiting');
+        l_k = get_ttft_mean_ms(m);
 
-        % 2. Fire non-blocking
-        for i = 1:b_k
-            all_fut4{end+1} = parfeval(@vllm_e2e, 1, cfg.gen_url, cfg.model, ...
-                cfg.prompts{mod(i-1,numel(cfg.prompts))+1}, cfg.e2e_tokens, cfg.timeout);
-        end
+        q_all(tick) = q_k;
+        l_all(tick) = l_k;
 
-        % 3. Tick clock
+        fprintf('  tick %2d [%s]  q=%5.1f  l=%5.0f ms\n', tick, phase, q_k, l_k);
+
         elapsed = toc(t_tick);
         if elapsed < cfg.dt; pause(cfg.dt - elapsed); end
-
-        q_all4(tick) = q_k4;
-        fprintf('  tick %2d [%s]  q=%5.1f  b=%d\n', tick, phase, q_k4, b_k);
     end
 
-    % Collect futures
-    fprintf('  Collecting %d futures...\n', numel(all_fut4));
-    lats4 = zeros(1,numel(all_fut4));
-    for i = 1:numel(all_fut4)
-        try; lats4(i) = fetchOutputs(all_fut4{i}); catch; lats4(i) = NaN; end
-    end
+    stop_load_gen(pid_file);
+    pause(3);  % drain queue before next lambda
 
-    n_meas_fut4 = cfg.meas_ticks4 * b_k;
     meas4 = (cfg.settle_ticks+1):n4;
-    env_q(li) = mean(q_all4(meas4));
-    env_b(li) = b_k;
-    env_l(li) = mean(lats4(end-n_meas_fut4+1:end), 'omitnan');
+    env_q(li) = mean(q_all(meas4));
+    env_l(li) = mean(l_all(meas4));
     fprintf('  --> q_ss=%.2f  l_ss=%.0fms\n\n', env_q(li), env_l(li));
-
-    % Drain queue before next lambda: wait for all futures to complete
-    fprintf('  Draining queue...\n');
-    pause(5);  % let vLLM finish outstanding requests
 end
 
 fig4 = figure('Visible','off','Position',[100 100 900 350]);
 subplot(1,2,1);
 plot(cfg.lambda_sweep, env_l, 'b-o','LineWidth',1.5,'MarkerFaceColor','b');
-xlabel('\lambda [req/tick]'); ylabel('l_{ss} [ms]'); title('Latency vs lambda'); grid on;
+xlabel('\lambda [req/s]'); ylabel('l_{ss} [ms]'); title('Latency vs rate'); grid on;
 subplot(1,2,2);
 plot(cfg.lambda_sweep, env_q, 'r-o','LineWidth',1.5,'MarkerFaceColor','r');
-xlabel('\lambda [req/tick]'); ylabel('q_{ss} [req]'); title('Queue depth vs lambda'); grid on;
+xlabel('\lambda [req/s]'); ylabel('q_{ss} [req]'); title('Queue depth vs rate'); grid on;
 saveas(fig4, fullfile(id_dir,'ch5_stage4_envelope.png'));
 fprintf('[stage4] Plot saved.\n\n');
 
@@ -323,9 +330,9 @@ else
     fprintf('║  beta  =      NaN\n');
 end
 fprintf('╠══════════════════════════════════════════════════════════════╣\n');
-fprintf('║  Operating envelope:\n');
+fprintf('║  Operating envelope (rate in req/s):\n');
 for li = 1:n_lam
-    fprintf('║    lambda=%2d  q=%5.1f  l=%6.0f ms\n', cfg.lambda_sweep(li), env_q(li), env_l(li));
+    fprintf('║    rate=%3d  q=%5.1f  l=%6.0f ms\n', cfg.lambda_sweep(li), env_q(li), env_l(li));
 end
 fprintf('╚══════════════════════════════════════════════════════════════╝\n\n');
 
@@ -341,7 +348,6 @@ identified.timestamp      = char(datetime('now'));
 identified.envelope.lambda = cfg.lambda_sweep;
 identified.envelope.q_ss   = env_q';
 identified.envelope.l_ss   = env_l';
-identified.envelope.b_ss   = env_b';
 identified.raw.b_sweep     = cfg.b_sweep;
 identified.raw.l_mean_b    = l_mean_b;
 identified.raw.l_std_b     = l_std_b;
@@ -360,13 +366,13 @@ end
 % HELPERS
 % =========================================================================
 function m = read_metrics(url)
-    raw = webread(url, weboptions('Timeout',3,'ContentType','text'));
+    raw = webread(url, weboptions('Timeout',5,'ContentType','text'));
     m   = struct();
     for line = strsplit(raw, newline)
         s = strtrim(line{1});
-        if isempty(s) || s(1)=='#'; continue; end
-        clean = strtrim(regexprep(s,'\{[^}]*\}',''));
-        p = regexp(clean,'\s+','split');
+        if isempty(s)||s(1)=='#'; continue; end
+        c = strtrim(regexprep(s,'\{[^}]*\}',''));
+        p = regexp(c,'\s+','split');
         if numel(p)<2; continue; end
         v = str2double(p{2});
         if isnan(v); continue; end
@@ -375,6 +381,29 @@ function m = read_metrics(url)
     end
 end
 
-function v = safe_get(m, field)
+function v = safe_field(m, field)
     if isfield(m, field); v = m.(field); else; v = 0; end
+end
+
+function l_ms = get_ttft_mean_ms(m)
+% Compute mean TTFT in ms from vLLM histogram sum/count fields.
+% vllm:time_to_first_token_seconds_sum / _count -> mean in seconds -> *1000 ms
+    s = safe_field(m, 'vllm_time_to_first_token_seconds_sum');
+    c = safe_field(m, 'vllm_time_to_first_token_seconds_count');
+    if c > 0
+        l_ms = (s / c) * 1000;
+    else
+        l_ms = NaN;
+    end
+end
+
+function stop_load_gen(pid_file)
+% Kill existing load_gen.py process if running.
+    if exist(pid_file, 'file')
+        pid_txt = strtrim(fileread(pid_file));
+        system(sprintf('kill %s 2>/dev/null; rm -f %s', pid_txt, pid_file));
+        pause(0.5);
+    end
+    % Also kill any stray python load_gen processes
+    system('pkill -f load_gen.py 2>/dev/null; true');
 end
