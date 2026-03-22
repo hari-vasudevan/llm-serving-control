@@ -15,12 +15,12 @@ classdef ollama_plant < matlab.System
     properties
         ollama_url    = 'http://localhost:11434/api/generate'
         model_name    = 'qwen2.5:7b'
-        num_predict   = 50
-        n_win         = 2
+        num_predict   = 1
+        n_win         = 20
         http_timeout  = 30
-        q_max         = 3
+        q_max         = 10
         b_min         = 1
-        b_max         = 16
+        b_max         = 4
         prompts_path  = '/Users/hvasudevan/Documents/MATLAB/llm_control_v2/chapter_3/llm_requirements/prompts.txt'
         n_warmup      = 4
     end
