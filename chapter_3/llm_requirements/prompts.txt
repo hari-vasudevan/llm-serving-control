@@ -1,0 +1,86 @@
+# LLM Prompt Library — Chapter 3 (Ollama / qwen2.5:7b)
+#
+# Purpose:
+#   These prompts are queued by the MATLAB load generator each tick.
+#   They are chosen to produce realistic, variable-length responses
+#   so that inference latency is meaningfully non-constant — giving
+#   the cascade controller real dynamics to regulate.
+#
+# Design criteria:
+#   - SHORT prompts  (~10-30 token response):  fast path, low latency
+#   - MEDIUM prompts (~50-100 token response): mid-range latency
+#   - LONG prompts   (~150-250 token response): slow path, stress test
+#
+#   The load generator samples uniformly from this list each tick.
+#   Mixing categories creates the latency variance the p95 metric
+#   is sensitive to — exactly what the outer loop must regulate.
+#
+# Format: one prompt per line, category tag in brackets at the start.
+# Lines beginning with # are comments and are ignored by the loader.
+#
+# ─────────────────────────────────────────────────────────────────────
+# SHORT  (~10-30 tokens out)
+# ─────────────────────────────────────────────────────────────────────
+[SHORT] What is the capital of France?
+[SHORT] What is 144 divided by 12?
+[SHORT] Name the three states of matter.
+[SHORT] What colour is the sky on a clear day?
+[SHORT] How many sides does a hexagon have?
+[SHORT] What is the chemical symbol for gold?
+[SHORT] Who wrote Romeo and Juliet?
+[SHORT] What is the boiling point of water in Celsius?
+[SHORT] What planet is closest to the Sun?
+[SHORT] How many bones are in the adult human body?
+[SHORT] What is the square root of 256?
+[SHORT] Name the four oceans.
+[SHORT] What gas do plants absorb during photosynthesis?
+[SHORT] How many days are in a leap year?
+[SHORT] What is the speed of light in km/s?
+[SHORT] What currency does Japan use?
+[SHORT] Who painted the Mona Lisa?
+[SHORT] What is the largest mammal on Earth?
+[SHORT] How many chambers does a human heart have?
+[SHORT] What is H2O?
+#
+# ─────────────────────────────────────────────────────────────────────
+# MEDIUM  (~50-100 tokens out)
+# ─────────────────────────────────────────────────────────────────────
+[MEDIUM] Explain in two sentences how a transformer neural network works.
+[MEDIUM] What is the difference between supervised and unsupervised learning?
+[MEDIUM] Describe briefly how TCP/IP works.
+[MEDIUM] What is gradient descent and why is it used in machine learning?
+[MEDIUM] Explain the concept of a context window in a large language model.
+[MEDIUM] What is the difference between latency and throughput in a computer system?
+[MEDIUM] Briefly explain what a Poisson process is.
+[MEDIUM] What is the difference between RAM and disk storage?
+[MEDIUM] Explain in two sentences what a REST API is.
+[MEDIUM] What is backpropagation in neural networks?
+[MEDIUM] Describe the difference between a process and a thread in an operating system.
+[MEDIUM] What is a hash function and what is it used for?
+[MEDIUM] Briefly explain what the PageRank algorithm does.
+[MEDIUM] What is the difference between precision and recall in machine learning?
+[MEDIUM] Explain what KV cache is in the context of LLM inference.
+[MEDIUM] What is the difference between batch normalisation and layer normalisation?
+[MEDIUM] Describe how attention mechanisms work in one paragraph.
+[MEDIUM] What is a softmax function and when is it used?
+[MEDIUM] Explain the concept of quantisation in the context of neural network inference.
+[MEDIUM] What is the difference between a compiler and an interpreter?
+#
+# ─────────────────────────────────────────────────────────────────────
+# LONG  (~150-250 tokens out)
+# ─────────────────────────────────────────────────────────────────────
+[LONG] Explain how a modern LLM inference server handles concurrent requests, covering batching, KV cache management, and scheduling decisions.
+[LONG] Describe the tradeoffs between model quantisation levels (fp16, int8, int4) in terms of memory, latency, and output quality.
+[LONG] Explain in detail how continuous batching in vLLM differs from static batching, and why it improves GPU utilisation.
+[LONG] Walk through the steps a transformer model takes to generate a single output token, from input embedding to softmax sampling.
+[LONG] Describe the causes of latency variability in an LLM serving system and what techniques can reduce p95 latency.
+[LONG] Explain how PagedAttention works and what problem it solves compared to contiguous KV cache allocation.
+[LONG] Describe how a PID controller works, including the role of each term, and give an example application in a computing system.
+[LONG] Explain the concept of Little's Law and how it applies to queueing in an LLM inference system.
+[LONG] Describe the tradeoffs between increasing batch size in neural network inference: throughput, latency, memory, and GPU utilisation.
+[LONG] Explain what speculative decoding is, how it works, and what conditions make it beneficial for LLM inference.
+[LONG] Describe how RLHF (reinforcement learning from human feedback) is used to align large language models.
+[LONG] Explain the memory hierarchy of a modern GPU (registers, shared memory, L2 cache, HBM) and how it affects LLM inference latency.
+[LONG] Describe the attention is all you need paper's key contributions and how they changed the field of NLP.
+[LONG] Explain what flash attention is, the problem it solves, and how it achieves its memory efficiency.
+[LONG] Walk through how beam search works in language model decoding and compare it to greedy decoding and sampling.
