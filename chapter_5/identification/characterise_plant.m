@@ -215,9 +215,10 @@ for tick = 1:n3
     if elapsed < cfg.dt; pause(cfg.dt - elapsed); end
 end
 
-% Stop load generator
+% Stop load generator and drain queue before Stage 4
 stop_load_gen(pid_file);
-fprintf('[stage3] Load generator stopped.\n\n');
+drain_queue(cfg.metrics_url);
+fprintf('[stage3] Load generator stopped and queue drained.\n\n');
 
 meas3 = (cfg.build_ticks+1):n3;
 q_ss3 = mean(q_log3(meas3));
@@ -298,7 +299,7 @@ for li = 1:n_lam
     end
 
     stop_load_gen(pid_file);
-    pause(3);  % drain queue before next lambda
+    drain_queue(cfg.metrics_url);  % poll until running=0 AND waiting=0
 
     meas4 = (cfg.settle_ticks+1):n4;
     env_q(li) = mean(q_all(meas4));
@@ -386,15 +387,54 @@ function v = safe_field(m, field)
 end
 
 function l_ms = get_ttft_mean_ms(m)
-% Compute mean TTFT in ms from vLLM histogram sum/count fields.
-% vllm:time_to_first_token_seconds_sum / _count -> mean in seconds -> *1000 ms
-    s = safe_field(m, 'vllm_time_to_first_token_seconds_sum');
-    c = safe_field(m, 'vllm_time_to_first_token_seconds_count');
-    if c > 0
-        l_ms = (s / c) * 1000;
+% Per-tick mean TTFT using histogram deltas between successive calls.
+%
+% vllm:time_to_first_token_seconds_sum and _count are CUMULATIVE counters.
+% Dividing sum/count gives the all-time average since vLLM started.
+% To get the per-tick mean we track deltas: (Δsum / Δcount) * 1000 ms.
+% On the first call (or after a reset) returns NaN -- no prior baseline.
+    persistent prev_sum prev_count
+    if isempty(prev_sum); prev_sum = 0; prev_count = 0; end
+    curr_sum   = safe_field(m, 'vllm_time_to_first_token_seconds_sum');
+    curr_count = safe_field(m, 'vllm_time_to_first_token_seconds_count');
+    delta_sum   = curr_sum   - prev_sum;
+    delta_count = curr_count - prev_count;
+    prev_sum   = curr_sum;
+    prev_count = curr_count;
+    if delta_count > 0
+        l_ms = (delta_sum / delta_count) * 1000;
     else
         l_ms = NaN;
     end
+end
+
+function drain_queue(metrics_url)
+% Block until vLLM reports both running=0 AND waiting=0.
+% Polls every 0.5s, times out after 60s with a warning.
+    fprintf('  [drain] Waiting for queue to empty...');
+    t0 = tic;
+    while toc(t0) < 60
+        try
+            raw = webread(metrics_url, weboptions('Timeout',3,'ContentType','text'));
+            running = 0; waiting = 0;
+            for line = strsplit(raw, newline)
+                s = strtrim(line{1});
+                if isempty(s)||s(1)=='#'; continue; end
+                c = strtrim(regexprep(s,'\{[^}]*\}',''));
+                p = regexp(c,'\s+','split');
+                if numel(p)<2; continue; end
+                v = str2double(p{2}); if isnan(v); continue; end
+                if contains(p{1},'num_requests_running'); running=running+v; end
+                if contains(p{1},'num_requests_waiting'); waiting=waiting+v; end
+            end
+            if running == 0 && waiting == 0
+                fprintf(' done (%.0fs)  running=%g  waiting=%g\n', toc(t0), running, waiting);
+                return
+            end
+        catch; end
+        pause(0.5);
+    end
+    fprintf(' TIMEOUT after 60s\n');
 end
 
 function stop_load_gen(pid_file)
