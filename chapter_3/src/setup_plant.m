@@ -23,16 +23,16 @@ perturbed.delta = 15;    % ms -- stochastic plant: p95 spread coeff
 
 perturbed.dt    = 1.0;   % s   -- scheduling tick
 perturbed.B_min = 1;     %     -- batch size lower bound
-perturbed.B_max = 6;     %     -- 2x lambda_mean; real drain authority
-perturbed.q_max = 6;     %     -- ~2x lambda_mean; prevents excess windup
+perturbed.B_max = 12;    %     -- 2.4x lambda_mean; wall~490ms, safe for dt=1s
+perturbed.q_max = 12;    %     -- 2.4x lambda_mean; realistic cap
 
 % -- 2. Operating conditions ---------------------------------------------------
 % Tuned for qwen2.5:7b on M2, num_predict=1:
 %   Measured single-request warm latency:  ~175-240 ms
 %   4 concurrent requests wall-clock time: ~200 ms
-perturbed.lambda_mean   = 3;    % req/tick -- 3 arrivals/s: B0=3 at ~500ms TTFT
-perturbed.L_p95_target  = 600;  % ms -- realistic p95 at lambda=3 equilibrium
-perturbed.L_mean_target = 350;  % ms -- between no-queue 175ms and eq 500ms
+perturbed.lambda_mean   = 5;    % req/tick -- 5 arrivals/s: B0=5, wall~250ms, TTFT~206ms
+perturbed.L_p95_target  = 400;  % ms -- realistic p95 for qwen2.5:3b
+perturbed.L_mean_target = 220;  % ms -- between min 120ms (B=2) and eq 206ms (B=5)
 
 % -- 3. Rolling window ----------------------------------------------------------
 perturbed.N_win = 2;    % samples -- rolling window (20 s at dt=1 s)
@@ -56,14 +56,14 @@ fprintf('  Real Ollama target:     L_mean=%.0f ms, L_p95=%.0f ms\n\n', ...
 
 % -- 5. Inner loop pole placement params ----------------------------------------
 %   Time constants must be >> dt=1s and << tau_out=30s
-perturbed.pp_tau1 = .20;    % s -- inner pole 1
-perturbed.pp_tau2 = .40;    % s -- inner pole 2
-perturbed.pp_tau  = .30;    % s -- oscillatory envelope (if pp_f>0)
+perturbed.pp_tau1 = 2.0;    % s -- inner pole 1
+perturbed.pp_tau2 = 4.0;    % s -- inner pole 2
+perturbed.pp_tau  = 3.0;    % s -- oscillatory envelope (if pp_f>0)
 perturbed.pp_f    = 0;      % Hz -- 0 = non-oscillatory
 
 % -- 6. Outer loop time constant ------------------------------------------------
 %   tau_out >> N_win*dt = 20s measurement lag
-perturbed.tau_out = 3;     % s -- outer CL time constant
+perturbed.tau_out = 30;     % s -- outer CL time constant
 
 % -- 7. Design cascade controller -----------------------------------------------
 % method = 'lqr';
@@ -77,14 +77,14 @@ controller = design_controller(perturbed, method);
 %   Parallel pool also opened here.
 ollama = ollama_plant();
 ollama.ollama_url    = 'http://localhost:11434/api/generate';
-ollama.model_name    = 'qwen2.5:7b';
+ollama.model_name    = 'qwen2.5:3b';
 ollama.num_predict   = 1;     % 1 token: ~175-200 ms/req on M2 (fastest)
 ollama.n_win         = perturbed.N_win;
 ollama.http_timeout  = 10;    % s -- abort after 10s
 ollama.n_warmup      = 4;
 ollama.q_max         = perturbed.q_max;
 ollama.b_min         = perturbed.B_min;
-ollama.b_max         = perturbed.B_max;   % = 6
+ollama.b_max         = perturbed.B_max;   % = 12
 ollama.prompts_path  = fullfile(fileparts(mfilename('fullpath')), ...
     '..', 'llm_requirements', 'prompts.txt');
 
