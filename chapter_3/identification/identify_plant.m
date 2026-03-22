@@ -336,6 +336,16 @@ fprintf('  perturbed.gamma = %.4f;\n', gamma_id);
 fprintf('  perturbed.beta  = %.4f;\n', beta_id);
 
 % =========================================================================
+% SUMMARY
+% =========================================================================
+fprintf('╔════════════════════════════════════════════════════════════╗\n');
+fprintf('║  IDENTIFIED PARAMETERS  (%s)\n', cfg.model);
+fprintf('╠════════════════════════════════════════════════════════════╣\n');
+fprintf('║  alpha = %8.4f  ms/req      R^2 stage1 = %.4f\n', alpha_id, r2_s1);
+fprintf('║  gamma = %8.4f  ms/req^2    R^2 stage1 = %.4f\n', gamma_id, r2_s1);
+fprintf('║  beta  = %8.4f  ms/req      R^2 stage2 = %.4f\n', beta_id,  r2_s2);
+fprintf('╚════════════════════════════════════════════════════════════╝\n\n');
+
 % SAVE
 % =========================================================================
 identified.alpha     = alpha_id;
