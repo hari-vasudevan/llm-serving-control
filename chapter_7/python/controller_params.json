@@ -1,0 +1,20 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "url": "https://hvasudevan--chapter-7-vllm-serve.modal.run",
+  "latency_definition": "l_total = t_first_token - t_enqueue",
+  "plant_model": "L(C) = client first-token latency vs client concurrency on native vLLM",
+  "beta_c": 177.68716238158225,
+  "C0": 3,
+  "C_min": 1,
+  "C_max": 8,
+  "L0_ms": 1224.952155653858,
+  "L_target_ms": 1408.7,
+  "dt": 1.0,
+  "tau_cl": 20.0,
+  "z_cl": 0.951229424500714,
+  "K_i": 0.00027447438996493976,
+  "xi_min": -7286.654322304795,
+  "xi_max": 18216.635805761987,
+  "prompt_repeat": 128,
+  "max_tokens": 32
+}

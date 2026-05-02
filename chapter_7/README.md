@@ -1,12 +1,39 @@
-# Chapter 7 — Remote GPU plan
+# Chapter 7 — Native vLLM On A Cheap Remote GPU
 
-Chapter 7 should keep the Chapter 6 *shape*:
+Chapter 7 asks a simple question:
 
-`local controller -> remote queue server -> model backend`
+> If Chapter 6 worked on a CPU queue server, what changes when we move the
+> controller onto a *real GPU inference stack*?
 
-but replace the Intel Mac + Ollama backend with a Linux/NVIDIA host running
-`vLLM`. This gives you a real GPU batching plant while preserving the same
-local workflow from your Mac.
+The answer in this repo is a deliberately minimal architecture:
+
+`local controller -> remote vLLM endpoint`
+
+There is no extra software FIFO in the main experiment path. Instead:
+
+- the plant is a real remote `vLLM` server,
+- the controller reads `vLLM`'s own queueing metrics from `/metrics`,
+- the control input is **client-side concurrency** `C`,
+- the controlled output is **client-observed first-token latency**.
+
+This chapter is intentionally experimental. It is not just a success story; it
+documents what worked, what failed, and why the final control surface looks
+different from Chapter 6.
+
+## Why This Chapter Exists
+
+Chapter 6 used a wrapper queue because the Intel Mac + Ollama setup did not
+expose a meaningful native queue that we could regulate cleanly. On a GPU
+serving stack, `vLLM` already has a scheduler, queue metrics, and batching.
+
+So the Chapter 7 hypothesis was:
+
+1. deploy a cheap real GPU endpoint,
+2. use native `vLLM` metrics,
+3. identify latency as a function of concurrency,
+4. regulate latency with a single-loop controller.
+
+That is exactly what the code in this folder now does.
 
 ## Recommendation
 
@@ -23,105 +50,252 @@ So the practical split is:
 2. **Free Colab use**: quick smoke tests inside the notebook, not the final
    chapter architecture.
 
+For this repo, the cheapest path that behaved like a real remotely accessible
+service was **Modal on a T4**.
+
 ## Architecture
 
 ```text
-GPU host (Linux/NVIDIA)                 Local Mac
-──────────────────────────              ─────────────────────────────
-vLLM (:8001, OpenAI-compatible)   <-    chapter_7/remote/vllm_queue_server.py
-remote wrapper (:8002)            <-    MATLAB or Python controller
-  /enqueue
-  /control {"B": N}
-  /metrics
+Remote GPU host / Modal                    Local Mac
+────────────────────────                  ─────────────────────────────
+vLLM OpenAI-compatible server       <-     Chapter 7 Python controller
+  /health                                  - characterise_remote.py
+  /metrics                                 - design_controller.py
+  /v1/completions                          - run_controller.py
 ```
 
-This wrapper server is the key execution step in this scaffold. It preserves
-the Chapter 6 remote-control API while swapping the backend to vLLM.
+The controller uses:
+- `vllm:num_requests_waiting` for native queue visibility
+- client first-token latency as the controlled output
+- client concurrency `C` as the actuator
 
-## What is in this folder
+This is the key conceptual shift from Chapter 6:
 
-- `remote/vllm_queue_server.py`
-  Remote queue server that dispatches requests in batches to vLLM and reports:
-  `q_sw`, `B_current`, `ttft_recent_mean`, `l_total_mean`, plus selected
-  upstream vLLM metrics such as `vllm_num_requests_waiting`.
+- Chapter 6 actuator: wrapper-controlled batch size `B`
+- Chapter 7 actuator: client-side concurrency `C`
+
+## What Is In This Folder
+
+- `python/vllm_native.py`
+  Shared helper for direct native-vLLM experiments.
+- `python/characterise_remote.py`
+  Identifies `L(C)` where `C` is client concurrency.
+- `python/design_controller.py`
+  Designs a single-loop integral controller on concurrency.
+- `python/run_controller.py`
+  Runs the closed-loop experiment against the remote vLLM endpoint.
 - `remote/start_vllm_linux.sh`
   Bootstrap script for an Ubuntu-like GPU host. Starts both `vllm serve` and
-  the wrapper queue server.
-- `python/`
-  Local controller-side utilities copied from the Chapter 5 Python flow as a
-  starting point for direct-endpoint experiments.
+  the old wrapper queue server if you want that variant.
+- `modal_vllm_server.py`
+  Minimal Modal deployment for the cheap T4-based experiment path.
 
-## Phase plan
+## Reading Guide
 
-### Phase 1 — Repeat Chapter 6 on a GPU host
+If someone opens this chapter cold on GitHub, the best order is:
 
-Goal: prove the remote GPU host works end-to-end with your existing control
-workflow before changing controller architecture.
+1. read this `README`
+2. inspect [identified_params.json](python/identified_params.json)
+3. inspect [controller_params.json](python/controller_params.json)
+4. look at the two plots:
+   - [native concurrency sweep](python/ch7_native_concurrency_sweep.png)
+   - [single-loop run](python/ch7_single_loop_215852.png)
+5. then read:
+   - [characterise_remote.py](python/characterise_remote.py)
+   - [design_controller.py](python/design_controller.py)
+   - [run_controller.py](python/run_controller.py)
 
-1. Start the GPU host with `remote/start_vllm_linux.sh`.
-2. Confirm:
-   - `curl http://HOST:8001/health`
-   - `curl http://HOST:8002/health`
-   - `curl http://HOST:8002/metrics`
-3. Point your Chapter 6 controller at the Chapter 7 wrapper endpoint.
-4. Re-run the single-loop TTFT experiment on GPU.
+## How To Run It
 
-This de-risks networking, deployment, and measurement first.
+### 1. Deploy The Remote vLLM Endpoint
 
-### Phase 2 — Re-introduce cascade control
+From the repo root:
 
-Once Phase 1 is stable:
+```bash
+python3 -m venv .modal-venv
+source .modal-venv/bin/activate
+pip install modal
+modal setup
+modal deploy chapter_7/modal_vllm_server.py
+```
 
-1. Re-identify `TTFT(B)` on the GPU host.
-2. Verify that larger `B` actually changes service behavior materially.
-3. Run the cascade logic with queue depth as the regulated inner variable.
-4. Compare:
-   - wrapper FIFO depth `q_sw`
-   - wrapper `ttft_recent_mean`
-   - wrapper `l_total_mean`
-   - upstream `vllm_num_requests_waiting`
+The Modal deployment used in this repo exposed:
+
+`https://hvasudevan--chapter-7-vllm-serve.modal.run`
+
+If you deploy from your own account, the hostname will differ.
+
+### 2. Expect A Cold Start
+
+The first request can take a while because `vLLM` must:
+
+- start the container,
+- load the model,
+- compile kernels,
+- warm up the engine.
+
+In our run, engine initialization took on the order of a minute. A quick wakeup
+request is helpful:
+
+```bash
+curl https://YOUR-ENDPOINT/health
+```
+
+### 3. Smoke Test The Endpoint
+
+```bash
+curl https://YOUR-ENDPOINT/health
+curl https://YOUR-ENDPOINT/metrics
+curl https://YOUR-ENDPOINT/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "prompt": "Explain in one sentence what a queue is in inference serving.",
+    "max_tokens": 16,
+    "stream": false,
+    "temperature": 0.0
+  }'
+```
+
+### 4. Create A Local Python Env For The Controller
+
+```bash
+python3 -m venv .chapter7-venv
+source .chapter7-venv/bin/activate
+pip install -r chapter_7/python/requirements.txt
+```
+
+### 5. Characterize The Plant
+
+```bash
+cd chapter_7/python
+../../.chapter7-venv/bin/python characterise_remote.py \
+  --url https://YOUR-ENDPOINT \
+  --c-sweep 1 2 3 4 6 \
+  --C0 3 \
+  --n-reps 5 \
+  --prompt-repeat 128 \
+  --max-tokens 32
+```
+
+This writes:
+
+- [identified_params.json](python/identified_params.json)
+- [ch7_native_concurrency_sweep.png](python/ch7_native_concurrency_sweep.png)
+
+### 6. Design The Controller
+
+```bash
+../../.chapter7-venv/bin/python design_controller.py
+```
+
+This writes:
+
+- [controller_params.json](python/controller_params.json)
+
+### 7. Run The Single-Loop Controller
+
+```bash
+../../.chapter7-venv/bin/python -u run_controller.py \
+  --url https://YOUR-ENDPOINT \
+  --background-scale 0.5 \
+  --timeout 45
+```
+
+This writes:
+
+- [single-loop plot](python/ch7_single_loop_215852.png)
+- [single-loop log](python/ch7_single_loop_log_215852.json)
+
+## Example Results
+
+### 1. Native Concurrency Sweep
+
+See [ch7_native_concurrency_sweep.png](python/ch7_native_concurrency_sweep.png).
+
+This run produced:
+
+- `L(C) = 9.34*C^2 + 121.65*C + 775.95`
+- `R^2 = 0.9912`
+- `C0 = 3`
+- `beta_c ≈ 177.7 ms / concurrency`
+
+Interpretation:
+
+- client-observed latency increased cleanly with concurrency,
+- the fit was strong,
+- the endpoint was controllable from the client side,
+- but most of the latency floor was *not* inside the raw model TTFT.
+
+### 2. Single-Loop Controller
+
+See [ch7_single_loop_215852.png](python/ch7_single_loop_215852.png).
+
+That run produced:
+
+- `L_mean ≈ 943.5 ms`
+- `L_p95 ≈ 1145.9 ms`
+- `C_mean ≈ 5.75`
+- `q_wait_mean = 0.00`
+
+Interpretation:
+
+- the single-loop controller ran successfully,
+- it increased concurrency when latency sat below target,
+- but `vllm:num_requests_waiting` stayed near zero,
+- so the endpoint never developed a meaningful server queue in this workload.
+
+## What We Learned
+
+This chapter produced a useful negative result:
+
+1. **The remote endpoint works.**
+   Modal + a T4 + `vLLM` can absolutely be driven from a local controller.
+
+2. **The latency signal is real and controllable.**
+   Client-observed first-token latency changed strongly with concurrency.
+
+3. **The native vLLM queue signal did not become dominant in this setup.**
+   `vllm:num_requests_waiting` stayed effectively zero during the main run.
+
+4. **The platform adds a large fixed latency floor.**
+   `vLLM`'s own TTFT metrics were typically tens of milliseconds, while the
+   client saw roughly `0.9–1.8 s`.
+
+5. **So this is not yet the clean queue-control story we wanted.**
+   The system behaved more like “control serverless endpoint concurrency under
+   fixed overhead” than “control a deeply queued GPU scheduler.”
+
+That is still valuable. It narrows the next step:
+
+- use a less serverless environment, or
+- use a heavier model / prompt workload,
+
+so that the native `vLLM` waiting queue becomes visible and worth regulating.
+
+## Phase Plan
+
+### Phase 1 — Native vLLM characterization
+
+1. Deploy the remote vLLM endpoint.
+2. Confirm `/health`, `/metrics`, and `/v1/completions`.
+3. Sweep client concurrency `C`.
+4. Fit the local slope `beta_c = dL/dC`.
+
+### Phase 2 — Single-loop control
+
+1. Choose an operating point `C0`.
+2. Design an integral controller on measured latency.
+3. Inject background load as a disturbance.
+4. Regulate latency by changing client concurrency.
 
 ### Phase 3 — Write the chapter
 
 The chapter should explicitly distinguish:
 
-- why Chapter 6 on CPU only supported a single-loop TTFT controller, and
-- why the GPU-backed Chapter 7 architecture restores a meaningful queue-rate
-  control handle.
-
-## Suggested experiments
-
-1. **Deployment smoke test**
-   Show that the local Mac can enqueue prompts and change `B` remotely.
-2. **B-sweep at low queue**
-   Fit `TTFT(B) = alpha*B + gamma*B^2`.
-3. **Queue buildup**
-   Step the offered load above sustainable capacity and observe `q_sw`.
-4. **Closed-loop recovery**
-   Hold a steady load, inject a spike, and show recovery in TTFT and queue.
-
-## Immediate next step
-
-Use a GPU host that permits serving, then run:
-
-```bash
-cd chapter_7/remote
-chmod +x start_vllm_linux.sh
-./start_vllm_linux.sh
-```
-
-Then from your Mac:
-
-```bash
-curl http://GPU_HOST:8002/health
-curl http://GPU_HOST:8002/metrics
-curl -X POST http://GPU_HOST:8002/enqueue \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"What is 2+2?"}'
-curl -X POST http://GPU_HOST:8002/control \
-  -H "Content-Type: application/json" \
-  -d '{"B":4}'
-```
+- why Chapter 6 used a wrapper queue on CPU,
+- why native vLLM queue metrics are available on real GPU serving, and
+- why the simplest stable experimental actuator here is client concurrency.
 
 ## Sources used for the hosting recommendation
 
