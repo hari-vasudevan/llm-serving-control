@@ -221,15 +221,19 @@ function r = server_post(server,path,data)
 end
 function v = clamp(x,lo,hi); v=max(lo,min(hi,x)); end
 function t = get_ttft(m)
-    if isfield(m,'ttft_recent_mean') && isnumeric(m.ttft_recent_mean) ...
-            && ~isnan(m.ttft_recent_mean) && m.ttft_recent_mean > 0
-        t = m.ttft_recent_mean;
-    elseif isfield(m,'ttft_mean') && isnumeric(m.ttft_mean) ...
-            && ~isnan(m.ttft_mean) && m.ttft_mean > 0
-        t = m.ttft_mean;
-    else
-        t = NaN;
+    % jsondecode returns [] for JSON null -- must check isscalar
+    % before isnan/>, otherwise && gets non-scalar logical operand
+    v = []; % temp
+    if isfield(m,'ttft_recent_mean'); v = m.ttft_recent_mean; end
+    if isnumeric(v) && isscalar(v) && ~isnan(v) && v > 0
+        t = double(v); return;
     end
+    v = [];
+    if isfield(m,'ttft_mean'); v = m.ttft_mean; end
+    if isnumeric(v) && isscalar(v) && ~isnan(v) && v > 0
+        t = double(v); return;
+    end
+    t = NaN;
 end
 function t = get_ttft_or_fallback(m,fb)
     t=get_ttft(m); if isnan(t)||t<=0; t=fb; end
