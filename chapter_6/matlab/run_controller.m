@@ -1,78 +1,100 @@
-%% run_controller.m  --  Chapter 6: Single-loop controller on Intel Mac
+%% run_controller.m  --  Chapter 6: Single-loop controller (TTFT measurement)
 %
-% Single integral controller directly regulating TTFT via batch size B.
+% ROOT CAUSE OF PREVIOUS FAILURES
+% --------------------------------
+% 1. WRONG SIGNAL: l_total = queue_wait + TTFT.  When the queue builds,
+%    l_total grows without bound.  The controller responds by reducing B,
+%    which makes queue_wait grow even faster (fewer dispatched per tick).
+%    This is POSITIVE FEEDBACK -- the controller destabilises the system.
 %
-% Why single-loop (not cascade) for this machine:
-%   The Intel CPU time-slices requests rather than batching them on a GPU.
-%   Service rate barely changes with B -- you cannot independently control
-%   queue depth and latency. The only real handle is B -> TTFT(B).
+%    FIX: use ttft_recent_mean (dispatch-to-completion, last 10 requests).
+%    TTFT only reflects B's effect on Ollama concurrency.  B larger -> TTFT
+%    larger.  This is the stable, monotone relationship the controller needs.
 %
-% LATENCY MEASUREMENT:
-%   Uses l_total_recent_mean (last 10 completions from queue_server).
-%   This avoids cold-start contamination of the 200-sample ring buffer.
+% 2. OVERLOADED SYSTEM: lambda_ss=4, B_max=4, TTFT(B=4)=1350ms > dt=1000ms.
+%    Ollama takes 1.35 ticks to serve each batch.  Queue grows by ~1/tick
+%    from tick 1 regardless of controller.
 %
-% DISTURBANCE SCHEDULE:
-%   Steady (30t):     lambda = lambda_ss    -- baseline regulation
-%   Lambda Spike(60t):lambda = lambda_spike -- overload, TTFT should rise
-%   Recovery (30t):   lambda = lambda_ss    -- return to steady
-%   Lambda Drop(20t): lambda = 1            -- under-load, TTFT falls
-%   Recovery (20t):   lambda = lambda_ss    -- restore
-%   Target Drop(30t): lambda = lambda_ss    -- tighten SLA (L_target drops)
-%   Restore (20t):    lambda = lambda_ss    -- restore target
+%    FIX: lambda_ss=2, B_max=4.  At equilibrium lambda=2 < B=2-4, so Ollama
+%    always keeps up.  The spike (lambda=6) briefly overloads, but once
+%    lambda returns to 2 the queue drains.
 %
-% SPIKE DESIGN NOTE:
-%   lambda_spike > B_max forces queue buildup (arrivals exceed dispatch).
-%   The controller cannot drain the queue (no handle on it) but it DOES
-%   reduce TTFT by lowering B -- which is the right response for latency SLA.
-%   The queue drains naturally only when lambda returns to lambda_ss < B_max.
+% CONTROLLER LAW (same as before, but cleaner signal):
+%   e[k]  = L_target - ttft_meas[k]
+%   xi    = clamp(xi + e, xi_min, xi_max)
+%   B[k]  = clamp(B0 + K_il * xi, B_min, B_max)
+%   K_il > 0: TTFT > target -> xi down -> B down -> TTFT down  CORRECT
 
 clear; clc;
 addpath(fileparts(mfilename('fullpath')));
 
-% ── Load ──────────────────────────────────────────────────────────────────
 out_dir = fileparts(mfilename('fullpath'));
 load(fullfile(out_dir, 'controller_params.mat'));
 
 fprintf('╔══════════════════════════════════════════════════════════════╗\n');
-fprintf('║  Chapter 6: Single-Loop Controller Run                       ║\n');
+fprintf('║  Chapter 6: Single-Loop Controller (TTFT signal)             ║\n');
 fprintf('╠══════════════════════════════════════════════════════════════╣\n');
+fprintf('║  Measures TTFT (dispatch→done), NOT l_total (enqueue→done)   ║\n');
 fprintf('║  K_il=%.8f  z_cl=%.4f  tau_cl=%.0fs\n', K_il, z_cl, TAU_CL);
-fprintf('║  B0=%d  B=[%d,%d]  alpha=%.1f  gamma=%.2f\n', B0,B_MIN,B_MAX,alpha,gamma);
+fprintf('║  B0=%d  B=[%d,%d]  beta_eff=%.1f ms/req\n', B0,B_MIN,B_MAX,beta_eff);
 fprintf('╚══════════════════════════════════════════════════════════════╝\n\n');
 
 % ── Schedule ──────────────────────────────────────────────────────────────
-L_TARGET_SS    = 2400;
-L_TARGET_TIGHT = 1200;
-LAMBDA_SS      = 4;
-LAMBDA_SPIKE   = 8;   % > B_MAX so queue builds -- controller sees TTFT rise
-LAMBDA_DROP    = 1;
+% TTFT at natural operating point B=2: ~887ms
+% L_target = 1.5 × TTFT(B=2) gives room on both sides
+% lambda_ss = 2 (< B_max=4, system stays stable at equilibrium)
+% lambda_spike = 6 (> B_max=4, creates overload; controller can't drain
+%                   queue but reduces TTFT per-request via lowering B)
 
+L_TTFT_SS    = 1400;   % target TTFT at steady state [ms] (~1.5x TTFT(B=2))
+L_TTFT_TIGHT = 700;    % tighter TTFT target [ms] (~below TTFT(B=2))
+LAMBDA_SS    = 2;      % FIX: was 4, now 2 -- system can keep up
+LAMBDA_SPIKE = 6;      % > B_max=4, creates queue pressure
+LAMBDA_DROP  = 1;
+
+% Override with identified values if they exist and are sensible
 if exist('L_target_recommended','var') && L_target_recommended > 0
-    L_TARGET_SS    = L_target_recommended;
-    L_TARGET_TIGHT = round(L_target_recommended * 0.5 / 100) * 100;
+    % L_target_recommended was computed from l_total; scale to TTFT-only
+    % TTFT is roughly 50-60% of l_total at moderate queue depths
+    L_TTFT_SS    = round(L_target_recommended * 0.55 / 100) * 100;
+    L_TTFT_TIGHT = round(L_TTFT_SS * 0.5 / 100) * 100;
 end
-if exist('lambda_ss','var');    LAMBDA_SS    = lambda_ss;    end
-LAMBDA_SPIKE = max(LAMBDA_SS * 2, B_MAX + 2);  % always > B_MAX
-
-fprintf('L_target_ss = %d ms   L_target_tight = %d ms\n', L_TARGET_SS, L_TARGET_TIGHT);
-fprintf('lambda_ss = %d   lambda_spike = %d   B_max = %d\n\n', LAMBDA_SS, LAMBDA_SPIKE, B_MAX);
+% Keep lambda fixed at sensible values regardless of characterise output
+% lambda_ss=2 is the key safety margin
 
 SEGMENTS = struct(...
-    'ticks',    {30,          60,           30,        20,          20,        30,             20}, ...
-    'lambda',   {LAMBDA_SS,   LAMBDA_SPIKE, LAMBDA_SS, LAMBDA_DROP, LAMBDA_SS, LAMBDA_SS,      LAMBDA_SS}, ...
-    'L_target', {L_TARGET_SS, L_TARGET_SS,  L_TARGET_SS,L_TARGET_SS,L_TARGET_SS,L_TARGET_TIGHT,L_TARGET_SS}, ...
-    'label',    {'Steady',    'λ↑ Spike',   'Recovery','λ↓ Drop',  'Recovery','Target↓',      'Restore'} ...
+    'ticks',    {30,           60,            30,         20,           20,        30,              20}, ...
+    'lambda',   {LAMBDA_SS,    LAMBDA_SPIKE,  LAMBDA_SS,  LAMBDA_DROP,  LAMBDA_SS, LAMBDA_SS,       LAMBDA_SS}, ...
+    'L_target', {L_TTFT_SS,    L_TTFT_SS,     L_TTFT_SS,  L_TTFT_SS,    L_TTFT_SS, L_TTFT_TIGHT,    L_TTFT_SS}, ...
+    'label',    {'Steady',     'λ↑ Spike',    'Recovery', 'λ↓ Drop',    'Recovery','TTFT Target↓',  'Restore'} ...
 );
 
 N = sum([SEGMENTS.ticks]);
-fprintf('Schedule: %d ticks (~%.0f min)\n', N, N*DT/60);
+fprintf('Schedule: %d ticks  dt=%.0fs (~%.0f min)\n', N, DT, N*DT/60);
+fprintf('  TTFT targets: steady=%dms  tight=%dms\n', L_TTFT_SS, L_TTFT_TIGHT);
+fprintf('  lambda_ss=%d (< B_max=%d -- system stays stable)\n\n', LAMBDA_SS, B_MAX);
 for s=1:numel(SEGMENTS)
-    fprintf('  %3d ticks  λ=%-2d  L=%4d ms  [%s]\n', ...
+    fprintf('  %3dt  λ=%-2d  L_TTFT=%4dms  [%s]\n', ...
         SEGMENTS(s).ticks, SEGMENTS(s).lambda, SEGMENTS(s).L_target, SEGMENTS(s).label);
 end
 
+% ── Capacity sanity check before starting ────────────────────────────────
+fprintf('\n[check] Verifying system can sustain lambda_ss=%d...\n', LAMBDA_SS);
+ttft_at_B_max = alpha*B_MAX + gamma*B_MAX^2;
+throughput_at_Bmax = B_MAX / (ttft_at_B_max/1000);  % req/s
+fprintf('  TTFT(B_max=%d) = %.0fms  throughput ≈ %.1f req/s\n', ...
+    B_MAX, ttft_at_B_max, throughput_at_Bmax);
+if LAMBDA_SS / DT > throughput_at_Bmax
+    fprintf('  WARNING: lambda_ss=%.0f req/s > max_throughput=%.1f req/s\n', ...
+        LAMBDA_SS/DT, throughput_at_Bmax);
+    fprintf('  System will be overloaded. Reduce lambda_ss or increase B_max.\n');
+else
+    fprintf('  OK: lambda_ss=%.0f req/s < max_throughput=%.1f req/s\n', ...
+        LAMBDA_SS/DT, throughput_at_Bmax);
+end
+
 % ── Pre-warm ──────────────────────────────────────────────────────────────
-fprintf('\n[pre-warm] Firing 12 requests to fill recent window...\n');
+fprintf('\n[pre-warm] 12 requests to fill ttft_recent buffer...\n');
 server_post(SERVER, '/reset', struct());
 server_post(SERVER, '/control', struct('B', B0));
 PROMPTS = {'What is 2+2?','Name a colour.','Capital of France?', ...
@@ -82,79 +104,68 @@ PROMPTS = {'What is 2+2?','Name a colour.','Capital of France?', ...
 for i=1:12
     server_post(SERVER, '/enqueue', struct('prompt', PROMPTS{mod(i-1,12)+1}));
 end
-t_wait = tic;
-while true
+t_pw = tic;
+while toc(t_pw) < 120
     m = server_get(SERVER, '/metrics');
-    if m.completed >= 12 || toc(t_wait) > 120; break; end
+    if m.completed >= 12; break; end
     pause(1);
 end
 m = server_get(SERVER, '/metrics');
-recent_l = get_recent(m);
-fprintf('  Done: completed=%d  l_recent=%.0fms  l_mean=%.0fms\n', ...
-    m.completed, recent_l, nvl(m.l_total_mean, 0));
+ttft_now = get_ttft(m);
+fprintf('  Done: completed=%d  ttft_recent=%.0fms\n', m.completed, ttft_now);
 
-% Reset ring buffer, keep Ollama hot, re-prime recent window
-server_post(SERVER, '/reset', struct());
+% Reset ring buffers; Ollama stays hot
+server_post(SERVER, '/reset', struct()); pause(0.5);
 server_post(SERVER, '/control', struct('B', B0));
-for i=1:4
-    server_post(SERVER, '/enqueue', struct('prompt', PROMPTS{i}));
-end
-pause(DT * 5);
+% Fire 4 requests so buffer has fresh samples from tick 1
+for i=1:4; server_post(SERVER, '/enqueue', struct('prompt', PROMPTS{i})); end
+pause(DT*3);
 fprintf('[pre-warm] Complete.\n\n');
 
 % ── Controller state ──────────────────────────────────────────────────────
 xi = 0;
 
 % ── Log ───────────────────────────────────────────────────────────────────
-log_tick     = zeros(N,1); log_lambda   = zeros(N,1);
-log_L_target = zeros(N,1); log_q_sw     = zeros(N,1);
-log_B        = zeros(N,1); log_l_meas   = zeros(N,1);
-log_e        = zeros(N,1); log_xi       = zeros(N,1);
-log_label    = cell(N,1);
+log_tick=zeros(N,1); log_lambda=zeros(N,1); log_L_target=zeros(N,1);
+log_q_sw=zeros(N,1); log_B=zeros(N,1); log_ttft=zeros(N,1);
+log_e=zeros(N,1); log_xi=zeros(N,1); log_label=cell(N,1);
 
 server_post(SERVER, '/reset', struct());
 server_post(SERVER, '/control', struct('B', B0));
-prompt_idx = 1; pause(1);
+prompt_idx=1; pause(1);
 
 fprintf('%5s  %3s  %6s  %5s  %2s  %7s  %7s  %7s  label\n', ...
-    'tick','λ','L_tgt','q_sw','B','l_meas','e','xi');
+    'tick','λ','L_ttft','q_sw','B','ttft','e','xi');
 fprintf('%s\n', repmat('-',1,72));
 
-tick = 0;
-for si = 1:numel(SEGMENTS)
-    seg = SEGMENTS(si);
-    for st = 1:seg.ticks
-        tick  = tick + 1;
-        lam   = seg.lambda;
-        L_tgt = seg.L_target;
-        t0    = tic;
+tick=0;
+for si=1:numel(SEGMENTS)
+    seg=SEGMENTS(si);
+    for st=1:seg.ticks
+        tick=tick+1; lam=seg.lambda; L_tgt=seg.L_target; t0=tic;
 
-        % 1. Observe -- use recent window (last 10) to avoid cold contamination
+        % 1. Observe TTFT (not l_total)
         m    = server_get(SERVER, '/metrics');
         q_sw = m.q_sw;
-        l_meas = get_recent_or_fallback(m, L_tgt);
+        ttft = get_ttft_or_fallback(m, L_tgt);
 
         % 2. Arrivals
         a_k = poissrnd(lam);
-        for ai = 1:a_k
+        for ai=1:a_k
             server_post(SERVER, '/enqueue', ...
                 struct('prompt', PROMPTS{mod(prompt_idx-1,12)+1}));
-            prompt_idx = prompt_idx + 1;
+            prompt_idx=prompt_idx+1;
         end
 
-        % 3. Control
-        %    K_il > 0:
-        %    l > L_tgt (e<0) -> xi down -> B=B0+K*xi down -> TTFT down -> l down ✓
-        %    l < L_tgt (e>0) -> xi up   -> B up            -> TTFT up   -> l up   ✓
-        e      = L_tgt - l_meas;
+        % 3. Control on TTFT
+        e      = L_tgt - ttft;
         xi_sat = clamp(xi, xi_min, xi_max);
-        B_cmd  = round(clamp(B0 + K_il * xi_sat, B_MIN, B_MAX));
+        B_cmd  = round(clamp(B0 + K_il*xi_sat, B_MIN, B_MAX));
 
-        % Anti-windup: freeze if saturated AND error would push further in
-        at_min = (B_cmd <= B_MIN) && (e < 0);  % at min, want to go lower -> freeze
-        at_max = (B_cmd >= B_MAX) && (e > 0);  % at max, want to go higher -> freeze
-        if ~(at_min || at_max)
-            xi = clamp(xi_sat + e, xi_min, xi_max);
+        at_min = (B_cmd<=B_MIN) && (e<0);
+        at_max = (B_cmd>=B_MAX) && (e>0);
+        if ~(at_min||at_max)
+            xi = clamp(xi_sat+e, xi_min, xi_max);
         else
             xi = xi_sat;
         end
@@ -164,26 +175,24 @@ for si = 1:numel(SEGMENTS)
 
         % 5. Log
         log_tick(tick)=tick; log_lambda(tick)=lam; log_L_target(tick)=L_tgt;
-        log_q_sw(tick)=q_sw; log_B(tick)=B_cmd; log_l_meas(tick)=l_meas;
+        log_q_sw(tick)=q_sw; log_B(tick)=B_cmd; log_ttft(tick)=ttft;
         log_e(tick)=e; log_xi(tick)=xi; log_label{tick}=seg.label;
 
         fprintf('%5d  %3d  %6d  %5d  %2d  %7.0f  %7.0f  %7.1f  %s\n', ...
-            tick,lam,L_tgt,q_sw,B_cmd,l_meas,e,xi,seg.label);
+            tick,lam,L_tgt,q_sw,B_cmd,ttft,e,xi,seg.label);
 
-        elapsed = toc(t0);
-        if elapsed < DT; pause(DT - elapsed); end
+        elapsed=toc(t0); if elapsed<DT; pause(DT-elapsed); end
     end
 end
 
 % ── Summary ───────────────────────────────────────────────────────────────
 fprintf('\n%s\n',repmat('═',1,72));
-fprintf('Per-segment summary:\n');
 fprintf('  %-14s  %2s  %6s  %6s  %6s  %4s  %5s\n', ...
-    'Segment','λ','L_tgt','l_mean','l_p95','B','q');
+    'Segment','λ','L_ttft','t_mean','t_p95','B','q');
 t0=1;
 for si=1:numel(SEGMENTS)
-    te = t0+SEGMENTS(si).ticks-1;
-    sl = log_l_meas(t0:te); sl=sl(sl>0);
+    te=t0+SEGMENTS(si).ticks-1;
+    sl=log_ttft(t0:te); sl=sl(sl>0);
     if ~isempty(sl)
         fprintf('  %-14s  %2d  %6d  %6.0f  %6.0f  %4.1f  %5.1f\n', ...
             SEGMENTS(si).label, SEGMENTS(si).lambda, SEGMENTS(si).L_target, ...
@@ -192,126 +201,102 @@ for si=1:numel(SEGMENTS)
     t0=te+1;
 end
 
-% ── Save + Plot ────────────────────────────────────────────────────────────
-log = struct('tick',log_tick,'lambda',log_lambda,'L_target',log_L_target, ...
-    'q_sw',log_q_sw,'B',log_B,'l_meas',log_l_meas,'e',log_e,'xi',log_xi, ...
+log=struct('tick',log_tick,'lambda',log_lambda,'L_target',log_L_target,...
+    'q_sw',log_q_sw,'B',log_B,'ttft',log_ttft,'e',log_e,'xi',log_xi,...
     'label',{log_label});
 save(fullfile(out_dir,'run_log.mat'),'log','SEGMENTS');
 fprintf('\n[save] run_log.mat\n');
-plot_results(log, SEGMENTS, N, out_dir);
+plot_results(log,SEGMENTS,N,out_dir);
 
 
 % =========================================================================
-function m = server_get(server, path)
-    [~,out] = system(sprintf('curl -s "%s%s"', server, path));
-    m = jsondecode(strtrim(out));
+function m = server_get(server,path)
+    [~,out]=system(sprintf('curl -s "%s%s"',server,path));
+    m=jsondecode(strtrim(out));
 end
-
-function r = server_post(server, path, data)
-    body = strrep(jsonencode(data),'"','\"');
-    [~,out] = system(sprintf( ...
-        'curl -s -X POST "%s%s" -H "Content-Type: application/json" -d "%s"', ...
-        server, path, body));
-    try; r = jsondecode(strtrim(out)); catch; r = struct(); end
+function r = server_post(server,path,data)
+    body=strrep(jsonencode(data),'"','\"');
+    [~,out]=system(sprintf('curl -s -X POST "%s%s" -H "Content-Type: application/json" -d "%s"',server,path,body));
+    try; r=jsondecode(strtrim(out)); catch; r=struct(); end
 end
-
-function v = clamp(x, lo, hi); v = max(lo, min(hi, x)); end
-
-function l = get_recent(m)
-    if isfield(m,'l_total_recent_mean') && ~isempty(m.l_total_recent_mean) ...
-            && isnumeric(m.l_total_recent_mean) && ~isnan(m.l_total_recent_mean)
-        l = m.l_total_recent_mean;
-    elseif isfield(m,'l_total_mean') && ~isempty(m.l_total_mean) ...
-            && isnumeric(m.l_total_mean) && ~isnan(m.l_total_mean)
-        l = m.l_total_mean;
+function v = clamp(x,lo,hi); v=max(lo,min(hi,x)); end
+function t = get_ttft(m)
+    if isfield(m,'ttft_recent_mean') && isnumeric(m.ttft_recent_mean) ...
+            && ~isnan(m.ttft_recent_mean) && m.ttft_recent_mean > 0
+        t = m.ttft_recent_mean;
+    elseif isfield(m,'ttft_mean') && isnumeric(m.ttft_mean) ...
+            && ~isnan(m.ttft_mean) && m.ttft_mean > 0
+        t = m.ttft_mean;
     else
-        l = NaN;
+        t = NaN;
     end
 end
-
-function l = get_recent_or_fallback(m, fallback)
-    % Use recent (last 10) if we have at least 3 samples, else long window, else fallback
-    if isfield(m,'l_total_recent_n') && isnumeric(m.l_total_recent_n) ...
-            && m.l_total_recent_n >= 3
-        l = get_recent(m);
-        if isnan(l); l = fallback; end
-    else
-        r = get_recent(m);
-        if ~isnan(r); l = r; else; l = fallback; end
-    end
+function t = get_ttft_or_fallback(m,fb)
+    t=get_ttft(m); if isnan(t)||t<=0; t=fb; end
 end
 
-function v = nvl(x, default)
-    if isempty(x) || ~isnumeric(x) || isnan(x); v = default; else; v = x; end
-end
+function plot_results(log,SEGMENTS,N,out_dir)
+    COLORS={[0.95 0.95 0.95],[1.0 0.90 0.90],[0.90 1.0 0.90],...
+            [0.90 0.90 1.0],[1.0 0.97 0.90],[1.0 0.90 1.0],[0.90 0.97 1.0]};
+    fig=figure('Visible','off','Position',[50 50 1400 950]);
+    ax=gobjects(3,1); for i=1:3; ax(i)=subplot(3,1,i); end
 
-function plot_results(log, SEGMENTS, N, out_dir)
-    COLORS = {[0.95 0.95 0.95],[1.0 0.90 0.90],[0.90 1.0 0.90], ...
-              [0.90 0.90 1.0],[1.0 0.97 0.90],[1.0 0.90 1.0],[0.90 0.97 1.0]};
-
-    fig = figure('Visible','off','Position',[50 50 1400 950]);
-    ax = gobjects(3,1);
-    for i=1:3; ax(i)=subplot(3,1,i); end
-
-    % Shade segments
     t0=1;
     for si=1:numel(SEGMENTS)
-        te=t0+SEGMENTS(si).ticks-1;
-        c=COLORS{mod(si-1,numel(COLORS))+1};
+        te=t0+SEGMENTS(si).ticks-1; c=COLORS{mod(si-1,numel(COLORS))+1};
         for ai=1:3
             yl=ylim(ax(ai));
-            patch(ax(ai),[t0 te te t0],[yl(1) yl(1) yl(2) yl(2)], ...
+            patch(ax(ai),[t0 te te t0],[yl(1) yl(1) yl(2) yl(2)],...
                 c,'FaceAlpha',0.28,'EdgeColor','none'); hold(ax(ai),'on');
         end
-        text(ax(1),(t0+te)/2, 0.96, SEGMENTS(si).label, ...
-            'Units','data','HorizontalAlignment','center', ...
+        text(ax(1),(t0+te)/2,0.96,SEGMENTS(si).label,...
+            'Units','data','HorizontalAlignment','center',...
             'VerticalAlignment','top','FontSize',8,'Color',[0.2 0.2 0.2]);
         t0=te+1;
     end
 
-    % Panel 1: latency
-    plot(ax(1), log.tick, log.l_meas/1000, 'b-','LineWidth',1.3);
+    % P1: TTFT
+    plot(ax(1),log.tick,log.ttft/1000,'b-','LineWidth',1.3,...
+        'DisplayName','TTFT_{recent} [s]');
     hold(ax(1),'on');
-    stairs(ax(1), log.tick, log.L_target/1000, 'k--','LineWidth',1.5);
-    ylabel(ax(1),'l_{recent} [s]');
-    legend(ax(1),'l_{total\_recent}','L_{target}','Location','northeast');
-    title(ax(1), ...
-        'Chapter 6 — Single-loop integral controller  (Intel Mac, qwen2.5:0.5b)');
-    grid(ax(1),'on');
+    stairs(ax(1),log.tick,log.L_target/1000,'k--','LineWidth',1.5,...
+        'DisplayName','L_{TTFT target}');
+    ylabel(ax(1),'TTFT [s]');
+    legend(ax(1),'Location','northeast'); grid(ax(1),'on');
+    title(ax(1),'Chapter 6 — Single-loop controller on TTFT  (Intel Mac)');
 
-    % Panel 2: B, lambda, queue on secondary axis
+    % P2: B, lambda, queue
     yyaxis(ax(2),'left');
-    stairs(ax(2), log.tick, log.B,      'm-','LineWidth',1.8);
-    hold(ax(2),'on');
-    stairs(ax(2), log.tick, log.lambda, 'k--','LineWidth',1.0);
+    stairs(ax(2),log.tick,log.B,'m-','LineWidth',1.8,...
+        'DisplayName','B (dispatch)'); hold(ax(2),'on');
+    stairs(ax(2),log.tick,log.lambda,'k--','LineWidth',1.0,...
+        'DisplayName','\lambda');
     ylabel(ax(2),'B / \lambda [req/tick]','Color','m');
     ylim(ax(2),[0 max(max(log.lambda),max(log.B))+1]);
     yyaxis(ax(2),'right');
-    area(ax(2), log.tick, log.q_sw, 'FaceColor',[1 0.65 0],'FaceAlpha',0.4,'EdgeColor','none');
+    area(ax(2),log.tick,log.q_sw,'FaceColor',[1 0.65 0],'FaceAlpha',0.4,...
+        'EdgeColor','none');
     hold(ax(2),'on');
-    stairs(ax(2), log.tick, log.q_sw,'Color',[0.8 0.4 0],'LineWidth',1.0);
+    stairs(ax(2),log.tick,log.q_sw,'Color',[0.8 0.4 0],'LineWidth',1.0,...
+        'DisplayName','q_{sw}');
     ylabel(ax(2),'q_{sw} [req]','Color',[0.8 0.4 0]);
-    legend(ax(2),'B (dispatch)','\lambda (arrivals)','q_{sw}','Location','northeast');
+    legend(ax(2),'B','\lambda','q_{sw}','Location','northeast');
     grid(ax(2),'on');
 
-    % Panel 3: integrator state xi and error e
+    % P3: xi and e
     yyaxis(ax(3),'left');
-    plot(ax(3), log.tick, log.xi,'g-','LineWidth',1.2);
+    plot(ax(3),log.tick,log.xi,'g-','LineWidth',1.2);
     yline(ax(3),0,'k--','LineWidth',0.7);
     ylabel(ax(3),'\xi (integrator)','Color','g');
     yyaxis(ax(3),'right');
-    plot(ax(3), log.tick, log.e/1000,'b:','LineWidth',1.0);
+    plot(ax(3),log.tick,log.e/1000,'b:','LineWidth',1.0);
     yline(ax(3),0,'k--','LineWidth',0.5);
-    ylabel(ax(3),'e = L_{tgt}-l [s]','Color','b');
+    ylabel(ax(3),'e = L_{TTFT} - ttft [s]','Color','b');
     xlabel(ax(3),'Tick [k]');
-    legend(ax(3),'\xi','e','Location','northeast');
-    grid(ax(3),'on');
+    legend(ax(3),'\xi','e','Location','northeast'); grid(ax(3),'on');
 
     for i=1:3; xlim(ax(i),[1 N]); end
-
-    ts = datetime('now','Format','HHmmss');
-    fn = fullfile(out_dir,sprintf('ch6_single_loop_%s.png',char(ts)));
-    saveas(fig,fn);
-    fprintf('[plot] %s\n',fn);
-    close(fig);
+    ts=datetime('now','Format','HHmmss');
+    fn=fullfile(out_dir,sprintf('ch6_single_ttft_%s.png',char(ts)));
+    saveas(fig,fn); fprintf('[plot] %s\n',fn); close(fig);
 end
