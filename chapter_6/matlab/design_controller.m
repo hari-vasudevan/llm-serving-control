@@ -1,132 +1,105 @@
 %% design_controller.m  --  Chapter 6: Cascade controller design
 %
-% Reads identified_params.mat and designs the two-loop cascade:
+% Reads identified_params.mat and designs the two-loop cascade.
 %
-%   Inner loop: queue_sw -> B  (Franklin augmented pole placement)
-%     q[k+1] = q[k] + a[k] - B[k],  e_q = q_ref - q_sw
-%     A_aug = [1 0; 1 1],  B_aug = [1; 0]   (FIFO dynamics)
-%     dB = -(K_q*e_q + K_i*xi_q)             K_q > 0
-%
-%   Outer loop: l_total -> q_ref  (integral, analytical gain)
-%     beta_q = dt*1000/B0   [analytical: d(l_total)/d(q)]
-%     K_il   = (1 - exp(-dt/tau_out)) / beta_q   [positive]
-%     q_ref  = q0 + K_il * xi_l
-%
-% Outputs: controller_params.mat
+% KEY PARAMETERS for Intel Mac with OLLAMA_NUM_PARALLEL=4:
+%   B_max=4  -- Ollama processes max 4 requests truly concurrently
+%   B0=2     -- nominal operating point (lambda_ss=2, comfortable headroom)
+%   B_min=1  -- always dispatch at least 1
+%   TAU_OUT  -- outer loop: slow enough that l_total measurement noise doesn't
+%               destabilise it (l_total has ~200-400ms std on this hardware)
 
 clear; clc;
 addpath(fileparts(mfilename('fullpath')));
 
-% -------------------------------------------------------------------------
-% Tuning parameters (adjust here)
-% -------------------------------------------------------------------------
+% ── Tuning ────────────────────────────────────────────────────────────────
 TAU1    = 2.0;    % inner CL time constant 1 [s]
 TAU2    = 3.0;    % inner CL time constant 2 [s]
-TAU_OUT = 25.0;   % outer CL time constant [s]  -- slower = more stable
+TAU_OUT = 30.0;   % outer CL time constant [s] -- slow to handle noisy l_total
 B_MIN   = 1;
-B_MAX   = 8;
-Q_MAX   = 30;     % anti-windup ceiling on q_ref
-Q0      = 0;      % nominal queue setpoint at equilibrium
+B_MAX   = 4;      % matches OLLAMA_NUM_PARALLEL -- no benefit dispatching more
+Q_MAX   = 20;
+Q0      = 0;
 
-% -------------------------------------------------------------------------
-% Load identified parameters
-% -------------------------------------------------------------------------
+% ── Load identified params ────────────────────────────────────────────────
 out_dir = fileparts(mfilename('fullpath'));
 load(fullfile(out_dir, 'identified_params.mat'));
 
-fprintf('╔══════════════════════════════════════════════════════════════╗\n');
+% Override B0 with the identified lambda_ss if available
+if exist('lambda_ss','var') && lambda_ss >= B_MIN && lambda_ss <= B_MAX
+    B0 = lambda_ss;
+    fprintf('Using identified lambda_ss=%d as B0\n', B0);
+else
+    B0 = 2;
+    fprintf('Using default B0=2\n');
+end
+
+% Recompute derived quantities at the actual B0
+ttft_B0  = alpha*B0 + gamma*B0^2;
+beta_eff = alpha + 2*gamma*B0;
+beta_q   = DT*1000 / B0;
+
+fprintf('\n╔══════════════════════════════════════════════════════════════╗\n');
 fprintf('║  Chapter 6: Cascade Controller Design                        ║\n');
 fprintf('╚══════════════════════════════════════════════════════════════╝\n\n');
 
-fprintf('=== Plant ===\n');
-fprintf('  l_total(B,q) = %.4f*B + (%.4f)*B^2 + (q/B)*%.0f\n', alpha, gamma, DT*1000);
+fprintf('=== Plant at B0=%d ===\n', B0);
 fprintf('  alpha   = %.4f ms/req\n', alpha);
 fprintf('  gamma   = %.4f ms/req^2\n', gamma);
-fprintf('  B0=%d  TTFT(B0)=%.2f ms\n', B0, ttft_B0);
-fprintf('  beta_q  = dt*1000/B0 = %.0f/%.0f = %.4f ms/req  [ANALYTICAL]\n', ...
-        DT*1000, B0, beta_q);
-fprintf('  beta_eff= alpha+2*gamma*B0 = %.4f ms/req  [TTFT slope]\n\n', beta_eff);
+fprintf('  TTFT(B0=%d) = %.2f ms\n', B0, ttft_B0);
+fprintf('  beta_q  = %.4f ms/req  [dt*1000/B0, analytical]\n', beta_q);
+fprintf('  beta_eff= %.4f ms/req  [d(TTFT)/dB at B0]\n\n', beta_eff);
 
-% -------------------------------------------------------------------------
-% Inner loop: Franklin augmented pole placement (FIFO plant)
-% -------------------------------------------------------------------------
+% ── Inner loop ────────────────────────────────────────────────────────────
 fprintf('=== Inner loop ===\n');
-
 z1 = exp(-DT/TAU1);
 z2 = exp(-DT/TAU2);
 
-% FIFO plant: de_q[k+1] = de_q[k] + dB[k]  => A=[1 0;1 1], B=[1;0]
-A_aug = [1 0; 1 1];
-B_aug = [1; 0];
-
-% Ackermann pole placement (use backslash, not inv)
+A_aug  = [1 0; 1 1];
+B_aug  = [1; 0];
 C_ctrl = [B_aug, A_aug*B_aug];
 e2     = [0 1];
 p_A    = A_aug^2 - (z1+z2)*A_aug + z1*z2*eye(2);
-K_pp   = (e2 / C_ctrl) * p_A;   % K = [K_q, K_i]  -- uses / (mrdivide) not inv
+K_pp   = (e2 / C_ctrl) * p_A;
 K_q    = K_pp(1);
 K_i    = K_pp(2);
 
-% Verify CL poles
 A_cl   = A_aug - B_aug*K_pp;
 poles  = eig(A_cl);
 stable = all(abs(poles) < 1);
 
-% Anti-windup bounds for xi_q
-% At e_q=0: B = B0 - K_i*xi_q.  Bound: B in [B_MIN, B_MAX]
 xi_q_min = (B0 - B_MAX) / K_i;
 xi_q_max = (B0 - B_MIN) / K_i;
-if xi_q_min > xi_q_max
-    [xi_q_min, xi_q_max] = deal(xi_q_max, xi_q_min);
-end
+if xi_q_min > xi_q_max; [xi_q_min, xi_q_max] = deal(xi_q_max, xi_q_min); end
 
-fprintf('  K_q = %.4f (>0: %s)\n', K_q, mat2str(K_q > 0));
-fprintf('  K_i = %.4f (>0: %s)\n', K_i, mat2str(K_i > 0));
-fprintf('  Desired poles: z1=%.4f  z2=%.4f\n', z1, z2);
-fprintf('  Actual CL poles: %.4f  %.4f  (stable: %s)\n', poles(1), poles(2), mat2str(stable));
-fprintf('  xi_q range: [%.2f, %.2f]\n\n', xi_q_min, xi_q_max);
+fprintf('  K_q=%.4f (>0:%s)  K_i=%.4f (>0:%s)\n', K_q, mat2str(K_q>0), K_i, mat2str(K_i>0));
+fprintf('  Desired z1=%.4f z2=%.4f  Actual=[%.4f %.4f]  stable=%s\n', ...
+    z1, z2, poles(1), poles(2), mat2str(stable));
+assert(K_q > 0 && stable, 'Inner loop design failed');
 
-assert(K_q > 0, sprintf('K_q=%.4f should be positive', K_q));
-assert(stable,  'Inner loop is unstable');
-
-% -------------------------------------------------------------------------
-% Outer loop: integral gain from beta_q
-% -------------------------------------------------------------------------
-fprintf('=== Outer loop ===\n');
-
+% ── Outer loop ────────────────────────────────────────────────────────────
+fprintf('\n=== Outer loop ===\n');
 z_out = exp(-DT/TAU_OUT);
 K_il  = (1 - z_out) / beta_q;   % positive
 
-xi_l_min = (0    - Q0) / K_il;
+xi_l_min = (0     - Q0) / K_il;
 xi_l_max = (Q_MAX - Q0) / K_il;
 
-fprintf('  beta_q  = %.4f ms/req  (dt*1000/B0)\n', beta_q);
-fprintf('  K_il    = %.8f (>0: %s)\n', K_il, mat2str(K_il > 0));
-fprintf('  z_out   = %.6f  tau_out=%.0fs\n', z_out, TAU_OUT);
-fprintf('  xi_l range: [%.2f, %.2f]\n\n', xi_l_min, xi_l_max);
+fprintf('  beta_q=%.4f ms/req\n', beta_q);
+fprintf('  K_il=%.8f (>0:%s)  z_out=%.6f  tau_out=%.0fs\n', ...
+    K_il, mat2str(K_il>0), z_out, TAU_OUT);
+assert(K_il > 0, 'Outer loop K_il should be positive');
 
-assert(K_il > 0, sprintf('K_il=%.6f should be positive', K_il));
-
-% -------------------------------------------------------------------------
-% Summary
-% -------------------------------------------------------------------------
-fprintf('╔══════════════════════════════════════════════════════════════╗\n');
+% ── Summary ───────────────────────────────────────────────────────────────
+fprintf('\n╔══════════════════════════════════════════════════════════════╗\n');
 fprintf('║  CASCADE CONTROLLER  --  Chapter 6\n');
 fprintf('╠══════════════════════════════════════════════════════════════╣\n');
-fprintf('║  Plant:  l_total = %.4f*B + (%.4f)*B^2 + (q/B)*%.0f\n', alpha, gamma, DT*1000);
-fprintf('║          beta_q = %.2f ms/req  [analytical]\n', beta_q);
-fprintf('║\n');
-fprintf('║  Outer:  K_il=%.8f  z_out=%.4f  tau_out=%.0fs\n', K_il, z_out, TAU_OUT);
-fprintf('║          q_ref = q0 + K_il * xi_l\n');
-fprintf('║\n');
-fprintf('║  Inner:  K_q=%.4f  K_i=%.4f\n', K_q, K_i);
-fprintf('║          CL poles ~ [%.4f  %.4f]\n', poles(1), poles(2));
-fprintf('║          dB = -(K_q*e_q + K_i*xi_q)\n');
+fprintf('║  B0=%d  B=[%d,%d]  Q_MAX=%d  tau_out=%.0fs\n', B0,B_MIN,B_MAX,Q_MAX,TAU_OUT);
+fprintf('║  Inner: K_q=%.4f  K_i=%.4f  poles=[%.4f %.4f]\n', K_q,K_i,poles(1),poles(2));
+fprintf('║  Outer: K_il=%.8f  z_out=%.4f\n', K_il, z_out);
 fprintf('╚══════════════════════════════════════════════════════════════╝\n\n');
 
-% -------------------------------------------------------------------------
-% Save
-% -------------------------------------------------------------------------
+% ── Save ──────────────────────────────────────────────────────────────────
 save(fullfile(out_dir, 'controller_params.mat'), ...
     'alpha','gamma','beta_q','beta_eff','B0','Q0', ...
     'DT','B_MIN','B_MAX','Q_MAX', ...
