@@ -24,6 +24,9 @@ QUEUE_SERVER_PORT=8002
 OLLAMA_PORT=11434
 LOG=/tmp/queue_server.log
 
+# Intel Mac Ollama installs to /usr/local/bin -- ensure it's on PATH
+export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
+
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  Chapter 6: Intel Mac LLM Queue Server Setup                 ║"
@@ -37,11 +40,12 @@ echo "[1/6] Checking Homebrew..."
 if ! command -v brew &>/dev/null; then
     echo "  Installing Homebrew..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    # Add brew to PATH for Intel Mac
     eval "$(/usr/local/bin/brew shellenv)"
 else
     echo "  Homebrew found: $(brew --version | head -1)"
 fi
+# Intel Mac brew is at /usr/local
+export PATH="/usr/local/bin:$PATH"
 
 # ---------------------------------------------------------------------------
 # 2. Python 3.10+
@@ -51,8 +55,8 @@ echo "[2/6] Checking Python..."
 if ! command -v python3 &>/dev/null; then
     echo "  Installing Python via Homebrew..."
     brew install python@3.11
+    export PATH="/usr/local/opt/python@3.11/bin:$PATH"
 fi
-
 PYTHON_VERSION=$(python3 --version 2>&1)
 echo "  $PYTHON_VERSION"
 
@@ -61,31 +65,61 @@ echo "  $PYTHON_VERSION"
 # ---------------------------------------------------------------------------
 echo ""
 echo "[3/6] Installing Python dependencies..."
-pip3 install --upgrade pip --quiet
-pip3 install flask requests numpy --quiet
-echo "  flask, requests, numpy installed"
+pip3 install --upgrade pip --quiet 2>/dev/null || pip3 install --upgrade pip
+pip3 install requests numpy --quiet
+echo "  requests, numpy installed"
 
 # ---------------------------------------------------------------------------
 # 4. Ollama
 # ---------------------------------------------------------------------------
 echo ""
 echo "[4/6] Checking Ollama..."
-if ! command -v ollama &>/dev/null; then
-    echo "  Downloading Ollama for macOS (Intel)..."
+
+# Ollama on Intel Mac installs the CLI to /usr/local/bin/ollama
+# It does NOT install a macOS .app bundle -- it's a CLI-only tool on Linux/Mac
+OLLAMA_BIN="/usr/local/bin/ollama"
+
+if [ ! -f "$OLLAMA_BIN" ]; then
+    echo "  Downloading and installing Ollama CLI..."
+    # The official install script puts the binary at /usr/local/bin/ollama
     curl -fsSL https://ollama.com/install.sh | sh
+    echo "  Ollama installed at $OLLAMA_BIN"
 else
-    echo "  Ollama found: $(ollama --version 2>/dev/null || echo 'installed')"
+    echo "  Ollama found at $OLLAMA_BIN"
 fi
 
-# Start Ollama in background if not already running
-if ! curl -s http://localhost:$OLLAMA_PORT/api/tags &>/dev/null; then
-    echo "  Starting Ollama service..."
-    ollama serve > /tmp/ollama.log 2>&1 &
-    echo $! > /tmp/ollama.pid
-    sleep 3
-    echo "  Ollama started (PID=$(cat /tmp/ollama.pid))"
-else
+# Verify the binary is executable
+if [ ! -x "$OLLAMA_BIN" ]; then
+    echo "  ERROR: $OLLAMA_BIN exists but is not executable"
+    echo "  Try: chmod +x $OLLAMA_BIN"
+    exit 1
+fi
+
+echo "  Version: $($OLLAMA_BIN --version 2>/dev/null || echo 'ok')"
+
+# Start Ollama serve in background if not already running
+if curl -s http://localhost:$OLLAMA_PORT/api/tags &>/dev/null; then
     echo "  Ollama already running on port $OLLAMA_PORT"
+else
+    echo "  Starting Ollama server..."
+    # Kill any stale ollama processes first
+    pkill -f "ollama serve" 2>/dev/null || true
+    sleep 1
+    nohup $OLLAMA_BIN serve > /tmp/ollama.log 2>&1 &
+    OLLAMA_PID=$!
+    echo $OLLAMA_PID > /tmp/ollama.pid
+    echo "  Waiting for Ollama to be ready (PID=$OLLAMA_PID)..."
+    for i in $(seq 1 30); do
+        if curl -s http://localhost:$OLLAMA_PORT/api/tags &>/dev/null; then
+            echo "  Ollama ready after ${i}s"
+            break
+        fi
+        sleep 1
+        if [ $i -eq 30 ]; then
+            echo "  WARNING: Ollama did not respond after 30s"
+            echo "  Check: tail -20 /tmp/ollama.log"
+        fi
+    done
 fi
 
 # ---------------------------------------------------------------------------
@@ -93,16 +127,21 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "[5/6] Pulling model: $MODEL"
-echo "  (This may take a few minutes on first run...)"
-ollama pull $MODEL
+echo "  (This may take several minutes on first run -- ~400MB download)"
+$OLLAMA_BIN pull $MODEL
 echo "  Model ready: $MODEL"
 
 # Quick smoke test
 echo "  Smoke test..."
 RESP=$(curl -s http://localhost:$OLLAMA_PORT/api/generate \
     -d "{\"model\":\"$MODEL\",\"prompt\":\"2+2\",\"stream\":false}" \
-    --max-time 30 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('response','ERROR')[:20])" 2>/dev/null || echo "TIMEOUT")
-echo "  Model response: '$RESP'"
+    --max-time 60 \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('response','ERROR')[:30].strip())" 2>/dev/null \
+    || echo "TIMEOUT/ERROR")
+echo "  Response preview: '$RESP'"
+if [ "$RESP" = "TIMEOUT/ERROR" ]; then
+    echo "  WARNING: smoke test failed -- model may be slow on first load, continuing anyway"
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Start queue server
@@ -112,13 +151,17 @@ echo "[6/6] Starting queue server on port $QUEUE_SERVER_PORT..."
 
 # Kill any existing instance
 if [ -f /tmp/queue_server.pid ]; then
-    kill $(cat /tmp/queue_server.pid) 2>/dev/null || true
-    rm /tmp/queue_server.pid
+    OLD_PID=$(cat /tmp/queue_server.pid)
+    kill "$OLD_PID" 2>/dev/null || true
+    rm -f /tmp/queue_server.pid
     sleep 1
 fi
+pkill -f "queue_server.py" 2>/dev/null || true
+sleep 1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 -u "$SCRIPT_DIR/queue_server.py" \
+
+nohup python3 -u "$SCRIPT_DIR/queue_server.py" \
     --port $QUEUE_SERVER_PORT \
     --ollama_port $OLLAMA_PORT \
     --model "$MODEL" \
@@ -129,13 +172,21 @@ echo "  PID=$SERVER_PID  log=$LOG"
 
 # Wait for it to be ready
 echo "  Waiting for queue server..."
+READY=0
 for i in $(seq 1 30); do
     if curl -s http://localhost:$QUEUE_SERVER_PORT/health &>/dev/null; then
         echo "  Ready after ${i}s"
+        READY=1
         break
     fi
     sleep 1
 done
+
+if [ $READY -eq 0 ]; then
+    echo "  ERROR: queue server did not start. Check log:"
+    tail -20 $LOG
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -148,22 +199,27 @@ printf "║  Model:        %-46s ║\n" "$MODEL"
 printf "║  Ollama:       http://localhost:%-30s ║\n" "$OLLAMA_PORT"
 printf "║  Queue server: http://localhost:%-30s ║\n" "$QUEUE_SERVER_PORT"
 echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║  curl http://localhost:8002/health    -- health check         ║"
-echo "║  curl http://localhost:8002/metrics   -- queue metrics        ║"
-echo "║  curl http://localhost:8002/status    -- full status          ║"
-echo "║  kill \$(cat /tmp/queue_server.pid)    -- stop server          ║"
+echo "║  Useful commands:                                             ║"
+echo "║  curl http://localhost:8002/health   -- health check          ║"
+echo "║  curl http://localhost:8002/metrics  -- queue depth + latency ║"
+echo "║  curl http://localhost:8002/status   -- full state            ║"
+echo "║  tail -f /tmp/queue_server.log       -- live dispatcher log   ║"
+echo "║  tail -f /tmp/ollama.log             -- ollama log            ║"
+echo "║  kill \$(cat /tmp/queue_server.pid)   -- stop queue server     ║"
+echo "║  kill \$(cat /tmp/ollama.pid)         -- stop ollama           ║"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║  To find your local IP for the controller Mac:                ║"
+echo "║  ipconfig getifaddr en0                                       ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
-# Show current metrics
-echo "Current metrics:"
-curl -s http://localhost:$QUEUE_SERVER_PORT/metrics | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    for k, v in d.items():
-        print(f'  {k:30s} = {v}')
-except:
-    print('  (server starting up)')
-"
+# Show current health + metrics
+echo "Health check:"
+curl -s http://localhost:$QUEUE_SERVER_PORT/health | python3 -m json.tool 2>/dev/null || \
+    curl -s http://localhost:$QUEUE_SERVER_PORT/health
+echo ""
+echo "Your local IP address (share this with the controller Mac):"
+ipconfig getifaddr en0 2>/dev/null || \
+    ipconfig getifaddr en1 2>/dev/null || \
+    ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | head -1
 echo ""
