@@ -46,19 +46,18 @@ fprintf('╚══════════════════════�
 % lambda_spike = 6 (> B_max=4, creates overload; controller can't drain
 %                   queue but reduces TTFT per-request via lowering B)
 
-L_TTFT_SS    = 1400;   % target TTFT at steady state [ms] (~1.5x TTFT(B=2))
-L_TTFT_TIGHT = 700;    % tighter TTFT target [ms] (~below TTFT(B=2))
+% From this run: actual warm TTFT at B=4 is ~800ms.
+% L_TTFT_SS must be <= natural TTFT so controller can regulate.
+% Set to 900ms (slightly above natural 800ms -- B will swing 3<->4).
+% Spike will push TTFT above 900ms, controller reduces B.
+L_TTFT_SS    = 900;    % slightly above natural TTFT -- controller active
+L_TTFT_TIGHT = 500;    % below TTFT(B=1)~580ms -- forces B=1
 LAMBDA_SS    = 2;      % FIX: was 4, now 2 -- system can keep up
 LAMBDA_SPIKE = 6;      % > B_max=4, creates queue pressure
 LAMBDA_DROP  = 1;
 
-% Override with identified values if they exist and are sensible
-if exist('L_target_recommended','var') && L_target_recommended > 0
-    % L_target_recommended was computed from l_total; scale to TTFT-only
-    % TTFT is roughly 50-60% of l_total at moderate queue depths
-    L_TTFT_SS    = round(L_target_recommended * 0.55 / 100) * 100;
-    L_TTFT_TIGHT = round(L_TTFT_SS * 0.5 / 100) * 100;
-end
+% Do NOT override from L_target_recommended -- it was derived from
+% l_total (queue+TTFT) not from TTFT alone, and over-estimates the target.
 % Keep lambda fixed at sensible values regardless of characterise output
 % lambda_ss=2 is the key safety margin
 
