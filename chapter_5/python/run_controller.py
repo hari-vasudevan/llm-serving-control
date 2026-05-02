@@ -6,39 +6,28 @@ LATENCY DEFINITION
 ------------------
 l_total = t_first_token - t_enqueue  (queue wait + TTFT)
 
-This is the correct SLO metric: from the user's perspective, latency starts
-when they submit the request, not when vLLM begins processing it.
-
-l_total is measured per-request by stamping t_enqueue on FIFO entry and
-recording t_first_token on first SSE chunk.  Per-tick l_meas is the mean
-of all l_total values from requests that completed during that tick window.
-
 PLANT MODEL
 -----------
 l_total(B, q) = alpha*B + gamma*B^2 + (q/B)*dt*1000
 
-where q = q_sw (software FIFO depth), B = dispatch batch size per tick.
+CASCADE CONTROLLER  (signs verified)
+--------------------------------------
+Outer (l_total -> q_ref):
+  K_il > 0.  CL pole z = 1 - beta_q * K_il = exp(-dt/tau_out)
+  l > target (e_l < 0) -> xi_l ↓ -> q_ref = K_il*xi_l ↓
+    -> inner sees q_ref < q_sw -> B ↑ -> queue drains -> queue_wait ↓  ✓
 
-This is why the cascade makes sense:
-  - Inner loop controls B to regulate q_sw toward q_ref
-  - Outer loop sets q_ref to regulate l_total
+Inner (q_sw -> B):
+  K_q > 0.  Law: dB = -(K_q*e_q + K_i*xi_q),  e_q = q_ref - q_sw
+  q_sw > q_ref (e_q < 0) -> dB = -(K_q*neg) > 0 -> B ↑ -> drain ✓
 
-CASCADE ARCHITECTURE
---------------------
-Outer (l_total -> q_ref):   e_l = L_target - l_meas
-                             xi_l += e_l
-                             q_ref = q0 + K_il * xi_l   [K_il < 0]
-
-Inner (q_sw -> B):          e_q = q_ref - q_sw
-                             xi_q += e_q
-                             dB = -(K_q * e_q + K_i * xi_q)
-                             B = clamp(B0 + dB)          [K_q > 0]
-
-DISTURBANCE PRESETS
--------------------
-rich:        Steady(30) | λ↑ Spike 90t | Recovery(40) | λ↓ Drop(30) |
-             Recovery(30) | Target↓(40) | Restore(30)
-spike_only:  Steady(20) | λ↑ Spike 90t | Recovery(30)
+Anti-windup:
+  Outer: freeze xi_l when q_ref at bound AND e_l would push further into bound.
+    K_il > 0: q_ref ↓ when xi_l ↓ (e_l < 0). Freeze at q_ref=0 when e_l<0.
+              q_ref ↑ when xi_l ↑ (e_l > 0). Freeze at q_ref=q_max when e_l>0.
+  Inner: freeze xi_q when B at bound AND e_q would push further into bound.
+    K_q > 0: B ↓ when e_q > 0. Freeze at B=B_min when e_q>0.
+             B ↑ when e_q < 0. Freeze at B=B_max when e_q<0.
 """
 
 import argparse
@@ -72,18 +61,18 @@ PROMPTS = [
 
 PRESETS = {
     "rich": [
-        {"ticks": 30, "lambda": 3, "L_target": 150, "label": "Steady"},
-        {"ticks": 90, "lambda": 6, "L_target": 150, "label": "λ↑ Spike (90t)"},
-        {"ticks": 40, "lambda": 3, "L_target": 150, "label": "Recovery"},
-        {"ticks": 30, "lambda": 1, "L_target": 150, "label": "λ↓ Drop"},
-        {"ticks": 30, "lambda": 3, "L_target": 150, "label": "Recovery"},
-        {"ticks": 40, "lambda": 3, "L_target": 100, "label": "Target↓ (100ms)"},
-        {"ticks": 30, "lambda": 3, "L_target": 150, "label": "Target restore"},
+        {"ticks": 30, "lambda": 3, "L_target": 400, "label": "Steady"},
+        {"ticks": 90, "lambda": 6, "L_target": 400, "label": "λ↑ Spike (90t)"},
+        {"ticks": 40, "lambda": 3, "L_target": 400, "label": "Recovery"},
+        {"ticks": 30, "lambda": 1, "L_target": 400, "label": "λ↓ Drop"},
+        {"ticks": 30, "lambda": 3, "L_target": 400, "label": "Recovery"},
+        {"ticks": 40, "lambda": 3, "L_target": 250, "label": "Target↓ (250ms)"},
+        {"ticks": 30, "lambda": 3, "L_target": 400, "label": "Target restore"},
     ],
     "spike_only": [
-        {"ticks": 20, "lambda": 3, "L_target": 150, "label": "Steady"},
-        {"ticks": 90, "lambda": 6, "L_target": 150, "label": "λ↑ Spike (90t)"},
-        {"ticks": 30, "lambda": 3, "L_target": 150, "label": "Recovery"},
+        {"ticks": 20, "lambda": 3, "L_target": 400, "label": "Steady"},
+        {"ticks": 90, "lambda": 6, "L_target": 400, "label": "λ↑ Spike (90t)"},
+        {"ticks": 30, "lambda": 3, "L_target": 400, "label": "Recovery"},
     ],
 }
 
@@ -109,12 +98,7 @@ def get_metrics(url):
 
 
 def fire_batch_ltotal(url, model, prompts, sink, timeout=30):
-    """
-    Fire len(prompts) requests concurrently.
-    t_enqueue is shared: all requests entered the queue at the same moment
-    (they were all dequeued together at the start of this tick).
-    l_total = t_first_token - t_enqueue is appended to sink for each request.
-    """
+    """Fire prompts concurrently; append l_total = (t_first_token - t_enqueue)*1000 to sink."""
     t_enqueue = time.perf_counter()
 
     def worker(prompt):
@@ -132,15 +116,11 @@ def fire_batch_ltotal(url, model, prompts, sink, timeout=30):
         except Exception:
             pass
 
-    threads = [threading.Thread(target=worker, args=(p,), daemon=True)
-               for p in prompts]
+    threads = [threading.Thread(target=worker, args=(p,), daemon=True) for p in prompts]
     for t in threads: t.start()
     for t in threads: t.join()
 
 
-# ---------------------------------------------------------------------------
-# Thread-safe results sink
-# ---------------------------------------------------------------------------
 class ResultsSink:
     def __init__(self):
         self._lock = threading.Lock()
@@ -151,19 +131,18 @@ class ResultsSink:
             self._buf.append(v)
 
     def drain(self):
-        """Return and clear all accumulated values."""
         with self._lock:
             out, self._buf = self._buf, []
         return out
 
 
 # ---------------------------------------------------------------------------
-# Cascade controller
+# Cascade controller  (signs verified 2026-03-23)
 # ---------------------------------------------------------------------------
 class CascadeController:
     def __init__(self, p):
         oc = p["outer"]
-        self.K_il     = oc["K_il"]        # < 0
+        self.K_il     = oc["K_il"]        # > 0  (verified)
         self.xi_l     = 0.0
         self.xi_l_min = oc["xi_l_min"]
         self.xi_l_max = oc["xi_l_max"]
@@ -171,45 +150,52 @@ class CascadeController:
         self.q_max    = oc["q_max"]
 
         ic = p["inner"]
-        self.K_q      = ic["K_q"]          # > 0
-        self.K_i      = ic["K_i"]
+        self.K_q      = ic["K_q"]          # > 0  (verified)
+        self.K_i      = ic["K_i"]          # > 0  (verified)
         self.xi_q     = 0.0
         self.xi_q_min = ic["xi_q_min"]
         self.xi_q_max = ic["xi_q_max"]
         self.B0       = ic["B0"]
         self.B_min    = ic["B_min"]
         self.B_max    = ic["B_max"]
-
         self.L_target = p["L_target"]
 
     def step(self, l_meas, q_sw, L_tgt_override=None):
         L_tgt = L_tgt_override if L_tgt_override is not None else self.L_target
 
-        # Outer: l_total -> q_ref
-        # K_il < 0:  l > L_tgt (e_l < 0) -> xi_l ↓ -> K_il*xi_l ↑ -> q_ref ↑
-        #   -> inner: q_ref > q_sw -> e_q > 0 -> dB < 0 -> B ↓ -> less contention
-        #   -> TTFT ↓, and queue builds (q_sw rises to q_ref) -> queue_wait ↑ offsetting
-        #   Net: outer stabilises l_total at L_tgt
+        # ── Outer loop: l_total → q_ref ───────────────────────────────────
+        # K_il > 0:
+        #   l > target (e_l < 0) → xi_l ↓ → q_ref = K_il*xi_l ↓
+        #     → inner: q_ref < q_sw → e_q < 0 → B ↑ → drains queue
+        #     → queue_wait ↓ → l_total ↓  ✓
         e_l      = L_tgt - l_meas
         xi_l_sat = max(self.xi_l_min, min(self.xi_l_max, self.xi_l))
         q_ref    = float(np.clip(self.q0 + self.K_il * xi_l_sat, 0, self.q_max))
 
-        at_lo_l = (q_ref <= 0)          and (e_l > 0)
-        at_hi_l = (q_ref >= self.q_max) and (e_l < 0)
+        # Anti-windup (K_il > 0):
+        #   at lower bound: e_l < 0 would push xi_l lower → q_ref below 0 → freeze
+        #   at upper bound: e_l > 0 would push xi_l higher → q_ref above q_max → freeze
+        at_lo_l = (q_ref <= 0)          and (e_l < 0)
+        at_hi_l = (q_ref >= self.q_max) and (e_l > 0)
         if not (at_lo_l or at_hi_l):
             self.xi_l = max(self.xi_l_min, min(self.xi_l_max, xi_l_sat + e_l))
         else:
             self.xi_l = xi_l_sat
 
-        # Inner: q_sw -> B
-        # K_q > 0:  q_sw > q_ref (e_q < 0) -> dB = -(K_q * neg) > 0 -> B ↑ -> drain ✓
+        # ── Inner loop: q_sw → B ──────────────────────────────────────────
+        # K_q > 0:
+        #   q_sw > q_ref (e_q < 0) → dB = -(K_q*neg) > 0 → B ↑ → drain ✓
+        #   q_sw < q_ref (e_q > 0) → dB = -(K_q*pos) < 0 → B ↓ → queue builds ✓
         e_q      = q_ref - q_sw
         xi_q_sat = max(self.xi_q_min, min(self.xi_q_max, self.xi_q))
         dB       = -(self.K_q * e_q + self.K_i * xi_q_sat)
         B_cmd    = int(np.clip(round(self.B0 + dB), self.B_min, self.B_max))
 
-        at_lo_q = (B_cmd <= self.B_min) and (e_q < 0)
-        at_hi_q = (B_cmd >= self.B_max) and (e_q > 0)
+        # Anti-windup (K_q > 0):
+        #   at lower bound: e_q > 0 → dB < 0 → wants B below B_min → freeze
+        #   at upper bound: e_q < 0 → dB > 0 → wants B above B_max → freeze
+        at_lo_q = (B_cmd <= self.B_min) and (e_q > 0)
+        at_hi_q = (B_cmd >= self.B_max) and (e_q < 0)
         if not (at_lo_q or at_hi_q):
             self.xi_q = max(self.xi_q_min, min(self.xi_q_max, xi_q_sat + e_q))
         else:
@@ -229,8 +215,7 @@ def run(url, model, ctrl, schedule, dt, out_dir):
     sink          = ResultsSink()
 
     print(f"\n{'═'*72}")
-    print(f"CASCADE RUN  {total} ticks  dt={dt}s  "
-          f"l_total = queue_wait + TTFT  (enqueue-to-first-token)")
+    print(f"CASCADE RUN  {total} ticks  dt={dt}s")
     for s in schedule:
         print(f"  {s['ticks']:3d}t  λ={s['lambda']}  L_target={s['L_target']}ms  [{s['label']}]")
     print(f"{'═'*72}\n")
@@ -246,34 +231,28 @@ def run(url, model, ctrl, schedule, dt, out_dir):
         L_tgt = seg["L_target"]
         t0    = time.perf_counter()
 
-        # 1. Collect l_total from requests completed this tick
+        # 1. Collect l_total from completed requests
         completed = sink.drain()
         valid     = [x for x in completed if not math.isnan(x) and x > 0]
-        l_meas    = statistics.mean(valid) if valid else float("nan")
-        if math.isnan(l_meas):
-            l_meas = L_tgt   # cold start / no completions this tick
+        l_meas    = statistics.mean(valid) if valid else L_tgt  # fallback
 
-        # 2. Poisson arrivals -> FIFO (with enqueue timestamps)
+        # 2. Poisson arrivals → FIFO
         a_k = int(np.random.poisson(lam))
         for _ in range(a_k):
             fifo.append(PROMPTS[prompt_idx % len(PROMPTS)])
             prompt_idx += 1
         q_sw = len(fifo)
 
-        # 3. Cascade control step
+        # 3. Control
         B_cmd, q_ref, e_l, e_q, xi_l, xi_q = ctrl.step(l_meas, q_sw, L_tgt)
 
-        # 4. Dispatch min(B_cmd, fifo_len) -- t_enqueue is NOW for the whole batch
+        # 4. Dispatch
         n_disp = min(B_cmd, len(fifo))
         batch  = [fifo.popleft() for _ in range(n_disp)]
         if batch:
-            # Each request in batch shares the same t_enqueue (this tick's dispatch time)
-            # which slightly underestimates true wait for requests that arrived earlier,
-            # but is the correct FIFO dispatch model: all dispatched together.
-            threading.Thread(
-                target=fire_batch_ltotal,
-                args=(url, model, batch, sink),
-                daemon=True).start()
+            threading.Thread(target=fire_batch_ltotal,
+                             args=(url, model, batch, sink),
+                             daemon=True).start()
 
         # 5. Tick clock
         elapsed = time.perf_counter() - t0
@@ -302,7 +281,7 @@ def plot_results(log, schedule, out_dir):
     fig, axes = plt.subplots(4, 1, figsize=(15, 11), sharex=True)
     fig.suptitle(
         "Chapter 5 — Cascade controller on live vLLM\n"
-        "l_total = queue_wait + TTFT  |  Outer: l→q_ref  |  Inner: q→B",
+        "l_total = queue_wait + TTFT  |  Outer: l→q_ref (K_il>0)  |  Inner: q→B (K_q>0)",
         fontsize=12, fontweight="bold")
 
     seg_start = 0
@@ -316,31 +295,31 @@ def plot_results(log, schedule, out_dir):
                      ha="center", va="top", fontsize=7.5, color="#333333")
         seg_start = seg_end
 
-    ax = axes[0]
-    ax.plot(ticks, log["l_meas"], "b-", lw=1.3, label="l_total (queue_wait+TTFT) [ms]", zorder=3)
-    ax.step(ticks, log["L_target"], "k--", lw=1.5, where="post", label="L_target", zorder=3)
-    ax.set_ylabel("l_total [ms]"); ax.legend(loc="upper right", fontsize=9); ax.grid(True, alpha=0.4)
+    axes[0].plot(ticks, log["l_meas"], "b-", lw=1.3, label="l_total [ms]", zorder=3)
+    axes[0].step(ticks, log["L_target"], "k--", lw=1.5, where="post", label="L_target", zorder=3)
+    axes[0].set_ylabel("l_total [ms]"); axes[0].legend(loc="upper right", fontsize=9)
+    axes[0].grid(True, alpha=0.4)
 
-    ax = axes[1]
-    ax.fill_between(ticks, log["q_sw"], step="post", color="orange", alpha=0.35, zorder=2)
-    ax.step(ticks, log["q_sw"],  "darkorange", lw=1.2, where="post", label="q_sw (FIFO)", zorder=3)
-    ax.step(ticks, log["q_ref"], "g--",         lw=1.5, where="post", label="q_ref (outer cmd)", zorder=3)
-    ax.set_ylabel("Queue [req]"); ax.legend(loc="upper right", fontsize=9); ax.grid(True, alpha=0.4)
+    axes[1].fill_between(ticks, log["q_sw"], step="post", color="orange", alpha=0.35, zorder=2)
+    axes[1].step(ticks, log["q_sw"],  "darkorange", lw=1.2, where="post", label="q_sw (FIFO)", zorder=3)
+    axes[1].step(ticks, log["q_ref"], "g--", lw=1.5, where="post", label="q_ref (outer cmd)", zorder=3)
+    axes[1].set_ylabel("Queue [req]"); axes[1].legend(loc="upper right", fontsize=9)
+    axes[1].grid(True, alpha=0.4)
 
-    ax = axes[2]
-    ax.step(ticks, log["B"],      "m-",  lw=1.5, where="post", label="B (dispatch)", zorder=3)
-    ax.step(ticks, log["lambda"], "k--", lw=1.0, where="post", label="λ (arrivals)", zorder=3)
-    ax.set_ylabel("Req / tick"); ax.legend(loc="upper right", fontsize=9); ax.grid(True, alpha=0.4)
+    axes[2].step(ticks, log["B"],      "m-",  lw=1.5, where="post", label="B (dispatch)", zorder=3)
+    axes[2].step(ticks, log["lambda"], "k--", lw=1.0, where="post", label="λ (arrivals)", zorder=3)
+    axes[2].set_ylabel("Req / tick"); axes[2].legend(loc="upper right", fontsize=9)
+    axes[2].grid(True, alpha=0.4)
 
-    ax  = axes[3]
-    ax2 = ax.twinx()
-    ax.plot(ticks, log["xi_l"],  "g-",  lw=1.2, label="ξ_l (outer)", zorder=3)
-    ax2.plot(ticks, log["xi_q"], "r--", lw=1.0, label="ξ_q (inner)", zorder=3)
-    ax.axhline(0, color="k", lw=0.7, ls="--")
-    ax.set_ylabel("ξ_l", color="g"); ax2.set_ylabel("ξ_q", color="r")
-    ax.set_xlabel("Tick [k]")
-    l1, n1 = ax.get_legend_handles_labels(); l2, n2 = ax2.get_legend_handles_labels()
-    ax.legend(l1+l2, n1+n2, loc="upper left", fontsize=9); ax.grid(True, alpha=0.4)
+    ax3  = axes[3]
+    ax3b = ax3.twinx()
+    ax3.plot(ticks, log["xi_l"],  "g-",  lw=1.2, label="ξ_l (outer)", zorder=3)
+    ax3b.plot(ticks, log["xi_q"], "r--", lw=1.0, label="ξ_q (inner)", zorder=3)
+    ax3.axhline(0, color="k", lw=0.7, ls="--")
+    ax3.set_ylabel("ξ_l", color="g"); ax3b.set_ylabel("ξ_q", color="r")
+    ax3.set_xlabel("Tick [k]")
+    l1, n1 = ax3.get_legend_handles_labels(); l2, n2 = ax3b.get_legend_handles_labels()
+    ax3.legend(l1+l2, n1+n2, loc="upper left", fontsize=9); ax3.grid(True, alpha=0.4)
 
     fig.tight_layout()
     ts   = datetime.now().strftime("%H%M%S")
@@ -371,18 +350,20 @@ def main():
         sys.exit(f"Not found: {args.params}\nRun: python3 design_controller.py first.")
     with open(args.params) as f:
         params = json.load(f)
-
     if "inner" not in params or "outer" not in params:
         sys.exit("Params missing 'inner'/'outer' -- run design_controller.py first.")
-
     if args.L_target:
         params["L_target"] = args.L_target
 
     ic = params["inner"]; oc = params["outer"]
-    print(f"Cascade controller loaded:")
-    print(f"  Inner: K_q={ic['K_q']:.4f} (>0)  K_i={ic['K_i']:.4f}  B0={ic['B0']}")
-    print(f"  Outer: K_il={oc['K_il']:.8f} (<0)  tau_out={oc.get('tau_out','?')}s")
-    print(f"  L_target={params['L_target']:.0f} ms  beta_q={oc.get('beta_q','?')} ms/req\n")
+    assert ic["K_q"] > 0, f"K_q must be positive, got {ic['K_q']}"
+    assert oc["K_il"] > 0, f"K_il must be positive, got {oc['K_il']}"
+    print(f"Cascade controller:")
+    print(f"  Inner: K_q={ic['K_q']:.4f} (>0 ✓)  K_i={ic['K_i']:.4f}  "
+          f"B0={ic['B0']}  poles={ic.get('poles_cl','?')}")
+    print(f"  Outer: K_il={oc['K_il']:.8f} (>0 ✓)  tau_out={oc.get('tau_out','?')}s  "
+          f"beta_q={oc.get('beta_q','?')} ms/req")
+    print(f"  L_target={params['L_target']:.0f} ms\n")
 
     try:
         requests.get(f"{args.url}/health", timeout=5).raise_for_status()
@@ -390,16 +371,12 @@ def main():
     except Exception as e:
         sys.exit(f"vLLM not reachable: {e}")
 
-    if args.n_ticks:
-        schedule = [{"ticks": args.n_ticks,
-                     "lambda": args.lambda_mean or 3,
-                     "L_target": args.L_target or params["L_target"],
-                     "label": "Steady"}]
-    else:
-        schedule = PRESETS[args.preset]
-        if args.L_target:
-            for s in schedule:
-                s["L_target"] = args.L_target
+    schedule = PRESETS[args.preset] if not args.n_ticks else [
+        {"ticks": args.n_ticks, "lambda": args.lambda_mean or 3,
+         "L_target": args.L_target or params["L_target"], "label": "Steady"}]
+    if args.L_target and not args.n_ticks:
+        for s in schedule:
+            s["L_target"] = args.L_target
 
     ctrl    = CascadeController(params)
     out_dir = Path(args.out_dir)
@@ -409,9 +386,8 @@ def main():
     print("\n=== Per-segment summary ===")
     seg_start = 0
     for seg in schedule:
-        se = seg_start + seg["ticks"]
-        sl = log["l_meas"][seg_start:se]
-        valid = [x for x in sl if not math.isnan(x)]
+        se    = seg_start + seg["ticks"]
+        valid = [x for x in log["l_meas"][seg_start:se] if not math.isnan(x)]
         if valid:
             p95 = sorted(valid)[int(0.95*len(valid))]
             print(f"  {seg['label']:22s}  λ={seg['lambda']}  L_tgt={seg['L_target']}  "

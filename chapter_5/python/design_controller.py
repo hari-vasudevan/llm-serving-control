@@ -21,16 +21,12 @@ Outer loop  (l_total -> q_ref):
     xi_l[k+1] = xi_l[k] + e_l[k]
     q_ref[k]  = q0 + K_il * xi_l[k]
 
-    We need K_il < 0 so that:
-      l > target  (e_l < 0)  -> xi_l decreases
-                              -> K_il*xi_l increases (less negative)
-                              -> q_ref increases
-                              -> inner raises B to drain queue
-                              -> queue_wait drops -> l_total drops  ✓
+    We need K_il > 0.  CL pole: z = 1 - beta_q * K_il
+    l > target (e_l < 0) -> xi_l down -> K_il*xi_l down -> q_ref down
+    -> inner: q_ref < q_sw -> B up -> queue drains -> queue_wait down  ✓
 
-    Gain from desired outer CL pole z_out = exp(-dt/tau_out):
-      z_out = 1 + beta_q * K_il     [linearised CL char. eqn.]
-      K_il  = (z_out - 1) / beta_q  [NEGATIVE since z_out < 1, beta_q > 0]
+    Setting z_out = exp(-dt/tau_out):
+      K_il = (1 - z_out) / beta_q   [POSITIVE: 1-z_out>0, beta_q>0]
 
 Inner loop  (q_ref -> B via queue error):
 
@@ -101,8 +97,8 @@ def design_outer(beta_q, dt, tau_out, q0, q_max):
     K_il = (z_out - 1) / beta_q  [NEGATIVE]
     """
     z_out = math.exp(-dt / tau_out)
-    K_il  = (z_out - 1.0) / beta_q
-    assert K_il < 0, f"K_il={K_il:.6f} should be negative"
+    K_il  = (1.0 - z_out) / beta_q   # POSITIVE
+    assert K_il > 0, f"K_il={K_il:.6f} should be positive"
 
     if abs(K_il) > 1e-12:
         bounds   = [(0-q0)/K_il, (q_max-q0)/K_il]
@@ -111,7 +107,7 @@ def design_outer(beta_q, dt, tau_out, q0, q_max):
         xi_l_min, xi_l_max = -1e6, 1e6
 
     print(f"  [outer] beta_q = {beta_q:.4f} ms/req = dt*1000/B0  (analytical)")
-    print(f"  [outer] K_il   = {K_il:.8f}  (<0 ✓)")
+    print(f"  [outer] K_il   = {K_il:.8f}  (>0 ✓)")
     print(f"  [outer] z_out  = {z_out:.6f}  tau_out={tau_out:.0f}s")
     return {"K_il": K_il, "z_out": z_out, "tau_out": tau_out, "beta_q": beta_q,
             "q0": q0, "q_max": q_max, "xi_l_min": xi_l_min, "xi_l_max": xi_l_max}

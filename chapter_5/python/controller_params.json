@@ -9,7 +9,7 @@
   "B_min": 1,
   "B_max": 8,
   "q_max": 30,
-  "L_target": 150.0,
+  "L_target": 400.0,
   "dt": 1.0,
   "inner": {
     "K_q": 0.6769380297135772,
@@ -25,14 +25,14 @@
     "B_max": 8
   },
   "outer": {
-    "K_il": -0.00014631172649785795,
+    "K_il": 0.00014631172649785795,
     "z_out": 0.951229424500714,
     "tau_out": 20.0,
     "beta_q": 333.3333333333333,
     "q0": 0,
     "q_max": 30,
-    "xi_l_min": -205041.6649306589,
-    "xi_l_max": -0.0
+    "xi_l_min": 0.0,
+    "xi_l_max": 205041.6649306589
   },
   "latency_definition": "l_total = t_first_token - t_enqueue",
   "plant_model": "l_total(B,q) = alpha*B + gamma*B^2 + (q/B)*dt*1000"

@@ -13,7 +13,7 @@ set -e
 MODEL="mlx-community/Qwen3-0.6B-4bit"
 PORT=8001
 MAX_SEQS=4
-MAX_LEN=512
+MAX_LEN=256       # reduced from 512 to cut GPU memory usage -- fixes OOM crash on Apple Metal
 LOG=/tmp/vllm_chapter5.log
 
 VENV=~/.venv-vllm-metal
@@ -26,7 +26,7 @@ echo "[start_vllm] Killing any stale vLLM / load_gen processes..."
 pkill -9 -f "vllm serve"  2>/dev/null || true
 pkill -9 -f "load_gen.py" 2>/dev/null || true
 rm -f /tmp/vllm_chapter5.pid /tmp/load_gen.pid
-sleep 2
+sleep 3
 
 if [[ "$1" == "--bg" ]]; then
     echo "[start_vllm] Starting in background, logging to $LOG"
@@ -34,14 +34,13 @@ if [[ "$1" == "--bg" ]]; then
     VLLM_PID=$!
     echo $VLLM_PID > /tmp/vllm_chapter5.pid
     echo "[start_vllm] PID = $VLLM_PID"
-    echo "[start_vllm] Model: $MODEL"
+    echo "[start_vllm] Model: $MODEL  max_model_len=$MAX_LEN"
     echo "[start_vllm] Waiting for server on port $PORT..."
 
     for i in $(seq 1 180); do
         if curl -s http://localhost:$PORT/health > /dev/null 2>&1; then
             echo "[start_vllm] Server ready after ${i}s"
             curl -s http://localhost:$PORT/health && echo ""
-            # Confirm queue is clean
             Q=$(curl -s http://localhost:$PORT/metrics | grep "num_requests_waiting" | grep -v "#" | awk '{print $NF}')
             echo "[start_vllm] num_requests_waiting = $Q  (should be 0.0)"
             exit 0
@@ -49,6 +48,8 @@ if [[ "$1" == "--bg" ]]; then
         sleep 1
         if [ $((i % 15)) -eq 0 ]; then
             echo "[start_vllm] Still waiting... (${i}s)"
+            # show last log line to confirm it's actually progressing
+            tail -1 $LOG 2>/dev/null | sed 's/^/  last log: /'
         fi
     done
     echo "[start_vllm] WARNING: server did not respond after 180s"
