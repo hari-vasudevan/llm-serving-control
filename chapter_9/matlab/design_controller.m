@@ -10,6 +10,21 @@ load(fullfile(fileparts(mfilename('fullpath')), 'identified_params.mat'));
 
 fprintf('=== Chapter 9 Cascade Design ===\n');
 
+% Demonstration operating point.  The plant fit still comes from the full
+% characterization, but the closed-loop demo should not sit next to B_max.
+DEMO_B0 = 1200;
+DEMO_LAMBDA_NOMINAL = 1200;
+if exist('LAMBDA_SWEEP', 'var') && exist('qmean_lambda', 'var') && exist('lmean_lambda', 'var')
+    [~, demo_idx] = min(abs(LAMBDA_SWEEP - DEMO_LAMBDA_NOMINAL));
+    B0 = DEMO_B0;
+    lambda_mean = LAMBDA_SWEEP(demo_idx);
+    q0 = qmean_lambda(demo_idx);
+    L_mean_target = lmean_lambda(demo_idx);
+    L_p95_target = lp95_lambda(demo_idx);
+    fprintf('[demo op] overriding saved op to B0=%d lambda0=%.2f using characterization point index %d\n', ...
+        B0, lambda_mean, demo_idx);
+end
+
 perturbed = struct();
 perturbed.dt = DT;
 perturbed.B0 = B0;
@@ -24,11 +39,12 @@ perturbed.L_mean_target = L_mean_target;
 perturbed.L_p95_target = L_p95_target;
 perturbed.B_min = B_min;
 perturbed.B_max = B_max;
-perturbed.q_min = Q_REF_MIN;
+perturbed.q_min = max(Q_REF_MIN, q0);
 perturbed.q_max = Q_MAX;
 perturbed.tau_in = 1.0;
-perturbed.tau_out = 35.0;
+perturbed.tau_out = 300.0;
 perturbed.inner_integral_fraction = 0.60;
+perturbed.inner_xi_leak = 0.85;
 
 fprintf('[op] B0=%d B_max=%d lambda_mean=%.2f q0=%.2f L_target=%.2f\n', ...
     perturbed.B0, perturbed.B_max, perturbed.lambda_mean, perturbed.q0, perturbed.L_mean_target);
@@ -83,6 +99,7 @@ controller = struct();
 controller.inner_c = struct( ...
     'K_q', K_q, ...
     'K_i_q', K_i_q, ...
+    'xi_leak', perturbed.inner_xi_leak, ...
     'B0', B0, ...
     'B_min', perturbed.B_min, ...
     'B_max', perturbed.B_max, ...
