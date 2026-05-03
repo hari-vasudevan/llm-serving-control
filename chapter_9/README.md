@@ -1,0 +1,149 @@
+# Chapter 9 -- Lower-Level GPU Batching Plant
+
+Chapter 9 is the direct follow-up to the Chapter 8 failure mode.
+
+Chapter 8 showed that a top-level Modal + vLLM serving experiment, even with
+a wrapper FIFO queue, does not cleanly expose the Chapter 2 cascade plant.  It
+produced a weak positive `B -> q` relation but an unphysical negative
+`q -> L_mean` fit.  Chapter 9 therefore moves one level down: away from HTTP
+LLM serving and toward a minimal GPU scheduling/batching plant.
+
+The goal is to test the Chapter 2 cascade theory on the simplest real plant
+where its assumptions are physically meaningful.
+
+## Chapter 2 Terminology
+
+The experiment keeps the Chapter 2 controller vocabulary:
+
+- inner loop: `B -> q`
+- outer loop: `q_ref -> L_mean`
+- actuator: `B[k]`, the commanded batch size
+- plant state: `q[k]`, the FIFO queue depth
+- outer-loop output: `L_mean[k]`, measured request latency
+- optional output: `L_p95[k]`, rolling measured p95 latency
+- arrivals: `lambda[k]`, sampled arrivals per control tick
+
+The Chapter 2 plant equations were:
+
+```text
+q[k+1] = max(0, q[k] + lambda[k] - B[k])
+
+L_mean[k] = alpha*B[k] + gamma*B[k]^2 + beta*q[k]
+
+L_p95[k] = L_mean[k] + 1.645*delta/sqrt(B[k])
+```
+
+Chapter 9 identifies the corresponding quantities from a real GPU batch
+workload instead of assuming them.
+
+## Architecture
+
+```text
+MATLAB cascade controller
+    -> Python plant server
+        -> FIFO queue q[k]
+        -> exact batch-size actuator B[k]
+        -> fixed GPU batch workload
+        -> measured batch service time
+        -> request/batch/tick logs
+```
+
+The Python plant server is intentionally lower-level than vLLM.  A request is
+a fixed tensor job.  A batch is exactly `B[k]` queued tensor jobs stacked
+together and sent through a fixed PyTorch GPU workload.
+
+This removes:
+
+- network latency inside the measured service time,
+- streaming effects,
+- vLLM scheduler opacity,
+- serverless/runtime interference,
+- prompt and generation-length variability.
+
+## Files
+
+- `python/gpu_batch_server.py`
+  HTTP plant server with FIFO queue, exact `B`, measured GPU batch service,
+  and CSV logs.
+- `python/workloads.py`
+  Fixed PyTorch batched matrix workload.
+- `python/requirements.txt`
+  Minimal Python dependencies.
+- `matlab/characterise_plant.m`
+  Open-loop sweeps to identify `B -> q`, service time, and `q -> L_mean`.
+- `matlab/design_controller.m`
+  Chapter 2-style cascade controller design.
+- `matlab/run_cascade_controller.m`
+  Closed-loop test with steady load and arrival spikes.
+
+## Run Flow
+
+From `chapter_9/python`:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python gpu_batch_server.py --device cuda --port 8019 --initial-B 8 --dim 1024 --layers 6
+```
+
+For a CPU smoke test:
+
+```bash
+python gpu_batch_server.py --device cpu --port 8019 --initial-B 8 --dim 256 --layers 2
+```
+
+Then in MATLAB:
+
+```matlab
+cd chapter_9/matlab
+characterise_plant
+design_controller
+run_cascade_controller
+```
+
+## Is Python Fast Enough?
+
+Yes, for this experiment.  Python is the discrete scheduler and logging
+wrapper, not the GPU compute kernel.
+
+The measured service interval is:
+
+```python
+workload.synchronize()
+t0 = time.perf_counter()
+workload.run(B_actual)
+workload.synchronize()
+t1 = time.perf_counter()
+service_time_ms = 1000 * (t1 - t0)
+```
+
+That makes the measurement include GPU work and exclude queued asynchronous
+launches from previous batches.
+
+Python is appropriate for controller/sample periods around `50--500 ms`.  It
+is not intended for microsecond kernel scheduling.  Chapter 2 is a discrete
+scheduling controller, so this is the right timescale for the theory.
+
+## Success Criteria
+
+Chapter 9 succeeds if the identified plant has physically credible signs:
+
+```text
+B increase -> queue drain improves near overload
+q increase -> L_mean increases
+service_time changes smoothly with B
+closed-loop B moves q toward q_ref
+outer loop moves q_ref to regulate L_mean
+```
+
+The most important check is:
+
+```text
+q -> L_mean must be positive
+```
+
+If that relation is not positive in this lower-level setup, the Chapter 2
+cascade theory is not matching the real scheduling plant.  If it is positive
+here but not in Chapter 8, then Chapter 8 failed because the top-level serving
+stack hid the plant, not because the cascade idea was wrong.
