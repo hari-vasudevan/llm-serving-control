@@ -34,20 +34,28 @@ disp(srv_get(SERVER, '/health'));
 
 fprintf('[modal] running per-point in-container characterisation; this removes MATLAB/network timing from load generation\n');
 
-B_results = repmat(struct(), numel(B_SWEEP), 1);
+B_results = [];
 for i = 1:numel(B_SWEEP)
     payload = block_payload(DT, B_SWEEP(i), LAMBDA_CHAR, TICKS_PER_POINT, SETTLE_TICKS, ...
         sprintf('matlab_characterise_B_%03d', B_SWEEP(i)));
     fprintf('[modal] B sweep %d/%d: B=%d lambda=%.2f\n', i, numel(B_SWEEP), B_SWEEP(i), LAMBDA_CHAR);
-    B_results(i) = srv_post(SERVER, '/characterise_block', payload);
+    result = srv_post(SERVER, '/characterise_block', payload);
+    if i == 1
+        B_results = repmat(result, numel(B_SWEEP), 1);
+    end
+    B_results(i) = result;
 end
 
-lambda_results = repmat(struct(), numel(LAMBDA_SWEEP), 1);
+lambda_results = [];
 for i = 1:numel(LAMBDA_SWEEP)
     payload = block_payload(DT, B0_PROBE, LAMBDA_SWEEP(i), TICKS_PER_POINT, SETTLE_TICKS, ...
         sprintf('matlab_characterise_lambda_%03d', LAMBDA_SWEEP(i)));
     fprintf('[modal] lambda sweep %d/%d: B=%d lambda=%.2f\n', i, numel(LAMBDA_SWEEP), B0_PROBE, LAMBDA_SWEEP(i));
-    lambda_results(i) = srv_post(SERVER, '/characterise_block', payload);
+    result = srv_post(SERVER, '/characterise_block', payload);
+    if i == 1
+        lambda_results = repmat(result, numel(LAMBDA_SWEEP), 1);
+    end
+    lambda_results(i) = result;
 end
 
 char_result = struct( ...
