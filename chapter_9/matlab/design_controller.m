@@ -15,6 +15,7 @@ perturbed.dt = DT;
 perturbed.B0 = B0;
 perturbed.q0 = q0;
 perturbed.beta_q = beta_q;
+perturbed.beta_q_sign = -1;  % q decreases when B increases
 perturbed.beta = beta;
 perturbed.alpha = alpha;
 perturbed.gamma = gamma;
@@ -25,8 +26,8 @@ perturbed.B_min = B_min;
 perturbed.B_max = B_max;
 perturbed.q_min = Q_REF_MIN;
 perturbed.q_max = Q_MAX;
-perturbed.tau_in = 2.0;
-perturbed.tau_out = 10.0;
+perturbed.tau_in = 4.0;
+perturbed.tau_out = 20.0;
 
 controller = design_cascade(perturbed);
 save(fullfile(fileparts(mfilename('fullpath')), 'controller_params.mat'), ...
@@ -60,9 +61,10 @@ K_i_q = 0.25 * K_q;
 
 % Outer loop, Chapter 2 static-gain form:
 %   Delta L = beta * Delta q_ref
-%   q_ref = q0 + K_i_l * xi_l, with K_i_l < 0
+%   e_l = L_target - L
+%   q_ref = q0 + K_i_l * xi_l, with K_i_l > 0 for this error definition
 rho_out = exp(-dt / perturbed.tau_out);
-K_i_l = (rho_out - 1) / beta;
+K_i_l = (1 - rho_out) / beta;
 
 xi_q_max = (perturbed.B_max - B0) / max(abs(K_i_q), 1e-9);
 xi_q_min = -(B0 - perturbed.B_min) / max(abs(K_i_q), 1e-9);
@@ -70,6 +72,7 @@ xi_l_max = (perturbed.q_max - q0) / max(abs(K_i_l), 1e-9);
 xi_l_min = -(q0 - perturbed.q_min) / max(abs(K_i_l), 1e-9);
 
 fprintf('Inner B->q: beta_q=%.4f K_q=%.6f K_i_q=%.6f rho=%.4f\n', beta_q, K_q, K_i_q, rho_in);
+fprintf('  sign convention: dq[k+1] = dq[k] - beta_q*dB[k]\n');
 fprintf('Outer q_ref->L_mean: beta=%.4f K_i_l=%.6f rho=%.4f\n', beta, K_i_l, rho_out);
 
 controller = struct();

@@ -61,6 +61,9 @@ class Plant:
         self.service_ms_recent: deque[float] = deque(maxlen=100)
         self.l_total_recent: deque[float] = deque(maxlen=1000)
         self.qwait_recent: deque[float] = deque(maxlen=1000)
+        self.service_ms_tick: list[float] = []
+        self.l_total_tick: list[float] = []
+        self.qwait_tick: list[float] = []
         self.q_samples_tick: list[int] = []
         self.last_batch: dict[str, Any] = {}
         self.controller_config: dict[str, Any] = {}
@@ -112,6 +115,9 @@ class Plant:
             self.service_ms_recent.clear()
             self.l_total_recent.clear()
             self.qwait_recent.clear()
+            self.service_ms_tick.clear()
+            self.l_total_tick.clear()
+            self.qwait_tick.clear()
             self.q_samples_tick.clear()
             self.last_batch = {}
         return {"status": "reset"}
@@ -120,9 +126,12 @@ class Plant:
         with self.lock:
             q_sw = len(self.fifo)
             q_samples = self.q_samples_tick[:] or [q_sw]
-            service = list(self.service_ms_recent)
-            l_total = list(self.l_total_recent)
-            qwait = list(self.qwait_recent)
+            service_tick = list(self.service_ms_tick)
+            l_total_tick = list(self.l_total_tick)
+            qwait_tick = list(self.qwait_tick)
+            service_recent = list(self.service_ms_recent)
+            l_total_recent = list(self.l_total_recent)
+            qwait_recent = list(self.qwait_recent)
             out = {
                 "status": "ok",
                 "B_current": self.B_current,
@@ -131,10 +140,14 @@ class Plant:
                 "q_max_tick": max(q_samples),
                 "arrivals_tick": self.arrivals_tick,
                 "completions_tick": self.completions_tick,
-                "service_mean_ms": _safe_mean(service),
-                "l_mean_ms": _safe_mean(l_total),
-                "l_p95_ms": _percentile(l_total, 95.0),
-                "queue_wait_mean_ms": _safe_mean(qwait),
+                "service_mean_ms": _safe_mean(service_tick),
+                "l_mean_ms": _safe_mean(l_total_tick),
+                "l_p95_ms": _percentile(l_total_tick, 95.0),
+                "queue_wait_mean_ms": _safe_mean(qwait_tick),
+                "service_recent_mean_ms": _safe_mean(service_recent),
+                "l_recent_mean_ms": _safe_mean(l_total_recent),
+                "l_recent_p95_ms": _percentile(l_total_recent, 95.0),
+                "queue_wait_recent_mean_ms": _safe_mean(qwait_recent),
                 "enqueued": self.enqueued,
                 "completed": self.completed,
                 "last_batch": self.last_batch,
@@ -143,6 +156,9 @@ class Plant:
             self.arrivals_tick = 0
             self.completions_tick = 0
             self.q_samples_tick = []
+            self.service_ms_tick = []
+            self.l_total_tick = []
+            self.qwait_tick = []
             self.tick_writer.writerow({k: out[k] for k in self.tick_writer.fieldnames if k in out} | {"t": time.time()})
             self.tick_csv.flush()
             return out
@@ -215,6 +231,9 @@ class Plant:
                 self.service_ms_recent.append(service_ms)
                 self.qwait_recent.extend(qwaits)
                 self.l_total_recent.extend(totals)
+                self.service_ms_tick.append(service_ms)
+                self.qwait_tick.extend(qwaits)
+                self.l_total_tick.extend(totals)
                 self.last_batch = batch_row.copy()
                 self.batch_writer.writerow(batch_row)
                 self.batch_csv.flush()

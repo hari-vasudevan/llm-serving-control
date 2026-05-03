@@ -204,3 +204,20 @@ If that relation is not positive in this lower-level setup, the Chapter 2
 cascade theory is not matching the real scheduling plant.  If it is positive
 here but not in Chapter 8, then Chapter 8 failed because the top-level serving
 stack hid the plant, not because the cascade idea was wrong.
+
+## Operating Point Selection
+
+The useful actuator range stops when larger `B` no longer increases
+completions per tick.  The MATLAB characterisation therefore computes:
+
+```text
+B_max_effective = first B with completions >= 98% of max(completions)
+```
+
+For the current Modal T4 workload this has been around `B = 2400`; `B = 3200`
+does not materially improve drain rate and should not be used as the controller
+upper limit.  The controller still uses the Chapter 2 sign convention:
+
+```text
+dq[k+1] = dq[k] - beta_q*dB[k], beta_q > 0
+```
