@@ -12,13 +12,14 @@ if strlength(SERVER) == 0
     SERVER = 'https://REPLACE_WITH_MODAL_CH9_URL';
 end
 DT = 0.5;                                  % Chapter 2 scheduling tick [s]
-B_SWEEP = [400 800 1200 1600 2000 2400 3200];
-LAMBDA_SWEEP = [1200 1600 2000 2200 2400 2600 2800 3200];
+B_SWEEP = [400 800 1200 1600 2000 2200 2400 2800 3200];
+LAMBDA_SWEEP = [1200 1600 1800 2000 2200 2400 2600 2800 3200];
 TICKS_PER_POINT = 24;
 SETTLE_TICKS = 6;
 LAMBDA_CHAR = 2400;
-B0_PROBE = 2400;
-Q_TARGET_NOMINAL = 2500;
+B0_PROBE = 2200;
+B0_NOMINAL = 2200;
+LAMBDA_NOMINAL = 2200;
 Q_REF_MIN = 0;
 Q_MAX = 40000;
 
@@ -92,7 +93,7 @@ end
 
 % Effective useful B saturates once completions stop improving materially.
 completion_max = max(completion_B, [], 'omitnan');
-sat_idx = find(completion_B >= 0.98 * completion_max, 1, 'first');
+sat_idx = find(completion_B >= 0.95 * completion_max & B_SWEEP >= LAMBDA_CHAR, 1, 'first');
 if isempty(sat_idx)
     sat_idx = numel(B_SWEEP);
 end
@@ -115,8 +116,8 @@ service_fit = polyfit(B_SWEEP(:), service_B(:), 2);
 gamma = max(service_fit(1), 0);
 alpha = service_fit(2);
 
-[~, op_idx] = min(abs(qmean_lambda - Q_TARGET_NOMINAL));
-B0 = B_max_effective;
+[~, op_idx] = min(abs(LAMBDA_SWEEP - LAMBDA_NOMINAL));
+B0 = min(B0_NOMINAL, B_max_effective);
 lambda_mean = LAMBDA_SWEEP(op_idx);
 q0 = qmean_lambda(op_idx);
 L_mean_target = lmean_lambda(op_idx);
@@ -133,7 +134,7 @@ fprintf('[op] B0=%d lambda_mean=%.2f q0=%.2f L_mean_target=%.2f L_p95_target=%.2
 
 save(fullfile(fileparts(mfilename('fullpath')), 'identified_params.mat'), ...
     'SERVER', 'DT', 'B_SWEEP', 'LAMBDA_SWEEP', 'TICKS_PER_POINT', 'SETTLE_TICKS', ...
-    'LAMBDA_CHAR', 'B0_PROBE', 'B_max_effective', 'char_result', ...
+    'LAMBDA_CHAR', 'B0_PROBE', 'B0_NOMINAL', 'LAMBDA_NOMINAL', 'B_max_effective', 'char_result', ...
     'qmean_B', 'lmean_B', 'lp95_B', 'service_B', 'completion_B', ...
     'qmean_lambda', 'lmean_lambda', 'lp95_lambda', 'service_lambda', 'completion_lambda', ...
     'beta_q', 'beta', 'alpha', 'gamma', 'B0', 'lambda_mean', 'q0', ...

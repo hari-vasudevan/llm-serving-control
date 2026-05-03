@@ -27,7 +27,10 @@ perturbed.B_max = B_max;
 perturbed.q_min = Q_REF_MIN;
 perturbed.q_max = Q_MAX;
 perturbed.tau_in = 4.0;
-perturbed.tau_out = 20.0;
+perturbed.tau_out = 25.0;
+
+fprintf('[op] B0=%d B_max=%d lambda_mean=%.2f q0=%.2f L_target=%.2f\n', ...
+    perturbed.B0, perturbed.B_max, perturbed.lambda_mean, perturbed.q0, perturbed.L_mean_target);
 
 controller = design_cascade(perturbed);
 save(fullfile(fileparts(mfilename('fullpath')), 'controller_params.mat'), ...
