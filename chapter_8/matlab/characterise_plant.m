@@ -1,21 +1,26 @@
 %% characterise_plant.m  --  Chapter 8 plant identification from MATLAB
 %
-% This script talks directly to the Chapter 8 Modal wrapper and identifies a
-% Chapter 2 style plant using the wrapper-controlled batch size B.
+% Characterise the wrapper-queue plant using smoother within-tick arrivals
+% and the wrapper's tick-averaged queue metrics. This makes the Chapter 8
+% plant much closer to the Chapter 2 cascade structure.
 
 clear; clc;
 addpath(fileparts(mfilename('fullpath')));
 
 SERVER = 'https://hvasudevan--chapter-8-vllm-wrapper-serve.modal.run';
 DT = 1.0;
-% Quick-trial profile to complete inside the current MATLAB tool runtime.
-B_SWEEP = [1 4 8];
-N_REPS = 2;
-PROMPT_REPEAT = 192;
-MAX_TOKENS = 32;
-WARMUP_ENQS = 4;
-TIMEOUT_S = 120;
+B_SWEEP = [64 80 96 112 128];
+LAMBDA_SWEEP = [72 84 96 108 120];
+PROMPT_REPEAT = 256;
+MAX_TOKENS = 64;
 TRACE_FILE = fullfile(fileparts(mfilename('fullpath')), 'characterise_trace.txt');
+TICKS_PER_POINT = 8;
+SETTLE_TICKS = 3;
+SPREAD_BINS = 6;
+Q_TARGET_NOMINAL = 24;
+Q_REF_MIN = 10;
+Q_REF_MAX = 90;
+Q_MAX = 180;
 
 if exist(TRACE_FILE, 'file')
     delete(TRACE_FILE);
@@ -24,118 +29,116 @@ diary(TRACE_FILE);
 diary on;
 
 fprintf('=== Chapter 8 Characterise Plant ===\n');
-fprintf('SERVER=%s\nDT=%.1fs\nB_SWEEP=%s\n\n', SERVER, DT, mat2str(B_SWEEP));
+fprintf('SERVER=%s\nDT=%.1fs\nB_SWEEP=%s\nLAMBDA_SWEEP=%s\n\n', ...
+    SERVER, DT, mat2str(B_SWEEP), mat2str(LAMBDA_SWEEP));
 
 smoke = srv_get(SERVER, '/health');
 disp(smoke);
 
-fprintf('[reset] clearing server buffers\n');
-srv_post(SERVER, '/reset', struct('source', 'matlab_characterise'));
-pause(1);
-
-fprintf('[warmup] %d requests at B=4\n', WARMUP_ENQS);
-srv_post(SERVER, '/control', struct('B', 4, 'source', 'matlab_characterise', 'note', 'warmup'));
-for i = 1:WARMUP_ENQS
-    enqueue_prompt(SERVER, prompt_library(i), PROMPT_REPEAT, MAX_TOKENS, 'warmup');
-end
-wait_for_delta_completions(SERVER, WARMUP_ENQS, TIMEOUT_S);
-disp(srv_get(SERVER, '/metrics'));
-
+lambda_char = 96;
 l_mean = NaN(size(B_SWEEP));
 ttft_mean = NaN(size(B_SWEEP));
 qwait_mean = NaN(size(B_SWEEP));
-vllm_waiting = NaN(size(B_SWEEP));
-vllm_running = NaN(size(B_SWEEP));
-rep_logs = cell(numel(B_SWEEP), N_REPS);
+qmean_mean = NaN(size(B_SWEEP));
+qmax_mean = NaN(size(B_SWEEP));
+service_rate_mean = NaN(size(B_SWEEP));
+rep_logs = cell(numel(B_SWEEP), 1);
 
 for bi = 1:numel(B_SWEEP)
     b = B_SWEEP(bi);
-    fprintf('\n=== Sweep B=%d ===\n', b);
-    rep_l = NaN(1, N_REPS);
-    rep_t = NaN(1, N_REPS);
-    rep_q = NaN(1, N_REPS);
-
-    for r = 1:N_REPS
-        fprintf('[B=%d rep=%d] reset and control\n', b, r);
-        srv_post(SERVER, '/reset', struct('source', 'matlab_characterise'));
-        pause(0.5);
-        srv_post(SERVER, '/control', struct('B', b, 'source', 'matlab_characterise', ...
-            'note', sprintf('characterise rep %d', r)));
-
-        for k = 1:b
-            enqueue_prompt(SERVER, prompt_library(k + 10 * r + b), PROMPT_REPEAT, MAX_TOKENS, ...
-                sprintf('char_B%d_rep%d', b, r));
-        end
-
-        wait_for_delta_completions(SERVER, b, TIMEOUT_S);
-        pause(1.0);
-        m = srv_get(SERVER, '/metrics');
-        rep_logs{bi, r} = m;
-        rep_l(r) = metric_or_nan(m, 'l_mean_ms');
-        rep_t(r) = metric_or_nan(m, 'ttft_mean_ms');
-        rep_q(r) = metric_or_nan(m, 'queue_wait_mean_ms');
-        fprintf('[B=%d rep=%d] l_mean=%.1f ttft=%.1f q_wait=%.1f q_sw=%d lambda_10s=%.2f\n', ...
-            b, r, rep_l(r), rep_t(r), rep_q(r), m.q_sw, m.lambda_10s_est);
-    end
-
-    l_mean(bi) = mean(rep_l, 'omitnan');
-    ttft_mean(bi) = mean(rep_t, 'omitnan');
-    qwait_mean(bi) = mean(rep_q, 'omitnan');
-    vllm_waiting(bi) = metric_or_nan(rep_logs{bi, end}, 'vllm_num_requests_waiting');
-    vllm_running(bi) = metric_or_nan(rep_logs{bi, end}, 'vllm_num_requests_running');
+    fprintf('\n=== Sweep B=%d at lambda=%d ===\n', b, lambda_char);
+    rep_logs{bi} = run_operating_block(SERVER, b, lambda_char, TICKS_PER_POINT, SETTLE_TICKS, ...
+        DT, SPREAD_BINS, PROMPT_REPEAT, MAX_TOKENS, sprintf('char_B_%03d', b));
+    summary = summarise_block(rep_logs{bi}, SETTLE_TICKS);
+    l_mean(bi) = summary.l_mean_ms;
+    ttft_mean(bi) = summary.ttft_mean_ms;
+    qwait_mean(bi) = summary.qwait_mean_ms;
+    qmean_mean(bi) = summary.q_mean_tick;
+    qmax_mean(bi) = summary.q_max_tick;
+    service_rate_mean(bi) = summary.service_rate_tick;
+    fprintf('[B=%d] q_mean=%.2f q_max=%.2f l_mean=%.1f ttft=%.1f q_wait=%.1f sr=%.2f\n', ...
+        b, qmean_mean(bi), qmax_mean(bi), l_mean(bi), ttft_mean(bi), qwait_mean(bi), service_rate_mean(bi));
 end
 
-valid = ~isnan(l_mean);
-beta_B = NaN;
-gamma_B = NaN;
-if nnz(valid) >= 3
-    Bv = B_SWEEP(valid)';
-    Lv = l_mean(valid)';
-    coeff = [Bv, Bv.^2] \ Lv;
-    beta_B = coeff(1);
-    gamma_B = coeff(2);
-    fprintf('\n[fit] l_mean(B) = %.4f*B + %.4f*B^2\n', beta_B, gamma_B);
+lambda_l_mean = NaN(size(LAMBDA_SWEEP));
+lambda_q_mean = NaN(size(LAMBDA_SWEEP));
+lambda_q_max = NaN(size(LAMBDA_SWEEP));
+lambda_service_rate = NaN(size(LAMBDA_SWEEP));
+lambda_logs = cell(numel(LAMBDA_SWEEP), 1);
+B0_probe = 96;
+
+fprintf('\n=== Load sweep at fixed B=%d ===\n', B0_probe);
+for li = 1:numel(LAMBDA_SWEEP)
+    lam = LAMBDA_SWEEP(li);
+    fprintf('[lambda sweep] B=%d lambda=%d\n', B0_probe, lam);
+    lambda_logs{li} = run_operating_block(SERVER, B0_probe, lam, TICKS_PER_POINT, SETTLE_TICKS, ...
+        DT, SPREAD_BINS, PROMPT_REPEAT, MAX_TOKENS, sprintf('char_lambda_%03d', lam));
+    summary = summarise_block(lambda_logs{li}, SETTLE_TICKS);
+    lambda_l_mean(li) = summary.l_mean_ms;
+    lambda_q_mean(li) = summary.q_mean_tick;
+    lambda_q_max(li) = summary.q_max_tick;
+    lambda_service_rate(li) = summary.service_rate_tick;
+    fprintf('[lambda=%d] q_mean=%.2f q_max=%.2f l_mean=%.1f service_rate=%.2f\n', ...
+        lam, lambda_q_mean(li), lambda_q_max(li), lambda_l_mean(li), lambda_service_rate(li));
 end
 
-B0 = 16;
-lambda_mean = 12;
-q0 = 5;
-q_max = 200;
-L_target = interp1(B_SWEEP(valid), l_mean(valid), B0, 'linear', 'extrap');
-beta_q = DT * 1000 / max(B0, 1);
+q_fit = polyfit(B_SWEEP(:), qmean_mean(:), 1);
+beta_q = max(-q_fit(1), 0.5);
+fprintf('\n[fit] q_mean(B) = %.4f * B + %.4f\n', q_fit(1), q_fit(2));
+fprintf('[fit] beta_q=%.4f queue_units_per_batch\n', beta_q);
+
+lambda_fit = polyfit(lambda_q_mean(:), lambda_l_mean(:), 1);
+beta_l = max(lambda_fit(1), 1.0);
+fprintf('[fit] l_mean(q_mean) = %.4f * q + %.4f\n', lambda_fit(1), lambda_fit(2));
+fprintf('[fit] beta_l=%.4f latency_ms_per_queue_unit\n', beta_l);
+
+B0 = B0_probe;
+target_idx = pick_operating_index(lambda_q_mean, Q_TARGET_NOMINAL);
+lambda_mean = LAMBDA_SWEEP(target_idx);
+q0 = max(lambda_q_mean(target_idx), Q_REF_MIN);
+L0 = lambda_l_mean(target_idx);
+L_target = L0;
 
 fprintf('\n[operating point]\n');
-fprintf('B0=%d lambda_mean=%.1f q0=%.1f beta_q=%.2f L_target=%.1f\n', ...
-    B0, lambda_mean, q0, beta_q, L_target);
+fprintf('B0=%d lambda_mean=%.1f q0=%.2f L0=%.1f beta_q=%.2f beta_l=%.2f\n', ...
+    B0, lambda_mean, q0, L0, beta_q, beta_l);
 
 save(fullfile(fileparts(mfilename('fullpath')), 'identified_params.mat'), ...
-    'SERVER', 'DT', 'B_SWEEP', 'N_REPS', 'PROMPT_REPEAT', 'MAX_TOKENS', ...
-    'l_mean', 'ttft_mean', 'qwait_mean', 'vllm_waiting', 'vllm_running', ...
-    'beta_B', 'gamma_B', 'B0', 'lambda_mean', 'q0', 'q_max', 'L_target', 'beta_q', ...
-    'rep_logs');
+    'SERVER', 'DT', 'B_SWEEP', 'LAMBDA_SWEEP', 'PROMPT_REPEAT', 'MAX_TOKENS', ...
+    'TICKS_PER_POINT', 'SETTLE_TICKS', 'SPREAD_BINS', ...
+    'l_mean', 'ttft_mean', 'qwait_mean', 'qmean_mean', 'qmax_mean', 'service_rate_mean', ...
+    'lambda_l_mean', 'lambda_q_mean', 'lambda_q_max', 'lambda_service_rate', ...
+    'rep_logs', 'lambda_logs', ...
+    'beta_q', 'beta_l', 'B0', 'lambda_mean', 'q0', 'Q_REF_MIN', 'Q_REF_MAX', 'Q_MAX', 'L0', 'L_target');
 fprintf('[save] identified_params.mat\n');
 
-fig = figure('Visible', 'off', 'Position', [50 50 1100 420]);
+fig = figure('Visible', 'off', 'Position', [50 50 1180 460]);
 subplot(1, 2, 1);
-plot(B_SWEEP, l_mean, 'bo-', 'LineWidth', 1.5);
-hold on;
-plot(B_SWEEP, ttft_mean, 'rs-', 'LineWidth', 1.5);
-plot(B_SWEEP, qwait_mean, 'kd-', 'LineWidth', 1.5);
+yyaxis left;
+plot(B_SWEEP, qmean_mean, 'ko-', 'LineWidth', 1.5); hold on;
+plot(B_SWEEP, qmax_mean, 'g^-', 'LineWidth', 1.2);
+ylabel('Queue');
+yyaxis right;
+plot(B_SWEEP, l_mean, 'bo-', 'LineWidth', 1.5); hold on;
+plot(B_SWEEP, ttft_mean, 'rs-', 'LineWidth', 1.2);
 grid on;
 xlabel('B');
 ylabel('Latency [ms]');
-legend('l_{mean}', 'TTFT', 'queue wait', 'Location', 'northwest');
-title('Chapter 8 characterization sweep');
+legend('q_{mean,tick}', 'q_{max,tick}', 'l_{mean}', 'TTFT', 'Location', 'northwest');
+title('Characterisation at fixed \lambda');
 
 subplot(1, 2, 2);
-plot(B_SWEEP, vllm_waiting, 'm^-', 'LineWidth', 1.5);
-hold on;
-plot(B_SWEEP, vllm_running, 'cv-', 'LineWidth', 1.5);
+yyaxis left;
+plot(LAMBDA_SWEEP, lambda_q_mean, 'm^-', 'LineWidth', 1.5); hold on;
+plot(LAMBDA_SWEEP, lambda_q_max, 'k--', 'LineWidth', 1.2);
+ylabel('Queue');
+yyaxis right;
+plot(LAMBDA_SWEEP, lambda_l_mean, 'cv-', 'LineWidth', 1.5);
 grid on;
-xlabel('B');
-ylabel('Native vLLM counts');
-legend('num\_requests\_waiting', 'num\_requests\_running', 'Location', 'northwest');
-title('Native vLLM metrics during sweep');
+xlabel('\lambda [req/s]');
+ylabel('Latency [ms]');
+legend('q_{mean,tick}', 'q_{max,tick}', 'l_{mean}', 'Location', 'northwest');
+title('Load calibration at fixed B');
 
 saveas(fig, fullfile(fileparts(mfilename('fullpath')), 'ch8_characterise.png'));
 fprintf('[save] ch8_characterise.png\n');
@@ -143,32 +146,107 @@ fprintf('[save] ch8_characterise.png\n');
 diary off;
 
 
-function enqueue_prompt(server, prompt, prompt_repeat, max_tokens, source_tag)
+function logs = run_operating_block(server, B_cmd, lambda_cmd, n_ticks, settle_ticks, dt, spread_bins, prompt_repeat, max_tokens, source_prefix)
+srv_post(server, '/reset', struct('source', source_prefix));
+pause(1.0);
+srv_post(server, '/control', struct('B', B_cmd, 'source', source_prefix, 'note', 'block start'));
+pause(0.5);
+
+logs = cell(n_ticks, 1);
+prompt_idx = 1;
+for k = 1:n_ticks
+    fprintf('\n[block %s] tick=%d/%d B=%d lambda=%.2f\n', source_prefix, k, n_ticks, B_cmd, lambda_cmd);
+    inject_spread_arrivals(server, lambda_cmd, dt, spread_bins, prompt_library(prompt_idx), prompt_repeat, max_tokens, ...
+        sprintf('%s_tick_%02d', source_prefix, k));
+    prompt_idx = prompt_idx + 1;
+    m = srv_get(server, '/metrics');
+    logs{k} = m;
+    fprintf('[metrics] q_mean=%.2f q_max=%.2f arrivals=%d comps=%d l_mean=%.1f ttft=%.1f q_wait=%.1f B=%d\n', ...
+        metric_or_nan(m, 'q_mean_tick'), metric_or_nan(m, 'q_max_tick'), metric_or_nan(m, 'arrivals_tick'), ...
+        metric_or_nan(m, 'completions_tick'), metric_or_nan(m, 'l_mean_ms'), metric_or_nan(m, 'ttft_mean_ms'), ...
+        metric_or_nan(m, 'queue_wait_mean_ms'), metric_or_nan(m, 'B_current'));
+    if k == settle_ticks
+        fprintf('[block %s] settle window completed\n', source_prefix);
+    end
+end
+wait_for_quiet_tick(server, 20.0);
+end
+
+function summary = summarise_block(logs, settle_ticks)
+start_idx = min(numel(logs), settle_ticks + 1);
+use = logs(start_idx:end);
+summary = struct();
+summary.q_mean_tick = average_metric(use, 'q_mean_tick');
+summary.q_max_tick = average_metric(use, 'q_max_tick');
+summary.service_rate_tick = average_metric(use, 'service_rate_tick');
+summary.l_mean_ms = average_metric(use, 'l_mean_ms');
+summary.ttft_mean_ms = average_metric(use, 'ttft_mean_ms');
+summary.qwait_mean_ms = average_metric(use, 'queue_wait_mean_ms');
+end
+
+function idx = pick_operating_index(q_values, q_target)
+[~, idx] = min(abs(q_values - q_target));
+end
+
+function value = average_metric(logs, field_name)
+vals = NaN(numel(logs), 1);
+for i = 1:numel(logs)
+    vals(i) = metric_or_nan(logs{i}, field_name);
+end
+value = mean(vals, 'omitnan');
+end
+
+function inject_spread_arrivals(server, lambda_cmd, dt, spread_bins, prompt, prompt_repeat, max_tokens, source_tag)
+arrivals = poissrnd(lambda_cmd * dt);
+fprintf('[arrivals] lambda=%.2f dt=%.2f sampled=%d bins=%d\n', lambda_cmd, dt, arrivals, spread_bins);
+if arrivals <= 0
+    pause(dt);
+    return;
+end
+
+sub_times = sort(rand(arrivals, 1) * max(dt - 0.05, 0.05));
+edges = linspace(0, dt, spread_bins + 1);
+counts = histcounts(sub_times, edges);
+clock0 = tic;
+for bi = 1:spread_bins
+    target_t = edges(bi);
+    elapsed = toc(clock0);
+    if target_t > elapsed
+        pause(target_t - elapsed);
+    end
+    if counts(bi) > 0
+        enqueue_burst(server, prompt, counts(bi), prompt_repeat, max_tokens, sprintf('%s_bin_%02d', source_tag, bi));
+    end
+end
+elapsed = toc(clock0);
+if elapsed < dt
+    pause(dt - elapsed);
+end
+end
+
+function enqueue_burst(server, prompt, count, prompt_repeat, max_tokens, source_tag)
 payload = struct( ...
     'prompt', prompt, ...
+    'count', count, ...
     'prompt_repeat', prompt_repeat, ...
     'max_tokens', max_tokens, ...
     'temperature', 0.0, ...
     'source', source_tag, ...
     'client_ts', char(datetime('now', 'TimeZone', 'local', 'Format', 'yyyy-MM-dd''T''HH:mm:ss.SSSZZZZZ')));
-srv_post(server, '/enqueue', payload);
+srv_post(server, '/enqueue_batch', payload);
 end
 
-function wait_for_delta_completions(server, delta_needed, timeout_s)
+function wait_for_quiet_tick(server, timeout_s)
 t0 = tic;
-start_metrics = srv_get(server, '/metrics');
-start_completed = start_metrics.completed;
 while toc(t0) < timeout_s
-    pause(1.0);
     m = srv_get(server, '/metrics');
-    if (m.completed - start_completed) >= delta_needed
-        fprintf('[wait] completed delta reached: %d/%d\n', m.completed - start_completed, delta_needed);
+    if metric_or_nan(m, 'q_sw') <= 0.5 && metric_or_nan(m, 'vllm_num_requests_running') <= 0.5
+        fprintf('[quiet] wrapper and vLLM are idle\n');
         return;
     end
-    fprintf('[wait] completed delta=%d/%d q=%d B=%d lambda_10s=%.2f\n', ...
-        m.completed - start_completed, delta_needed, m.q_sw, m.B_current, m.lambda_10s_est);
+    pause(1.0);
 end
-error('Timed out waiting for completions');
+fprintf('[quiet] timeout waiting for idle; continuing\n');
 end
 
 function out = srv_get(server, path)

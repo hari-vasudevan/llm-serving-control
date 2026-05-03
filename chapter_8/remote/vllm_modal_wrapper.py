@@ -48,6 +48,7 @@ TRACE_PREFIX = "CH8"
 LOCK = threading.Lock()
 FIFO = collections.deque()
 RECENT_EVENTS = collections.deque(maxlen=500)
+RECENT_TICKS = collections.deque(maxlen=120)
 L_MEAN_BUF = collections.deque(maxlen=300)
 TTFT_BUF = collections.deque(maxlen=300)
 QWAIT_BUF = collections.deque(maxlen=300)
@@ -71,6 +72,20 @@ HEALTH_URL = "http://127.0.0.1:8001/health"
 API_KEY = ""
 LAST_CONTROL_SOURCE = "startup"
 LAST_CONTROL_TS = ""
+QUEUE_AREA = 0.0
+QUEUE_LAST_TS = time.perf_counter()
+TICK_ARRIVALS = 0
+TICK_COMPLETIONS = 0
+TICK_Q_MAX = 0
+LAST_TICK_SUMMARY = {
+    "tick": 0,
+    "q_mean_tick": 0.0,
+    "q_max_tick": 0,
+    "arrivals_tick": 0,
+    "completions_tick": 0,
+    "service_rate_tick": 0.0,
+    "lambda_tick": 0.0,
+}
 
 
 def log(message):
@@ -125,11 +140,60 @@ def recent_arrival_rate():
     return round(len(recent) / 10.0, 2)
 
 
+def update_queue_area_locked(now=None):
+    global QUEUE_AREA, QUEUE_LAST_TS
+    if now is None:
+        now = time.perf_counter()
+    dt = now - QUEUE_LAST_TS
+    if dt > 0:
+        QUEUE_AREA += len(FIFO) * dt
+        QUEUE_LAST_TS = now
+    return now
+
+
 def new_request_id():
     global REQ_COUNTER
     with LOCK:
         REQ_COUNTER += 1
         return f"r{REQ_COUNTER:06d}"
+
+
+def build_queue_item(prompt, prompt_repeat, max_tokens, temperature, source, client_ts):
+    expanded_prompt = prompt if prompt_repeat <= 1 else (prompt + " ") * prompt_repeat
+    request_id = new_request_id()
+    return QueueItem(
+        request_id=request_id,
+        prompt=expanded_prompt,
+        prompt_chars=len(expanded_prompt),
+        prompt_repeat=prompt_repeat,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        source=source,
+        client_ts=client_ts,
+        enqueued_wall=datetime.now().isoformat(),
+        enqueued_perf=time.perf_counter(),
+    )
+
+
+def enqueue_item(item):
+    global TICK_ARRIVALS, TICK_Q_MAX
+    with LOCK:
+        now = update_queue_area_locked()
+        FIFO.append(item)
+        ARRIVAL_TS.append(item.enqueued_perf)
+        TICK_ARRIVALS += 1
+        q_now = len(FIFO)
+        TICK_Q_MAX = max(TICK_Q_MAX, q_now)
+        RECENT_EVENTS.append(
+            {
+                "request_id": item.request_id,
+                "event": "enqueue",
+                "q_sw": q_now,
+                "source": item.source,
+                "prompt_chars": item.prompt_chars,
+            }
+        )
+    return q_now
 
 
 def safe_mean(values):
@@ -155,10 +219,12 @@ def build_metrics():
         tick = TICK
         last_control_source = LAST_CONTROL_SOURCE
         last_control_ts = LAST_CONTROL_TS
+        last_tick = dict(LAST_TICK_SUMMARY)
         latencies = list(L_MEAN_BUF)
         ttfts = list(TTFT_BUF)
         qwaits = list(QWAIT_BUF)
         recent_events = list(RECENT_EVENTS)[-10:]
+        recent_ticks = list(RECENT_TICKS)[-5:]
 
     metrics = {
         "status": "ok",
@@ -180,6 +246,12 @@ def build_metrics():
         "ttft_p95_ms": safe_p95(ttfts),
         "queue_wait_mean_ms": safe_mean(qwaits),
         "queue_wait_p95_ms": safe_p95(qwaits),
+        "q_mean_tick": last_tick["q_mean_tick"],
+        "q_max_tick": last_tick["q_max_tick"],
+        "arrivals_tick": last_tick["arrivals_tick"],
+        "completions_tick": last_tick["completions_tick"],
+        "service_rate_tick": last_tick["service_rate_tick"],
+        "lambda_tick": last_tick["lambda_tick"],
         "vllm_num_requests_waiting": backend.get("vllm:num_requests_waiting"),
         "vllm_num_requests_running": backend.get("vllm:num_requests_running"),
         "vllm_ttft_mean_ms": hist_mean_ms(backend, "vllm:time_to_first_token_seconds"),
@@ -188,6 +260,7 @@ def build_metrics():
         "last_control_source": last_control_source,
         "last_control_ts": last_control_ts,
         "recent_events": recent_events,
+        "recent_ticks": recent_ticks,
         "timestamp": datetime.now().isoformat(),
     }
     return metrics
@@ -198,8 +271,14 @@ def prom_metrics_text():
     lines = []
     gauges = {
         "ch8_q_sw": m["q_sw"],
+        "ch8_q_mean_tick": m["q_mean_tick"],
+        "ch8_q_max_tick": m["q_max_tick"],
         "ch8_B_current": m["B_current"],
         "ch8_lambda_10s_est": m["lambda_10s_est"],
+        "ch8_lambda_tick": m["lambda_tick"],
+        "ch8_arrivals_tick": m["arrivals_tick"],
+        "ch8_completions_tick": m["completions_tick"],
+        "ch8_service_rate_tick": m["service_rate_tick"],
         "ch8_l_mean_ms": m["l_mean_ms"] or 0,
         "ch8_ttft_mean_ms": m["ttft_mean_ms"] or 0,
         "ch8_queue_wait_mean_ms": m["queue_wait_mean_ms"] or 0,
@@ -213,7 +292,7 @@ def prom_metrics_text():
 
 
 def dispatch_one(item, batch_index, result_lock, results):
-    global COMPLETED, ERRORS
+    global COMPLETED, ERRORS, TICK_COMPLETIONS
 
     body = {
         "model": MODEL,
@@ -249,6 +328,7 @@ def dispatch_one(item, batch_index, result_lock, results):
                         L_MEAN_BUF.append(l_total_ms)
                         QWAIT_BUF.append(q_wait_ms)
                         COMPLETED += 1
+                        TICK_COMPLETIONS += 1
                         RECENT_EVENTS.append(
                             {
                                 "request_id": item.request_id,
@@ -288,21 +368,32 @@ def dispatch_one(item, batch_index, result_lock, results):
 
 
 def dispatcher():
-    global TICK, DISPATCHED
+    global TICK, DISPATCHED, TICK_ARRIVALS, TICK_COMPLETIONS, TICK_Q_MAX, LAST_TICK_SUMMARY
     log(
         "dispatcher start backend=%s model=%s dt=%.2fs B=[%d,%d]"
         % (BACKEND_URL, MODEL, DT, B_MIN, B_MAX)
     )
+    tick_index = 0
+    tick_start = time.perf_counter()
+    with LOCK:
+        update_queue_area_locked(tick_start)
+        area_start = QUEUE_AREA
+        TICK_ARRIVALS = 0
+        TICK_COMPLETIONS = 0
+        TICK_Q_MAX = len(FIFO)
     while True:
         t0 = time.perf_counter()
+        tick_index += 1
         with LOCK:
+            update_queue_area_locked(t0)
             b_now = B
             batch = []
             while FIFO and len(batch) < b_now:
                 batch.append(FIFO.popleft())
+            update_queue_area_locked()
             q_after_pop = len(FIFO)
-            TICK += 1
-            tick_now = TICK
+            TICK = tick_index
+            tick_now = tick_index
             DISPATCHED += len(batch)
 
         if batch:
@@ -357,6 +448,40 @@ def dispatcher():
         elapsed = time.perf_counter() - t0
         if elapsed < DT:
             time.sleep(DT - elapsed)
+        tick_end = time.perf_counter()
+        with LOCK:
+            update_queue_area_locked(tick_end)
+            tick_area = QUEUE_AREA - area_start
+            tick_elapsed = max(tick_end - tick_start, 1e-6)
+            q_mean_tick = tick_area / tick_elapsed
+            tick_summary = {
+                "tick": tick_now,
+                "q_mean_tick": round(q_mean_tick, 2),
+                "q_max_tick": int(TICK_Q_MAX),
+                "arrivals_tick": int(TICK_ARRIVALS),
+                "completions_tick": int(TICK_COMPLETIONS),
+                "service_rate_tick": round(TICK_COMPLETIONS / tick_elapsed, 2),
+                "lambda_tick": round(TICK_ARRIVALS / tick_elapsed, 2),
+            }
+            LAST_TICK_SUMMARY = tick_summary
+            RECENT_TICKS.append(tick_summary)
+            area_start = QUEUE_AREA
+            tick_start = tick_end
+            TICK_ARRIVALS = 0
+            TICK_COMPLETIONS = 0
+            TICK_Q_MAX = len(FIFO)
+        if batch or tick_summary["arrivals_tick"] > 0 or tick_summary["q_max_tick"] > 0:
+            log(
+                "tick=%d plant q_mean=%.2f q_max=%d arrivals=%d completions=%d service_rate=%.2f"
+                % (
+                    tick_now,
+                    tick_summary["q_mean_tick"],
+                    tick_summary["q_max_tick"],
+                    tick_summary["arrivals_tick"],
+                    tick_summary["completions_tick"],
+                    tick_summary["service_rate_tick"],
+                )
+            )
 
 
 def headers():
@@ -431,34 +556,17 @@ class Handler(BaseHTTPRequestHandler):
             temperature = float(body.get("temperature", 0.0))
             source = body.get("source", "matlab")
             client_ts = body.get("client_ts", "")
-
-            expanded_prompt = prompt if prompt_repeat <= 1 else (prompt + " ") * prompt_repeat
-            request_id = new_request_id()
-            item = QueueItem(
-                request_id=request_id,
-                prompt=expanded_prompt,
-                prompt_chars=len(expanded_prompt),
+            item = build_queue_item(
+                prompt=prompt,
                 prompt_repeat=prompt_repeat,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 source=source,
                 client_ts=client_ts,
-                enqueued_wall=datetime.now().isoformat(),
-                enqueued_perf=time.perf_counter(),
             )
-            with LOCK:
-                FIFO.append(item)
-                ARRIVAL_TS.append(item.enqueued_perf)
-                q_now = len(FIFO)
-                RECENT_EVENTS.append(
-                    {
-                        "request_id": request_id,
-                        "event": "enqueue",
-                        "q_sw": q_now,
-                        "source": source,
-                        "prompt_chars": item.prompt_chars,
-                    }
-                )
+            q_now = enqueue_item(item)
+            request_id = item.request_id
+            enqueued_wall = item.enqueued_wall
             log(
                 "recv enqueue request_id=%s client=%s q=%d prompt_chars=%d repeat=%d max_tokens=%d client_ts=%s prompt='%s'"
                 % (
@@ -478,7 +586,56 @@ class Handler(BaseHTTPRequestHandler):
                     "status": "queued",
                     "request_id": request_id,
                     "q_sw": q_now,
-                    "timestamp": item.enqueued_wall,
+                    "timestamp": enqueued_wall,
+                },
+            )
+            return
+
+        if parsed.path == "/enqueue_batch":
+            prompt = body.get("prompt", "")
+            count = int(body.get("count", 1))
+            prompt_repeat = int(body.get("prompt_repeat", PROMPT_REPEAT_DEFAULT))
+            max_tokens = int(body.get("max_tokens", MAX_TOKENS_DEFAULT))
+            temperature = float(body.get("temperature", 0.0))
+            source = body.get("source", "matlab_batch")
+            client_ts = body.get("client_ts", "")
+            count = max(1, min(count, 1000))
+
+            request_ids = []
+            for _ in range(count):
+                item = build_queue_item(
+                    prompt=prompt,
+                    prompt_repeat=prompt_repeat,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    source=source,
+                    client_ts=client_ts,
+                )
+                q_now = enqueue_item(item)
+                request_ids.append(item.request_id)
+
+            log(
+                "recv enqueue_batch client=%s count=%d q=%d prompt_chars=%d repeat=%d max_tokens=%d source=%s prompt='%s'"
+                % (
+                    self.client_address[0],
+                    count,
+                    q_now,
+                    len(prompt) * max(prompt_repeat, 1),
+                    prompt_repeat,
+                    max_tokens,
+                    source,
+                    short_prompt(prompt),
+                )
+            )
+            self._send_json(
+                200,
+                {
+                    "status": "queued_batch",
+                    "count": count,
+                    "first_request_id": request_ids[0],
+                    "last_request_id": request_ids[-1],
+                    "q_sw": q_now,
+                    "timestamp": datetime.now().isoformat(),
                 },
             )
             return
@@ -509,14 +666,37 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/reset":
+            global DISPATCHED, COMPLETED, ERRORS, TICK
+            global QUEUE_AREA, QUEUE_LAST_TS, TICK_ARRIVALS, TICK_COMPLETIONS, TICK_Q_MAX, LAST_TICK_SUMMARY
             with LOCK:
+                update_queue_area_locked()
                 FIFO.clear()
+                update_queue_area_locked()
                 L_MEAN_BUF.clear()
                 TTFT_BUF.clear()
                 QWAIT_BUF.clear()
                 ARRIVAL_TS.clear()
                 RECENT_EVENTS.clear()
-            log(f"recv reset client={self.client_address[0]} queue and buffers cleared")
+                RECENT_TICKS.clear()
+                DISPATCHED = 0
+                COMPLETED = 0
+                ERRORS = 0
+                TICK = 0
+                QUEUE_AREA = 0.0
+                QUEUE_LAST_TS = time.perf_counter()
+                TICK_ARRIVALS = 0
+                TICK_COMPLETIONS = 0
+                TICK_Q_MAX = 0
+                LAST_TICK_SUMMARY = {
+                    "tick": 0,
+                    "q_mean_tick": 0.0,
+                    "q_max_tick": 0,
+                    "arrivals_tick": 0,
+                    "completions_tick": 0,
+                    "service_rate_tick": 0.0,
+                    "lambda_tick": 0.0,
+                }
+            log(f"recv reset client={self.client_address[0]} queue, buffers, and counters cleared")
             self._send_json(200, {"status": "ok"})
             return
 

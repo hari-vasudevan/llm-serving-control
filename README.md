@@ -14,6 +14,8 @@ A blog series applying classical control theory to LLM inference serving systems
 | [Chapter 4](chapter_4/) | Real Ollama on M-Mac (qwen2.5:3b) | Single-loop integral on TTFT | Success — B directly controls TTFT via GPU concurrency; identified TTFT(B) curve, single integral controller regulates latency |
 | [Chapter 5](chapter_5/) | vLLM on Apple Silicon (Qwen3-0.6B) | Cascade attempt | vLLM-metal's `num_requests_waiting` gauge is broken (accumulates monotonically); software FIFO queue fails because queue_wait is near-zero; motivates real queue server |
 | [Chapter 6](chapter_6/) | Intel Mac queue server (qwen2.5:0.5b) | Single-loop integral on TTFT | Real FIFO queue server — requests genuinely wait; key lesson: l_total = queue_wait + TTFT, must use TTFT-only signal for stable control; CPU machine cannot support cascade |
+| [Chapter 7](chapter_7/) | Modal + native vLLM on NVIDIA GPU | Remote single-loop / characterization | Remote GPU serving path works, but serverless/runtime effects hide a clean native queue signal; motivates a wrapper-based attempt |
+| [Chapter 8](chapter_8/) | Modal wrapper queue + vLLM on NVIDIA GPU | MATLAB cascade attempt | End-to-end remote cascade plumbing works, but top-level LLM latency does not expose a trustworthy Chapter 2 outer plant; pivot to lower-level GPU batching for Chapter 9 |
 
 ---
 
@@ -33,6 +35,11 @@ Chapter 5: vLLM on Apple Silicon
 Chapter 6: Real queue server (Intel Mac)
     MATLAB controller ──► queue_server.py HTTP ──► Ollama ──► CPU
     (controller on M-Mac, server on Intel Mac at 192.168.68.106:8002)
+
+Chapter 7–8: Remote GPU serving on Modal
+    MATLAB controller ──► Modal wrapper / vLLM ──► NVIDIA GPU
+    Chapter 7: native remote serving characterization
+    Chapter 8: wrapper queue + MATLAB cascade attempt
 ```
 
 ---
@@ -49,15 +56,29 @@ Chapter 6: Real queue server (Intel Mac)
 
 **Ch6:** With a real queue server, `l_total = queue_wait + TTFT`. Using `l_total` as the control signal inverts the control sign at high queue depth (reducing B increases queue_wait faster than it reduces TTFT — positive feedback). Must use TTFT-only (`ttft_recent_mean`) as the control signal. The cascade is still not valid on Intel CPU because the CPU time-slices requests rather than batching them — service rate barely changes with B, so there's no independent queue-rate handle.
 
+**Ch7:** A real remote NVIDIA/vLLM path is operational from the controller side, but a serverless-style deployment still does not expose the clean queue signal needed for a true Chapter 2 cascade story.
+
+**Ch8:** Even with a wrapper FIFO and explicit per-tick batch dispatch on a real GPU, the top-level LLM latency signal is still too aggregated. The critical identification result was an unphysical outer fit:
+
+`l_mean(q_mean) = -4.9228 q + 648.7647`
+
+That negative slope is a warning that top-level request latency is not exposing a clean queueing plant. The correct pivot is to move down to a lower-level GPU batching experiment where batch size is a direct actuator and service time is measured per batch.
+
 ---
 
-## Next: Chapter 7
+## Next: Chapter 9
 
-GPU rental (Lambda Labs A10 / RunPod) running vLLM on Linux/NVIDIA where:
-- `num_requests_waiting` is a real gauge
-- GPU genuinely batches requests (service rate scales with B)
-- Both loops of the cascade have real, independent signals
-- Full cascade controller with end-to-end latency measurement from the client side
+Chapter 9 should pivot away from top-level HTTP LLM latency and toward a
+lower-level GPU batching experiment:
+
+- fixed model, prompt length, and output length,
+- software queue outside the model runtime,
+- exact batch-size control `B[k]`,
+- direct measurement of batch service time,
+- explicit queue evolution and completion latency.
+
+That setup should match the Chapter 1/2 equations much more faithfully than a
+whole-serving-stack latency experiment.
 
 ---
 
@@ -90,5 +111,14 @@ chapter_5/          vLLM Apple Silicon: cascade attempt (abandoned)
 chapter_6/          Intel Mac queue server: single-loop on TTFT
   server/           queue_server.py + setup.sh (runs on Intel Mac)
   matlab/           characterise.m, design_controller.m, run_controller.m
+  README.md
+
+chapter_7/          Modal native vLLM remote experiment
+  README.md
+
+chapter_8/          Modal wrapper queue + MATLAB cascade attempt
+  modal_vllm_wrapper.py
+  remote/
+  matlab/
   README.md
 ```
