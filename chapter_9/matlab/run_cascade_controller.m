@@ -1,4 +1,7 @@
-%% run_cascade_controller.m -- Chapter 9 closed-loop cascade experiment
+%% run_cascade_controller.m -- Chapter 9 Modal-side closed-loop cascade
+%
+% MATLAB designs/uploads the controller. Modal owns the closed-loop clock,
+% arrival generator, scheduler, metrics snapshot, and GPU dispatch.
 
 clear; clc;
 addpath(fileparts(mfilename('fullpath')));
@@ -10,92 +13,49 @@ diary(TRACE_FILE); diary on;
 
 DT = perturbed.dt;
 SEGMENTS = struct( ...
-    'ticks', {35, 25, 25, 25, 35}, ...
-    'lambda', {perturbed.lambda_mean, min(perturbed.B_max, perturbed.lambda_mean * 1.10), max(perturbed.lambda_mean * 0.82, 1), min(3200, perturbed.lambda_mean * 1.22), perturbed.lambda_mean}, ...
-    'label', {'steady', 'spike_1', 'recover', 'spike_2', 'steady_restore'});
-N = sum([SEGMENTS.ticks]);
+    'label', {'steady', 'spike_1', 'recover', 'spike_2', 'steady_restore'}, ...
+    'ticks', {10, 6, 6, 6, 10}, ...
+    'lambda', {perturbed.lambda_mean, ...
+               min(perturbed.B_max, perturbed.lambda_mean * 1.10), ...
+               max(perturbed.lambda_mean * 0.82, 1), ...
+               min(3200, perturbed.lambda_mean * 1.22), ...
+               perturbed.lambda_mean});
 
 fprintf('=== Chapter 9 Closed-loop Cascade ===\n');
-fprintf('Inner loop: B->q. Outer loop: q_ref->L_mean. Target L_mean=%.2f ms\n', controller.outer_c.L_mean_target);
+fprintf('Modal-side clock. Inner loop: B->q. Outer loop: q_ref->L_mean.\n');
+fprintf('Target L_mean=%.2f ms, B0=%d, Bmax=%d, lambda0=%.2f\n', ...
+    controller.outer_c.L_mean_target, controller.inner_c.B0, controller.inner_c.B_max, perturbed.lambda_mean);
+for i = 1:numel(SEGMENTS)
+    fprintf('segment %d: label=%s ticks=%d lambda=%.2f\n', ...
+        i, SEGMENTS(i).label, SEGMENTS(i).ticks, SEGMENTS(i).lambda);
+end
 
 upload_controller_if_available(SERVER);
-srv_post(SERVER, '/reset', struct());
-srv_post(SERVER, '/control', struct('B', round(controller.inner_c.B0)));
+payload = struct( ...
+    'dt', DT, ...
+    'seed', 9, ...
+    'segments', SEGMENTS, ...
+    'source', 'matlab_run_cascade_controller');
+result = srv_post(SERVER, '/run_closed_loop', payload);
+assert(strcmp(result.status, 'ok'), 'run_closed_loop failed');
 
-xi_q = 0;
-xi_l = 0;
-q_ref = controller.outer_c.q0;
+remote_log = result.run_log;
+log_tick = extract_field(remote_log, 'tick');
+log_lambda = extract_field(remote_log, 'lambda');
+log_B = extract_field(remote_log, 'B');
+log_q = extract_field(remote_log, 'q');
+log_q_ref = extract_field(remote_log, 'q_ref');
+log_L = extract_field(remote_log, 'L_mean');
+log_L_p95 = extract_field(remote_log, 'L_p95');
+log_service = extract_field(remote_log, 'service_ms');
+log_arrivals = extract_field(remote_log, 'arrivals');
+log_completions = extract_field(remote_log, 'completions');
+log_label = extract_labels(remote_log);
 
-log_tick = zeros(N,1);
-log_lambda = zeros(N,1);
-log_B = zeros(N,1);
-log_q = zeros(N,1);
-log_q_ref = zeros(N,1);
-log_L = zeros(N,1);
-log_L_p95 = zeros(N,1);
-log_service = zeros(N,1);
-log_arrivals = zeros(N,1);
-log_completions = zeros(N,1);
-log_label = strings(N,1);
-
-tick = 0;
-for si = 1:numel(SEGMENTS)
-    seg = SEGMENTS(si);
-    for sk = 1:seg.ticks
-        tick = tick + 1;
-        t0 = tic;
-
-        m = srv_get(SERVER, '/metrics');
-        q = metric_or_default(m, 'q_mean_tick', controller.outer_c.q0);
-        L_mean = metric_or_default(m, 'l_mean_ms', controller.outer_c.L_mean_target);
-        L_p95 = metric_or_default(m, 'l_p95_ms', controller.outer_c.L_p95_target);
-        service_ms = metric_or_default(m, 'service_mean_ms', NaN);
-        comps = metric_or_default(m, 'completions_tick', 0);
-
-        % Outer loop: q_ref -> L_mean
-        e_l = controller.outer_c.L_mean_target - L_mean;
-        xi_l_trial = clamp(xi_l + e_l, controller.outer_c.xi_min, controller.outer_c.xi_max);
-        q_ref_trial = clamp(controller.outer_c.q0 + controller.outer_c.K_i_l * xi_l_trial, ...
-            controller.outer_c.q_min, controller.outer_c.q_max);
-        if ~(q_ref_trial == controller.outer_c.q_min && e_l < 0) && ~(q_ref_trial == controller.outer_c.q_max && e_l > 0)
-            xi_l = xi_l_trial;
-            q_ref = q_ref_trial;
-        end
-
-        % Inner loop: B -> q
-        e_q = q_ref - q;
-        xi_q_trial = clamp(xi_q + e_q, controller.inner_c.xi_min, controller.inner_c.xi_max);
-        B_unsat = controller.inner_c.B0 + controller.inner_c.K_q * (q - q_ref) ...
-            - controller.inner_c.K_i_q * xi_q_trial;
-        B_cmd = round(clamp(B_unsat, controller.inner_c.B_min, controller.inner_c.B_max));
-        if ~(B_cmd == controller.inner_c.B_min && e_q > 0) && ~(B_cmd == controller.inner_c.B_max && e_q < 0)
-            xi_q = xi_q_trial;
-        end
-
-        srv_post(SERVER, '/control', struct('B', B_cmd));
-        arrivals = poissrnd(seg.lambda);
-        srv_post(SERVER, '/enqueue_batch', struct('count', arrivals, 'source', sprintf('run_tick_%03d', tick)));
-
-        fprintf('[tick=%03d] seg=%s lambda=%.2f arrivals=%d q=%.2f q_ref=%.2f B=%d L=%.2f Lp95=%.2f service=%.2f comps=%.2f\n', ...
-            tick, seg.label, seg.lambda, arrivals, q, q_ref, B_cmd, L_mean, L_p95, service_ms, comps);
-
-        log_tick(tick) = tick;
-        log_lambda(tick) = seg.lambda;
-        log_B(tick) = B_cmd;
-        log_q(tick) = q;
-        log_q_ref(tick) = q_ref;
-        log_L(tick) = L_mean;
-        log_L_p95(tick) = L_p95;
-        log_service(tick) = service_ms;
-        log_arrivals(tick) = arrivals;
-        log_completions(tick) = comps;
-        log_label(tick) = string(seg.label);
-
-        elapsed = toc(t0);
-        if elapsed < DT
-            pause(DT - elapsed);
-        end
-    end
+for i = 1:numel(log_tick)
+    fprintf('[tick=%03d] seg=%s lambda=%.2f arrivals=%.0f q=%.2f q_ref=%.2f B=%.0f L=%.2f Lp95=%.2f service=%.2f comps=%.2f\n', ...
+        log_tick(i), log_label(i), log_lambda(i), log_arrivals(i), log_q(i), log_q_ref(i), ...
+        log_B(i), log_L(i), log_L_p95(i), log_service(i), log_completions(i));
 end
 
 run_log = struct( ...
@@ -110,14 +70,14 @@ run_log = struct( ...
     'arrivals', log_arrivals, ...
     'completions', log_completions, ...
     'label', {cellstr(log_label)});
-save(fullfile(fileparts(mfilename('fullpath')), 'run_log.mat'), 'run_log', 'SEGMENTS');
+save(fullfile(fileparts(mfilename('fullpath')), 'run_log.mat'), 'run_log', 'SEGMENTS', 'result');
 fprintf('[save] run_log.mat\n');
 
 fig = figure('Visible', 'off', 'Position', [50 50 1200 760]);
 subplot(4,1,1);
 plot(log_tick, log_L, 'b-', 'LineWidth', 1.5); hold on;
 yline(controller.outer_c.L_mean_target, 'r--', 'LineWidth', 1.2);
-grid on; ylabel('L_{mean} [ms]'); title('Chapter 9 cascade: q_{ref}->L_{mean}, B->q');
+grid on; ylabel('L_{mean} [ms]'); title('Chapter 9 Modal-side cascade: q_{ref}->L_{mean}, B->q');
 
 subplot(4,1,2);
 plot(log_tick, log_q, 'k-', 'LineWidth', 1.5); hold on;
@@ -140,23 +100,22 @@ fprintf('[save] ch9_closed_loop.png\n');
 diary off;
 
 
-function value = metric_or_default(s, field_name, default_value)
-if isfield(s, field_name) && ~isempty(s.(field_name))
-    value = double(s.(field_name));
-else
-    value = default_value;
+function vals = extract_field(s, field_name)
+vals = NaN(numel(s), 1);
+for i = 1:numel(s)
+    if isfield(s(i), field_name) && ~isempty(s(i).(field_name))
+        vals(i) = double(s(i).(field_name));
+    end
 end
 end
 
-function y = clamp(x, lo, hi)
-y = min(max(x, lo), hi);
+function labels = extract_labels(s)
+labels = strings(numel(s), 1);
+for i = 1:numel(s)
+    if isfield(s(i), 'label') && ~isempty(s(i).label)
+        labels(i) = string(s(i).label);
+    end
 end
-
-function out = srv_get(server, path)
-cmd = sprintf('curl -sS "%s%s"', server, path);
-[status, raw] = system(cmd);
-assert(status == 0, 'GET failed: %s', raw);
-out = jsondecode(strtrim(raw));
 end
 
 function out = srv_post(server, path, payload)
@@ -166,6 +125,7 @@ cmd = sprintf('curl -sS -X POST "%s%s" -H "Content-Type: application/json" -d "%
     server, path, body_escaped);
 [status, raw] = system(cmd);
 assert(status == 0, 'POST failed: %s', raw);
+assert(strlength(strtrim(raw)) > 0, 'POST returned empty response for %s%s', server, path);
 out = jsondecode(strtrim(raw));
 end
 

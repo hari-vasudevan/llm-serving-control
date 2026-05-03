@@ -34,6 +34,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+import numpy as np
+
 from workloads import FixedMatmulWorkload, WorkloadConfig
 
 
@@ -53,6 +55,7 @@ class Plant:
         self.fifo: deque[RequestItem] = deque()
         self.B_current = initial_b
         self.running = True
+        self.worker_paused = False
         self.batch_id = 0
         self.enqueued = 0
         self.completed = 0
@@ -173,74 +176,97 @@ class Plant:
             next_tick = tick_start + self.tick_s
 
             with self.lock:
-                self.q_samples_tick.append(len(self.fifo))
-                b_now = self.B_current
-                batch = []
-                while self.fifo and len(batch) < b_now:
-                    batch.append(self.fifo.popleft())
-                q_after = len(self.fifo)
-                q_before = q_after + len(batch)
+                paused = self.worker_paused
 
-            if not batch:
+            if paused:
                 continue
 
-            dispatch_t = time.perf_counter()
-            self.workload.synchronize()
-            t0 = time.perf_counter()
-            self.workload.run(len(batch))
-            self.workload.synchronize()
-            finish_t = time.perf_counter()
-            service_ms = 1000.0 * (finish_t - t0)
-            throughput = 1000.0 * len(batch) / max(service_ms, 1e-9)
+            self._dispatch_once()
 
-            request_rows = []
-            qwaits = []
-            totals = []
-            for item in batch:
-                q_wait_ms = 1000.0 * (dispatch_t - item.enqueue_time)
-                total_ms = 1000.0 * (finish_t - item.enqueue_time)
-                qwaits.append(q_wait_ms)
-                totals.append(total_ms)
-                request_rows.append({
-                    "request_id": item.request_id,
-                    "batch_id": self.batch_id,
-                    "enqueue_time": item.enqueue_time,
-                    "dispatch_time": dispatch_t,
-                    "finish_time": finish_t,
-                    "queue_wait_ms": q_wait_ms,
-                    "service_time_ms": service_ms,
-                    "total_latency_ms": total_ms,
-                    "source": item.source,
-                })
+    def _dispatch_once(self) -> bool:
+        with self.lock:
+            self.q_samples_tick.append(len(self.fifo))
+            b_now = self.B_current
+            batch = []
+            while self.fifo and len(batch) < b_now:
+                batch.append(self.fifo.popleft())
+            q_after = len(self.fifo)
+            q_before = q_after + len(batch)
 
-            batch_row = {
+        if not batch:
+            return False
+
+        dispatch_t = time.perf_counter()
+        self.workload.synchronize()
+        t0 = time.perf_counter()
+        self.workload.run(len(batch))
+        self.workload.synchronize()
+        finish_t = time.perf_counter()
+        service_ms = 1000.0 * (finish_t - t0)
+        throughput = 1000.0 * len(batch) / max(service_ms, 1e-9)
+
+        request_rows = []
+        qwaits = []
+        totals = []
+        for item in batch:
+            q_wait_ms = 1000.0 * (dispatch_t - item.enqueue_time)
+            total_ms = 1000.0 * (finish_t - item.enqueue_time)
+            qwaits.append(q_wait_ms)
+            totals.append(total_ms)
+            request_rows.append({
+                "request_id": item.request_id,
                 "batch_id": self.batch_id,
-                "t_dispatch": dispatch_t,
-                "t_finish": finish_t,
-                "B_cmd": b_now,
-                "B_actual": len(batch),
-                "q_before": q_before,
-                "q_after": q_after,
+                "enqueue_time": item.enqueue_time,
+                "dispatch_time": dispatch_t,
+                "finish_time": finish_t,
+                "queue_wait_ms": q_wait_ms,
                 "service_time_ms": service_ms,
-                "throughput_jobs_s": throughput,
-            }
+                "total_latency_ms": total_ms,
+                "source": item.source,
+            })
 
-            with self.lock:
-                self.completed += len(batch)
-                self.completions_tick += len(batch)
-                self.service_ms_recent.append(service_ms)
-                self.qwait_recent.extend(qwaits)
-                self.l_total_recent.extend(totals)
-                self.service_ms_tick.append(service_ms)
-                self.qwait_tick.extend(qwaits)
-                self.l_total_tick.extend(totals)
-                self.last_batch = batch_row.copy()
-                self.batch_writer.writerow(batch_row)
-                self.batch_csv.flush()
-                for row in request_rows:
-                    self.request_writer.writerow(row)
-                self.request_csv.flush()
-                self.batch_id += 1
+        batch_row = {
+            "batch_id": self.batch_id,
+            "t_dispatch": dispatch_t,
+            "t_finish": finish_t,
+            "B_cmd": b_now,
+            "B_actual": len(batch),
+            "q_before": q_before,
+            "q_after": q_after,
+            "service_time_ms": service_ms,
+            "throughput_jobs_s": throughput,
+        }
+
+        with self.lock:
+            self.completed += len(batch)
+            self.completions_tick += len(batch)
+            self.service_ms_recent.append(service_ms)
+            self.qwait_recent.extend(qwaits)
+            self.l_total_recent.extend(totals)
+            self.service_ms_tick.append(service_ms)
+            self.qwait_tick.extend(qwaits)
+            self.l_total_tick.extend(totals)
+            self.last_batch = batch_row.copy()
+            self.batch_writer.writerow(batch_row)
+            self.batch_csv.flush()
+            for row in request_rows:
+                self.request_writer.writerow(row)
+            self.request_csv.flush()
+            self.batch_id += 1
+        return True
+
+    def _set_worker_paused(self, value: bool) -> None:
+        with self.lock:
+            self.worker_paused = value
+
+    def _run_with_paused_worker(self, fn):
+        self._set_worker_paused(True)
+        # Let an in-flight background tick finish before the synchronous run.
+        time.sleep(1.2 * self.tick_s)
+        try:
+            return fn()
+        finally:
+            self._set_worker_paused(False)
 
     def close(self) -> None:
         self.running = False
@@ -293,30 +319,144 @@ class Plant:
         settle_ticks = int(body.get("settle_ticks", 6))
         source = str(body.get("source", "modal_characterise_block"))
 
-        logs = self._run_block(b_cmd, lambda_tick, dt, ticks_per_point, source)
-        return {
-            "status": "ok",
-            "B": b_cmd,
-            "lambda": lambda_tick,
-            "dt": dt,
-            "ticks_per_point": ticks_per_point,
-            "settle_ticks": settle_ticks,
-            **_summarise_logs(logs, settle_ticks),
-        }
+        def run():
+            logs = self._run_block(b_cmd, lambda_tick, dt, ticks_per_point, source)
+            return {
+                "status": "ok",
+                "B": b_cmd,
+                "lambda": lambda_tick,
+                "dt": dt,
+                "ticks_per_point": ticks_per_point,
+                "settle_ticks": settle_ticks,
+                **_summarise_logs(logs, settle_ticks),
+            }
+
+        return self._run_with_paused_worker(run)
 
     def _run_block(self, b_cmd: int, lambda_tick: float, dt: float, n_ticks: int, source: str) -> list[dict[str, Any]]:
         self.reset()
         self.set_B(b_cmd)
-        time.sleep(2.0 * self.tick_s)
         logs = []
         for k in range(n_ticks):
+            t0 = time.perf_counter()
             arrivals = max(0, int(round(lambda_tick)))
             self.enqueue(arrivals, f"{source}_tick_{k:03d}")
-            time.sleep(dt)
+            self._dispatch_once()
             m = self.metrics()
             m["arrivals_injected"] = arrivals
             logs.append(m)
+            elapsed = time.perf_counter() - t0
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
         return logs
+
+    def run_closed_loop(self, body: dict[str, Any]) -> dict[str, Any]:
+        def run():
+            return self._run_closed_loop_impl(body)
+
+        return self._run_with_paused_worker(run)
+
+    def _run_closed_loop_impl(self, body: dict[str, Any]) -> dict[str, Any]:
+        cfg = self.controller_config
+        if not cfg:
+            raise ValueError("controller_config is empty; POST /controller_config before /run_closed_loop")
+
+        inner = cfg["inner_c"]
+        outer = cfg["outer_c"]
+        perturbed = cfg.get("perturbed", {})
+        dt = float(body.get("dt", perturbed.get("dt", self.tick_s)))
+        seed = int(body.get("seed", 9))
+        rng = np.random.default_rng(seed)
+
+        lambda_mean = float(perturbed.get("lambda_mean", body.get("lambda_mean", 1)))
+        b_max = float(inner["B_max"])
+        default_segments = [
+            {"label": "steady", "ticks": 20, "lambda": lambda_mean},
+            {"label": "spike_1", "ticks": 12, "lambda": min(b_max, 1.10 * lambda_mean)},
+            {"label": "recover", "ticks": 12, "lambda": max(1.0, 0.82 * lambda_mean)},
+            {"label": "spike_2", "ticks": 12, "lambda": min(3200.0, 1.22 * lambda_mean)},
+            {"label": "steady_restore", "ticks": 20, "lambda": lambda_mean},
+        ]
+        segments = body.get("segments", default_segments)
+
+        self.reset()
+        self.set_B(round(float(inner["B0"])))
+        xi_q = 0.0
+        xi_l = 0.0
+        q_ref = float(outer["q0"])
+        logs = []
+        tick = 0
+
+        for seg in segments:
+            label = str(seg.get("label", "segment"))
+            lam = float(seg["lambda"])
+            n_ticks = int(seg["ticks"])
+            for _ in range(n_ticks):
+                tick += 1
+                t0 = time.perf_counter()
+                m = self.metrics()
+                q = _metric_or_default(m, "q_mean_tick", float(outer["q0"]))
+                l_mean = _metric_or_default(m, "l_mean_ms", float(outer["L_mean_target"]))
+                l_p95 = _metric_or_default(m, "l_p95_ms", float(outer["L_p95_target"]))
+                service_ms = _metric_or_default(m, "service_mean_ms", float("nan"))
+                comps = _metric_or_default(m, "completions_tick", 0.0)
+
+                e_l = float(outer["L_mean_target"]) - l_mean
+                xi_l_trial = _clamp(xi_l + e_l, float(outer["xi_min"]), float(outer["xi_max"]))
+                q_ref_trial = _clamp(
+                    float(outer["q0"]) + float(outer["K_i_l"]) * xi_l_trial,
+                    float(outer["q_min"]),
+                    float(outer["q_max"]),
+                )
+                if not (
+                    (q_ref_trial == float(outer["q_min"]) and e_l < 0)
+                    or (q_ref_trial == float(outer["q_max"]) and e_l > 0)
+                ):
+                    xi_l = xi_l_trial
+                    q_ref = q_ref_trial
+
+                e_q = q_ref - q
+                xi_q_trial = _clamp(xi_q + e_q, float(inner["xi_min"]), float(inner["xi_max"]))
+                b_unsat = (
+                    float(inner["B0"])
+                    + float(inner["K_q"]) * (q - q_ref)
+                    - float(inner["K_i_q"]) * xi_q_trial
+                )
+                b_cmd = round(_clamp(b_unsat, float(inner["B_min"]), float(inner["B_max"])))
+                if not (
+                    (b_cmd == float(inner["B_min"]) and e_q > 0)
+                    or (b_cmd == float(inner["B_max"]) and e_q < 0)
+                ):
+                    xi_q = xi_q_trial
+
+                self.set_B(b_cmd)
+                arrivals = int(rng.poisson(lam))
+                self.enqueue(arrivals, f"closed_loop_tick_{tick:03d}")
+                self._dispatch_once()
+
+                logs.append({
+                    "tick": tick,
+                    "label": label,
+                    "lambda": lam,
+                    "arrivals": arrivals,
+                    "q": q,
+                    "q_ref": q_ref,
+                    "B": b_cmd,
+                    "L_mean": l_mean,
+                    "L_p95": l_p95,
+                    "service_ms": service_ms,
+                    "completions": comps,
+                    "e_l": e_l,
+                    "e_q": e_q,
+                    "xi_l": xi_l,
+                    "xi_q": xi_q,
+                })
+
+                elapsed = time.perf_counter() - t0
+                if elapsed < dt:
+                    time.sleep(dt - elapsed)
+
+        return {"status": "ok", "dt": dt, "segments": segments, "run_log": logs}
 
 
 def make_handler(plant: Plant):
@@ -336,26 +476,31 @@ def make_handler(plant: Plant):
                 self._send({"error": "not found"}, status=404)
 
         def do_POST(self) -> None:
-            body = self._read_json()
-            if self.path == "/control":
-                self._send(plant.set_B(int(body.get("B", plant.B_current))))
-            elif self.path == "/enqueue_batch":
-                count = int(body.get("count", body.get("arrivals", 1)))
-                self._send(plant.enqueue(count, str(body.get("source", "matlab"))))
-            elif self.path == "/reset":
-                self._send(plant.reset())
-            elif self.path == "/controller_config":
-                xml_text = str(body.get("xml", ""))
-                if not xml_text:
-                    self._send({"error": "missing xml field"}, status=400)
+            try:
+                body = self._read_json()
+                if self.path == "/control":
+                    self._send(plant.set_B(int(body.get("B", plant.B_current))))
+                elif self.path == "/enqueue_batch":
+                    count = int(body.get("count", body.get("arrivals", 1)))
+                    self._send(plant.enqueue(count, str(body.get("source", "matlab"))))
+                elif self.path == "/reset":
+                    self._send(plant.reset())
+                elif self.path == "/controller_config":
+                    xml_text = str(body.get("xml", ""))
+                    if not xml_text:
+                        self._send({"error": "missing xml field"}, status=400)
+                    else:
+                        self._send(plant.set_controller_config_xml(xml_text))
+                elif self.path == "/characterise":
+                    self._send(plant.run_characterisation(body))
+                elif self.path == "/characterise_block":
+                    self._send(plant.run_characterisation_block(body))
+                elif self.path == "/run_closed_loop":
+                    self._send(plant.run_closed_loop(body))
                 else:
-                    self._send(plant.set_controller_config_xml(xml_text))
-            elif self.path == "/characterise":
-                self._send(plant.run_characterisation(body))
-            elif self.path == "/characterise_block":
-                self._send(plant.run_characterisation_block(body))
-            else:
-                self._send({"error": "not found"}, status=404)
+                    self._send({"error": "not found"}, status=404)
+            except Exception as exc:
+                self._send({"status": "error", "error": repr(exc)}, status=500)
 
         def _read_json(self) -> dict[str, Any]:
             n = int(self.headers.get("Content-Length", "0"))
@@ -380,6 +525,23 @@ def make_handler(plant: Plant):
 def _safe_mean(values: list[float]) -> float:
     finite = [v for v in values if math.isfinite(v)]
     return mean(finite) if finite else float("nan")
+
+
+def _metric_or_default(metrics: dict[str, Any], key: str, default: float) -> float:
+    value = metrics.get(key)
+    if value is None:
+        return default
+    try:
+        as_float = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(as_float):
+        return default
+    return as_float
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return min(max(value, lo), hi)
 
 
 def _summarise_logs(logs: list[dict[str, Any]], settle_ticks: int) -> dict[str, Any]:
