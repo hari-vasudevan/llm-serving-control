@@ -26,8 +26,9 @@ perturbed.B_min = B_min;
 perturbed.B_max = B_max;
 perturbed.q_min = Q_REF_MIN;
 perturbed.q_max = Q_MAX;
-perturbed.tau_in = 4.0;
-perturbed.tau_out = 25.0;
+perturbed.tau_in = 1.0;
+perturbed.tau_out = 35.0;
+perturbed.inner_integral_fraction = 0.60;
 
 fprintf('[op] B0=%d B_max=%d lambda_mean=%.2f q0=%.2f L_target=%.2f\n', ...
     perturbed.B0, perturbed.B_max, perturbed.lambda_mean, perturbed.q0, perturbed.L_mean_target);
@@ -60,7 +61,7 @@ beta = max(perturbed.beta, 1e-3);
 %   dB[k] = -K_q*dq[k] - K_i_q*xi_q[k]
 rho_in = exp(-dt / perturbed.tau_in);
 K_q = (1 - rho_in) / beta_q;
-K_i_q = 0.25 * K_q;
+K_i_q = perturbed.inner_integral_fraction * K_q;
 
 % Outer loop, Chapter 2 static-gain form:
 %   Delta L = beta * Delta q_ref

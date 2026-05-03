@@ -386,6 +386,7 @@ class Plant:
         q_ref = float(outer["q0"])
         logs = []
         tick = 0
+        have_batch_measurement = False
 
         for seg in segments:
             label = str(seg.get("label", "segment"))
@@ -395,11 +396,18 @@ class Plant:
                 tick += 1
                 t0 = time.perf_counter()
                 m = self.metrics()
-                q = _metric_or_default(m, "q_mean_tick", float(outer["q0"]))
-                l_mean = _metric_or_default(m, "l_mean_ms", float(outer["L_mean_target"]))
-                l_p95 = _metric_or_default(m, "l_p95_ms", float(outer["L_p95_target"]))
-                service_ms = _metric_or_default(m, "service_mean_ms", float("nan"))
                 comps = _metric_or_default(m, "completions_tick", 0.0)
+                if not have_batch_measurement and comps <= 0:
+                    q = float(outer["q0"])
+                    l_mean = float(outer["L_mean_target"])
+                    l_p95 = float(outer["L_p95_target"])
+                    service_ms = float("nan")
+                else:
+                    have_batch_measurement = True
+                    q = _metric_or_default(m, "q_mean_tick", float(outer["q0"]))
+                    l_mean = _metric_or_default(m, "l_mean_ms", float(outer["L_mean_target"]))
+                    l_p95 = _metric_or_default(m, "l_p95_ms", float(outer["L_p95_target"]))
+                    service_ms = _metric_or_default(m, "service_mean_ms", float("nan"))
 
                 e_l = float(outer["L_mean_target"]) - l_mean
                 xi_l_trial = _clamp(xi_l + e_l, float(outer["xi_min"]), float(outer["xi_max"]))
