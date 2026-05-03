@@ -18,6 +18,7 @@ N = sum([SEGMENTS.ticks]);
 fprintf('=== Chapter 9 Closed-loop Cascade ===\n');
 fprintf('Inner loop: B->q. Outer loop: q_ref->L_mean. Target L_mean=%.2f ms\n', controller.outer_c.L_mean_target);
 
+upload_controller_if_available(SERVER);
 srv_post(SERVER, '/reset', struct());
 srv_post(SERVER, '/control', struct('B', round(controller.inner_c.B0)));
 
@@ -166,4 +167,13 @@ cmd = sprintf('curl -sS -X POST "%s%s" -H "Content-Type: application/json" -d "%
 [status, raw] = system(cmd);
 assert(status == 0, 'POST failed: %s', raw);
 out = jsondecode(strtrim(raw));
+end
+
+function upload_controller_if_available(server)
+xml_path = fullfile(fileparts(mfilename('fullpath')), 'controller_config.xml');
+if exist(xml_path, 'file') && ~contains(server, 'REPLACE_WITH_MODAL')
+    payload = struct('xml', fileread(xml_path), 'source', 'matlab_run_cascade_controller');
+    out = srv_post(server, '/controller_config', payload);
+    fprintf('[upload] controller_config status=%s\n', string(out.status));
+end
 end

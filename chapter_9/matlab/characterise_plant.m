@@ -7,7 +7,10 @@
 clear; clc;
 addpath(fileparts(mfilename('fullpath')));
 
-SERVER = 'http://127.0.0.1:8019';
+SERVER = getenv('CH9_SERVER');
+if strlength(SERVER) == 0
+    SERVER = 'https://REPLACE_WITH_MODAL_CH9_URL';
+end
 DT = 0.5;                         % controller/sample tick [s]
 B_SWEEP = [2 4 6 8 10 12 16];     % batch-size actuator sweep
 LAMBDA_SWEEP = [4 6 8 10 12 14];  % arrivals/tick sweep

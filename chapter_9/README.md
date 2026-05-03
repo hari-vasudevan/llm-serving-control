@@ -40,7 +40,8 @@ workload instead of assuming them.
 
 ```text
 MATLAB cascade controller
-    -> Python plant server
+    -> Modal web endpoint
+        -> Python plant server on Modal T4
         -> FIFO queue q[k]
         -> exact batch-size actuator B[k]
         -> fixed GPU batch workload
@@ -67,8 +68,10 @@ This removes:
   and CSV logs.
 - `python/workloads.py`
   Fixed PyTorch batched matrix workload.
+- `modal_gpu_batch_server.py`
+  Modal deployment entrypoint for the real GPU experiment.
 - `python/requirements.txt`
-  Minimal Python dependencies.
+  Minimal dependencies for optional local CPU smoke tests.
 - `matlab/characterise_plant.m`
   Open-loop sweeps to identify `B -> q`, service time, and `q -> L_mean`.
 - `matlab/design_controller.m`
@@ -78,19 +81,23 @@ This removes:
 
 ## Run Flow
 
-From `chapter_9/python`:
+The real Chapter 9 GPU experiment runs on Modal, not on the local Mac.
+
+From the repository root:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python gpu_batch_server.py --device cuda --port 8019 --initial-B 8 --dim 1024 --layers 6
+python3 -m venv .modal-venv
+source .modal-venv/bin/activate
+pip install modal
+modal setup
+modal deploy chapter_9/modal_gpu_batch_server.py
 ```
 
-For a CPU smoke test:
+Modal prints a web URL.  Put that URL in `CH9_SERVER` before running MATLAB.
+For example:
 
-```bash
-python gpu_batch_server.py --device cpu --port 8019 --initial-B 8 --dim 256 --layers 2
+```matlab
+setenv('CH9_SERVER', 'https://YOUR-MODAL-URL.modal.run')
 ```
 
 Then in MATLAB:
@@ -102,10 +109,37 @@ design_controller
 run_cascade_controller
 ```
 
+`design_controller` writes `controller_config.xml` locally and uploads it to
+the Modal plant via:
+
+```text
+POST /controller_config
+```
+
+The Modal container therefore picks up the locally computed Chapter 2
+coefficients without needing access to the local filesystem.
+
+For a local CPU smoke test only:
+
+```bash
+cd chapter_9/python
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python gpu_batch_server.py --device cpu --port 8019 --initial-B 8 --dim 256 --layers 2
+```
+
+Then explicitly point MATLAB at the local smoke-test server:
+
+```matlab
+setenv('CH9_SERVER', 'http://127.0.0.1:8019')
+```
+
 ## Is Python Fast Enough?
 
-Yes, for this experiment.  Python is the discrete scheduler and logging
-wrapper, not the GPU compute kernel.
+Yes, for this experiment.  Python runs inside the Modal GPU container as the
+discrete scheduler and logging wrapper; the GPU compute kernel is PyTorch on
+CUDA.
 
 The measured service interval is:
 

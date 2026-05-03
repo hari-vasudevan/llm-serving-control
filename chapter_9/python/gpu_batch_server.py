@@ -26,6 +26,7 @@ import signal
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -62,6 +63,7 @@ class Plant:
         self.qwait_recent: deque[float] = deque(maxlen=1000)
         self.q_samples_tick: list[int] = []
         self.last_batch: dict[str, Any] = {}
+        self.controller_config: dict[str, Any] = {}
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.batch_csv = (self.log_dir / "batch_log.csv").open("w", newline="")
@@ -136,6 +138,7 @@ class Plant:
                 "enqueued": self.enqueued,
                 "completed": self.completed,
                 "last_batch": self.last_batch,
+                "controller_config": self.controller_config,
             }
             self.arrivals_tick = 0
             self.completions_tick = 0
@@ -220,6 +223,12 @@ class Plant:
         self.request_csv.close()
         self.tick_csv.close()
 
+    def set_controller_config_xml(self, xml_text: str) -> dict[str, Any]:
+        cfg = _parse_controller_xml(xml_text)
+        with self.lock:
+            self.controller_config = cfg
+        return {"status": "ok", "controller_config": cfg}
+
 
 def make_handler(plant: Plant):
     class Handler(BaseHTTPRequestHandler):
@@ -246,6 +255,12 @@ def make_handler(plant: Plant):
                 self._send(plant.enqueue(count, str(body.get("source", "matlab"))))
             elif self.path == "/reset":
                 self._send(plant.reset())
+            elif self.path == "/controller_config":
+                xml_text = str(body.get("xml", ""))
+                if not xml_text:
+                    self._send({"error": "missing xml field"}, status=400)
+                else:
+                    self._send(plant.set_controller_config_xml(xml_text))
             else:
                 self._send({"error": "not found"}, status=404)
 
@@ -290,6 +305,32 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, list):
         return [_json_safe(v) for v in value]
     return value
+
+
+def _parse_controller_xml(xml_text: str) -> dict[str, Any]:
+    root = ET.fromstring(xml_text)
+    out: dict[str, Any] = {}
+    for child in root:
+        if list(child):
+            out[child.tag] = {grand.tag: _coerce_xml_value(grand.text) for grand in child}
+        else:
+            out[child.tag] = _coerce_xml_value(child.text)
+    return out
+
+
+def _coerce_xml_value(value: str | None) -> Any:
+    if value is None:
+        return ""
+    text = value.strip()
+    if text == "":
+        return ""
+    try:
+        as_float = float(text)
+    except ValueError:
+        return text
+    if as_float.is_integer():
+        return int(as_float)
+    return as_float
 
 
 def main() -> None:

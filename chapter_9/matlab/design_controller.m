@@ -33,6 +33,16 @@ save(fullfile(fileparts(mfilename('fullpath')), 'controller_params.mat'), ...
     'controller', 'perturbed', 'SERVER');
 fprintf('[save] controller_params.mat\n');
 
+xml_path = fullfile(fileparts(mfilename('fullpath')), 'controller_config.xml');
+write_controller_xml(xml_path, controller, perturbed);
+fprintf('[save] controller_config.xml\n');
+
+if ~contains(SERVER, 'REPLACE_WITH_MODAL')
+    upload_controller_config(SERVER, xml_path);
+else
+    fprintf('[skip] SERVER placeholder still set; not uploading controller_config.xml\n');
+end
+
 
 function controller = design_cascade(perturbed)
 B0 = perturbed.B0;
@@ -82,4 +92,53 @@ controller.outer_c = struct( ...
     'xi_min', xi_l_min, ...
     'xi_max', xi_l_max, ...
     'rho', rho_out);
+end
+
+function write_controller_xml(path, controller, perturbed)
+fid = fopen(path, 'w');
+assert(fid > 0, 'Could not open %s for writing', path);
+cleanup = onCleanup(@() fclose(fid));
+fprintf(fid, '<chapter9_controller>\n');
+fprintf(fid, '  <inner_c>\n');
+write_struct_fields(fid, controller.inner_c, 4);
+fprintf(fid, '  </inner_c>\n');
+fprintf(fid, '  <outer_c>\n');
+write_struct_fields(fid, controller.outer_c, 4);
+fprintf(fid, '  </outer_c>\n');
+fprintf(fid, '  <perturbed>\n');
+write_struct_fields(fid, perturbed, 4);
+fprintf(fid, '  </perturbed>\n');
+fprintf(fid, '</chapter9_controller>\n');
+end
+
+function write_struct_fields(fid, s, indent)
+fields = fieldnames(s);
+pad = repmat(' ', 1, indent);
+for i = 1:numel(fields)
+    name = fields{i};
+    value = s.(name);
+    if isnumeric(value) || islogical(value)
+        value_txt = num2str(double(value), '%.15g');
+    else
+        value_txt = char(string(value));
+    end
+    fprintf(fid, '%s<%s>%s</%s>\n', pad, name, value_txt, name);
+end
+end
+
+function upload_controller_config(server, xml_path)
+xml_text = fileread(xml_path);
+payload = struct('xml', xml_text, 'source', 'matlab_design_controller');
+out = srv_post(server, '/controller_config', payload);
+fprintf('[upload] controller_config status=%s\n', string(out.status));
+end
+
+function out = srv_post(server, path, payload)
+body = jsonencode(payload);
+body_escaped = strrep(body, '"', '\"');
+cmd = sprintf('curl -sS -X POST "%s%s" -H "Content-Type: application/json" -d "%s"', ...
+    server, path, body_escaped);
+[status, raw] = system(cmd);
+assert(status == 0, 'POST failed: %s', raw);
+out = jsondecode(strtrim(raw));
 end
