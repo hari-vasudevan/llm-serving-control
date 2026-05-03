@@ -7,10 +7,10 @@ import modal
 app = modal.App("chapter-9-gpu-batch-plant")
 
 SERVER_PORT = 8019
-DEFAULT_DIM = 1024
-DEFAULT_LAYERS = 6
-DEFAULT_INITIAL_B = 8
-DEFAULT_TICK_S = 0.1
+DEFAULT_DIM = 2048
+DEFAULT_LAYERS = 8
+DEFAULT_INITIAL_B = 16
+DEFAULT_TICK_S = 0.5
 
 image = (
     modal.Image.debian_slim(python_version="3.11")

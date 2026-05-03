@@ -53,6 +53,18 @@ The Python plant server is intentionally lower-level than vLLM.  A request is
 a fixed tensor job.  A batch is exactly `B[k]` queued tensor jobs stacked
 together and sent through a fixed PyTorch GPU workload.
 
+The scheduler is deliberately ticked, not eager:
+
+```text
+once per DT:
+    pop up to B[k] jobs from FIFO
+    run one GPU batch
+    leave the remainder in q[k]
+```
+
+This is important.  If the worker drains continuously, `B` becomes only a
+micro-batch cap and the Chapter 2 queue state never appears.
+
 This removes:
 
 - network latency inside the measured service time,
@@ -73,7 +85,8 @@ This removes:
 - `python/requirements.txt`
   Minimal dependencies for optional local CPU smoke tests.
 - `matlab/characterise_plant.m`
-  Open-loop sweeps to identify `B -> q`, service time, and `q -> L_mean`.
+  Asks Modal to run in-container open-loop sweeps to identify `B -> q`,
+  service time, and `q -> L_mean`.
 - `matlab/design_controller.m`
   Chapter 2-style cascade controller design.
 - `matlab/run_cascade_controller.m`
@@ -108,6 +121,16 @@ characterise_plant
 design_controller
 run_cascade_controller
 ```
+
+`characterise_plant` calls:
+
+```text
+POST /characterise
+```
+
+so arrival generation runs inside the Modal GPU container.  MATLAB receives
+the summarized results and does the fitting/plotting locally.  This avoids
+using MATLAB-to-Modal round trips as the load generator.
 
 `design_controller` writes `controller_config.xml` locally and uploads it to
 the Modal plant via:

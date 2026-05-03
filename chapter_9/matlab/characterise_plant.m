@@ -11,12 +11,14 @@ SERVER = getenv('CH9_SERVER');
 if strlength(SERVER) == 0
     SERVER = 'https://REPLACE_WITH_MODAL_CH9_URL';
 end
-DT = 0.5;                         % controller/sample tick [s]
-B_SWEEP = [2 4 6 8 10 12 16];     % batch-size actuator sweep
-LAMBDA_SWEEP = [4 6 8 10 12 14];  % arrivals/tick sweep
-TICKS_PER_POINT = 16;
-SETTLE_TICKS = 5;
-Q_TARGET_NOMINAL = 16;
+DT = 0.5;                             % Chapter 2 scheduling tick [s]
+B_SWEEP = [4 8 12 16 20 24 32];       % batch-size actuator sweep
+LAMBDA_SWEEP = [8 12 16 20 24 28 32]; % arrivals/tick sweep
+TICKS_PER_POINT = 30;
+SETTLE_TICKS = 8;
+LAMBDA_CHAR = 24;
+B0_PROBE = 16;
+Q_TARGET_NOMINAL = 24;
 Q_REF_MIN = 0;
 Q_MAX = 200;
 
@@ -30,46 +32,41 @@ fprintf('SERVER=%s DT=%.3fs\n', SERVER, DT);
 
 disp(srv_get(SERVER, '/health'));
 
-lambda_char = 10;
-qmean_B = NaN(size(B_SWEEP));
-lmean_B = NaN(size(B_SWEEP));
-lp95_B = NaN(size(B_SWEEP));
-service_B = NaN(size(B_SWEEP));
-completion_B = NaN(size(B_SWEEP));
+payload = struct( ...
+    'dt', DT, ...
+    'B_sweep', B_SWEEP, ...
+    'lambda_sweep', LAMBDA_SWEEP, ...
+    'lambda_char', LAMBDA_CHAR, ...
+    'B0_probe', B0_PROBE, ...
+    'ticks_per_point', TICKS_PER_POINT, ...
+    'settle_ticks', SETTLE_TICKS, ...
+    'source', 'matlab_characterise');
+
+fprintf('[modal] running in-container characterisation; this removes MATLAB/network timing from load generation\n');
+char_result = srv_post(SERVER, '/characterise', payload);
+
+B_results = char_result.B_results;
+lambda_results = char_result.lambda_results;
+
+qmean_B = extract_field(B_results, 'q_mean_tick');
+lmean_B = extract_field(B_results, 'l_mean_ms');
+lp95_B = extract_field(B_results, 'l_p95_ms');
+service_B = extract_field(B_results, 'service_mean_ms');
+completion_B = extract_field(B_results, 'completions_tick');
+
+qmean_lambda = extract_field(lambda_results, 'q_mean_tick');
+lmean_lambda = extract_field(lambda_results, 'l_mean_ms');
+lp95_lambda = extract_field(lambda_results, 'l_p95_ms');
+service_lambda = extract_field(lambda_results, 'service_mean_ms');
+completion_lambda = extract_field(lambda_results, 'completions_tick');
 
 for i = 1:numel(B_SWEEP)
-    B = B_SWEEP(i);
-    fprintf('\n=== B sweep: B=%d lambda=%.2f arrivals/tick ===\n', B, lambda_char);
-    logs = run_block(SERVER, B, lambda_char, DT, TICKS_PER_POINT);
-    s = summarise_block(logs, SETTLE_TICKS);
-    qmean_B(i) = s.q_mean_tick;
-    lmean_B(i) = s.l_mean_ms;
-    lp95_B(i) = s.l_p95_ms;
-    service_B(i) = s.service_mean_ms;
-    completion_B(i) = s.completions_tick;
     fprintf('[B=%d] q=%.2f L_mean=%.2f L_p95=%.2f service=%.2fms comps=%.2f\n', ...
-        B, qmean_B(i), lmean_B(i), lp95_B(i), service_B(i), completion_B(i));
+        B_SWEEP(i), qmean_B(i), lmean_B(i), lp95_B(i), service_B(i), completion_B(i));
 end
-
-B0_probe = 10;
-qmean_lambda = NaN(size(LAMBDA_SWEEP));
-lmean_lambda = NaN(size(LAMBDA_SWEEP));
-lp95_lambda = NaN(size(LAMBDA_SWEEP));
-service_lambda = NaN(size(LAMBDA_SWEEP));
-completion_lambda = NaN(size(LAMBDA_SWEEP));
-
 for i = 1:numel(LAMBDA_SWEEP)
-    lam = LAMBDA_SWEEP(i);
-    fprintf('\n=== lambda sweep: B=%d lambda=%.2f arrivals/tick ===\n', B0_probe, lam);
-    logs = run_block(SERVER, B0_probe, lam, DT, TICKS_PER_POINT);
-    s = summarise_block(logs, SETTLE_TICKS);
-    qmean_lambda(i) = s.q_mean_tick;
-    lmean_lambda(i) = s.l_mean_ms;
-    lp95_lambda(i) = s.l_p95_ms;
-    service_lambda(i) = s.service_mean_ms;
-    completion_lambda(i) = s.completions_tick;
     fprintf('[lambda=%.2f] q=%.2f L_mean=%.2f L_p95=%.2f service=%.2fms comps=%.2f\n', ...
-        lam, qmean_lambda(i), lmean_lambda(i), lp95_lambda(i), service_lambda(i), completion_lambda(i));
+        LAMBDA_SWEEP(i), qmean_lambda(i), lmean_lambda(i), lp95_lambda(i), service_lambda(i), completion_lambda(i));
 end
 
 % Chapter 2 inner linearisation: dq[k+1] = dq[k] - dB[k].
@@ -88,7 +85,7 @@ gamma = max(service_fit(1), 0);
 alpha = service_fit(2);
 
 [~, op_idx] = min(abs(qmean_lambda - Q_TARGET_NOMINAL));
-B0 = B0_probe;
+B0 = B0_PROBE;
 lambda_mean = LAMBDA_SWEEP(op_idx);
 q0 = qmean_lambda(op_idx);
 L_mean_target = lmean_lambda(op_idx);
@@ -104,6 +101,7 @@ fprintf('[op] B0=%d lambda_mean=%.2f q0=%.2f L_mean_target=%.2f L_p95_target=%.2
 
 save(fullfile(fileparts(mfilename('fullpath')), 'identified_params.mat'), ...
     'SERVER', 'DT', 'B_SWEEP', 'LAMBDA_SWEEP', 'TICKS_PER_POINT', 'SETTLE_TICKS', ...
+    'LAMBDA_CHAR', 'B0_PROBE', 'char_result', ...
     'qmean_B', 'lmean_B', 'lp95_B', 'service_B', 'completion_B', ...
     'qmean_lambda', 'lmean_lambda', 'lp95_lambda', 'service_lambda', 'completion_lambda', ...
     'beta_q', 'beta', 'alpha', 'gamma', 'B0', 'lambda_mean', 'q0', ...
@@ -134,55 +132,21 @@ fprintf('[save] ch9_characterise.png\n');
 diary off;
 
 
-function logs = run_block(server, B_cmd, lambda_tick, dt, n_ticks)
-srv_post(server, '/reset', struct());
-pause(0.5);
-srv_post(server, '/control', struct('B', B_cmd));
-pause(0.2);
-logs = cell(n_ticks, 1);
-for k = 1:n_ticks
-    arrivals = poissrnd(lambda_tick);
-    srv_post(server, '/enqueue_batch', struct('count', arrivals, 'source', sprintf('char_tick_%03d', k)));
-    pause(dt);
-    logs{k} = srv_get(server, '/metrics');
-    fprintf('[tick=%03d] B=%d arrivals=%d q=%.2f comps=%.2f L=%.2f service=%.2f\n', ...
-        k, B_cmd, arrivals, metric_or_nan(logs{k}, 'q_mean_tick'), ...
-        metric_or_nan(logs{k}, 'completions_tick'), metric_or_nan(logs{k}, 'l_mean_ms'), ...
-        metric_or_nan(logs{k}, 'service_mean_ms'));
-end
-end
-
-function summary = summarise_block(logs, settle_ticks)
-use = logs(min(numel(logs), settle_ticks + 1):end);
-summary = struct();
-summary.q_mean_tick = average_metric(use, 'q_mean_tick');
-summary.l_mean_ms = average_metric(use, 'l_mean_ms');
-summary.l_p95_ms = average_metric(use, 'l_p95_ms');
-summary.service_mean_ms = average_metric(use, 'service_mean_ms');
-summary.completions_tick = average_metric(use, 'completions_tick');
-end
-
-function value = average_metric(logs, field_name)
-vals = NaN(numel(logs), 1);
-for i = 1:numel(logs)
-    vals(i) = metric_or_nan(logs{i}, field_name);
-end
-value = mean(vals, 'omitnan');
-end
-
-function value = metric_or_nan(s, field_name)
-if isfield(s, field_name) && ~isempty(s.(field_name))
-    value = double(s.(field_name));
-else
-    value = NaN;
-end
-end
-
 function out = srv_get(server, path)
 cmd = sprintf('curl -sS "%s%s"', server, path);
 [status, raw] = system(cmd);
 assert(status == 0, 'GET failed: %s', raw);
 out = jsondecode(strtrim(raw));
+end
+
+function vals = extract_field(s, field_name)
+vals = NaN(numel(s), 1);
+for i = 1:numel(s)
+    if isfield(s(i), field_name) && ~isempty(s(i).(field_name))
+        vals(i) = double(s(i).(field_name));
+    end
+end
+vals = vals(:).';
 end
 
 function out = srv_post(server, path, payload)

@@ -148,7 +148,14 @@ class Plant:
             return out
 
     def worker_loop(self) -> None:
+        next_tick = time.perf_counter()
         while self.running:
+            now = time.perf_counter()
+            if now < next_tick:
+                time.sleep(next_tick - now)
+            tick_start = time.perf_counter()
+            next_tick = tick_start + self.tick_s
+
             with self.lock:
                 self.q_samples_tick.append(len(self.fifo))
                 b_now = self.B_current
@@ -159,7 +166,6 @@ class Plant:
                 q_before = q_after + len(batch)
 
             if not batch:
-                time.sleep(min(0.002, self.tick_s / 10))
                 continue
 
             dispatch_t = time.perf_counter()
@@ -229,6 +235,51 @@ class Plant:
             self.controller_config = cfg
         return {"status": "ok", "controller_config": cfg}
 
+    def run_characterisation(self, body: dict[str, Any]) -> dict[str, Any]:
+        dt = float(body.get("dt", self.tick_s))
+        b_sweep = [int(x) for x in body.get("B_sweep", [4, 8, 12, 16, 24, 32])]
+        lambda_sweep = [float(x) for x in body.get("lambda_sweep", [8, 12, 16, 20, 24, 28, 32])]
+        lambda_char = float(body.get("lambda_char", 24))
+        b0_probe = int(body.get("B0_probe", 16))
+        ticks_per_point = int(body.get("ticks_per_point", 30))
+        settle_ticks = int(body.get("settle_ticks", 8))
+        source = str(body.get("source", "modal_characterise"))
+
+        b_results = []
+        for b_cmd in b_sweep:
+            logs = self._run_block(b_cmd, lambda_char, dt, ticks_per_point, f"{source}_B_{b_cmd}")
+            b_results.append({"B": b_cmd, **_summarise_logs(logs, settle_ticks)})
+
+        lambda_results = []
+        for lam in lambda_sweep:
+            logs = self._run_block(b0_probe, lam, dt, ticks_per_point, f"{source}_lam_{lam:g}")
+            lambda_results.append({"lambda": lam, **_summarise_logs(logs, settle_ticks)})
+
+        return {
+            "status": "ok",
+            "dt": dt,
+            "lambda_char": lambda_char,
+            "B0_probe": b0_probe,
+            "ticks_per_point": ticks_per_point,
+            "settle_ticks": settle_ticks,
+            "B_results": b_results,
+            "lambda_results": lambda_results,
+        }
+
+    def _run_block(self, b_cmd: int, lambda_tick: float, dt: float, n_ticks: int, source: str) -> list[dict[str, Any]]:
+        self.reset()
+        self.set_B(b_cmd)
+        time.sleep(2.0 * self.tick_s)
+        logs = []
+        for k in range(n_ticks):
+            arrivals = max(0, int(round(lambda_tick)))
+            self.enqueue(arrivals, f"{source}_tick_{k:03d}")
+            time.sleep(dt)
+            m = self.metrics()
+            m["arrivals_injected"] = arrivals
+            logs.append(m)
+        return logs
+
 
 def make_handler(plant: Plant):
     class Handler(BaseHTTPRequestHandler):
@@ -261,6 +312,8 @@ def make_handler(plant: Plant):
                     self._send({"error": "missing xml field"}, status=400)
                 else:
                     self._send(plant.set_controller_config_xml(xml_text))
+            elif self.path == "/characterise":
+                self._send(plant.run_characterisation(body))
             else:
                 self._send({"error": "not found"}, status=404)
 
@@ -287,6 +340,19 @@ def make_handler(plant: Plant):
 def _safe_mean(values: list[float]) -> float:
     finite = [v for v in values if math.isfinite(v)]
     return mean(finite) if finite else float("nan")
+
+
+def _summarise_logs(logs: list[dict[str, Any]], settle_ticks: int) -> dict[str, Any]:
+    use = logs[min(len(logs), settle_ticks):]
+    return {
+        "q_mean_tick": _safe_mean([float(x.get("q_mean_tick", float("nan"))) for x in use]),
+        "q_max_tick": max([float(x.get("q_max_tick", 0.0)) for x in use], default=0.0),
+        "l_mean_ms": _safe_mean([float(x.get("l_mean_ms", float("nan"))) for x in use if x.get("l_mean_ms") is not None]),
+        "l_p95_ms": _safe_mean([float(x.get("l_p95_ms", float("nan"))) for x in use if x.get("l_p95_ms") is not None]),
+        "service_mean_ms": _safe_mean([float(x.get("service_mean_ms", float("nan"))) for x in use if x.get("service_mean_ms") is not None]),
+        "queue_wait_mean_ms": _safe_mean([float(x.get("queue_wait_mean_ms", float("nan"))) for x in use if x.get("queue_wait_mean_ms") is not None]),
+        "completions_tick": _safe_mean([float(x.get("completions_tick", float("nan"))) for x in use]),
+    }
 
 
 def _percentile(values: list[float], pct: float) -> float:
