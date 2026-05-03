@@ -14,8 +14,8 @@ end
 DT = 0.5;                             % Chapter 2 scheduling tick [s]
 B_SWEEP = [4 8 12 16 20 24 32];       % batch-size actuator sweep
 LAMBDA_SWEEP = [8 12 16 20 24 28 32]; % arrivals/tick sweep
-TICKS_PER_POINT = 30;
-SETTLE_TICKS = 8;
+TICKS_PER_POINT = 24;
+SETTLE_TICKS = 6;
 LAMBDA_CHAR = 24;
 B0_PROBE = 16;
 Q_TARGET_NOMINAL = 24;
@@ -32,21 +32,34 @@ fprintf('SERVER=%s DT=%.3fs\n', SERVER, DT);
 
 disp(srv_get(SERVER, '/health'));
 
-payload = struct( ...
+fprintf('[modal] running per-point in-container characterisation; this removes MATLAB/network timing from load generation\n');
+
+B_results = repmat(struct(), numel(B_SWEEP), 1);
+for i = 1:numel(B_SWEEP)
+    payload = block_payload(DT, B_SWEEP(i), LAMBDA_CHAR, TICKS_PER_POINT, SETTLE_TICKS, ...
+        sprintf('matlab_characterise_B_%03d', B_SWEEP(i)));
+    fprintf('[modal] B sweep %d/%d: B=%d lambda=%.2f\n', i, numel(B_SWEEP), B_SWEEP(i), LAMBDA_CHAR);
+    B_results(i) = srv_post(SERVER, '/characterise_block', payload);
+end
+
+lambda_results = repmat(struct(), numel(LAMBDA_SWEEP), 1);
+for i = 1:numel(LAMBDA_SWEEP)
+    payload = block_payload(DT, B0_PROBE, LAMBDA_SWEEP(i), TICKS_PER_POINT, SETTLE_TICKS, ...
+        sprintf('matlab_characterise_lambda_%03d', LAMBDA_SWEEP(i)));
+    fprintf('[modal] lambda sweep %d/%d: B=%d lambda=%.2f\n', i, numel(LAMBDA_SWEEP), B0_PROBE, LAMBDA_SWEEP(i));
+    lambda_results(i) = srv_post(SERVER, '/characterise_block', payload);
+end
+
+char_result = struct( ...
+    'status', 'ok', ...
+    'mode', 'per_point_characterise_block', ...
     'dt', DT, ...
-    'B_sweep', B_SWEEP, ...
-    'lambda_sweep', LAMBDA_SWEEP, ...
     'lambda_char', LAMBDA_CHAR, ...
     'B0_probe', B0_PROBE, ...
     'ticks_per_point', TICKS_PER_POINT, ...
     'settle_ticks', SETTLE_TICKS, ...
-    'source', 'matlab_characterise');
-
-fprintf('[modal] running in-container characterisation; this removes MATLAB/network timing from load generation\n');
-char_result = srv_post(SERVER, '/characterise', payload);
-
-B_results = char_result.B_results;
-lambda_results = char_result.lambda_results;
+    'B_results', B_results, ...
+    'lambda_results', lambda_results);
 
 qmean_B = extract_field(B_results, 'q_mean_tick');
 lmean_B = extract_field(B_results, 'l_mean_ms');
@@ -136,6 +149,7 @@ function out = srv_get(server, path)
 cmd = sprintf('curl -sS "%s%s"', server, path);
 [status, raw] = system(cmd);
 assert(status == 0, 'GET failed: %s', raw);
+assert(strlength(strtrim(raw)) > 0, 'GET returned empty response for %s%s', server, path);
 out = jsondecode(strtrim(raw));
 end
 
@@ -156,5 +170,16 @@ cmd = sprintf('curl -sS -X POST "%s%s" -H "Content-Type: application/json" -d "%
     server, path, body_escaped);
 [status, raw] = system(cmd);
 assert(status == 0, 'POST failed: %s', raw);
+assert(strlength(strtrim(raw)) > 0, 'POST returned empty response for %s%s', server, path);
 out = jsondecode(strtrim(raw));
+end
+
+function payload = block_payload(dt, B, lambda_tick, ticks_per_point, settle_ticks, source)
+payload = struct( ...
+    'dt', dt, ...
+    'B', B, ...
+    'lambda', lambda_tick, ...
+    'ticks_per_point', ticks_per_point, ...
+    'settle_ticks', settle_ticks, ...
+    'source', source);
 end

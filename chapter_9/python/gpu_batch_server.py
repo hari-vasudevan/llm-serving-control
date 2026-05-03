@@ -266,6 +266,25 @@ class Plant:
             "lambda_results": lambda_results,
         }
 
+    def run_characterisation_block(self, body: dict[str, Any]) -> dict[str, Any]:
+        dt = float(body.get("dt", self.tick_s))
+        b_cmd = int(body.get("B", body.get("B_cmd", self.B_current)))
+        lambda_tick = float(body.get("lambda", body.get("lambda_tick", 1)))
+        ticks_per_point = int(body.get("ticks_per_point", 24))
+        settle_ticks = int(body.get("settle_ticks", 6))
+        source = str(body.get("source", "modal_characterise_block"))
+
+        logs = self._run_block(b_cmd, lambda_tick, dt, ticks_per_point, source)
+        return {
+            "status": "ok",
+            "B": b_cmd,
+            "lambda": lambda_tick,
+            "dt": dt,
+            "ticks_per_point": ticks_per_point,
+            "settle_ticks": settle_ticks,
+            **_summarise_logs(logs, settle_ticks),
+        }
+
     def _run_block(self, b_cmd: int, lambda_tick: float, dt: float, n_ticks: int, source: str) -> list[dict[str, Any]]:
         self.reset()
         self.set_B(b_cmd)
@@ -314,6 +333,8 @@ def make_handler(plant: Plant):
                     self._send(plant.set_controller_config_xml(xml_text))
             elif self.path == "/characterise":
                 self._send(plant.run_characterisation(body))
+            elif self.path == "/characterise_block":
+                self._send(plant.run_characterisation_block(body))
             else:
                 self._send({"error": "not found"}, status=404)
 

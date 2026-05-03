@@ -14,7 +14,7 @@ DEFAULT_TICK_S = 0.5
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch")
+    .pip_install("torch", "numpy")
     .add_local_file(
         "chapter_9/python/gpu_batch_server.py",
         remote_path="/root/gpu_batch_server.py",
