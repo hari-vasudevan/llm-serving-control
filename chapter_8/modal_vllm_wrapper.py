@@ -37,6 +37,7 @@ image = (
 
 @app.function(
     image=image,
+    secrets=[modal.Secret.from_name("huggingface", required_keys=["HF_TOKEN"])],
     gpu="T4",
     timeout=60 * 60,
     scaledown_window=300,

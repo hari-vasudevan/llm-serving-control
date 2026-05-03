@@ -6,14 +6,15 @@
 clear; clc;
 addpath(fileparts(mfilename('fullpath')));
 
-SERVER = 'https://REPLACE-WITH-YOUR-MODAL-ENDPOINT.modal.run';
+SERVER = 'https://hvasudevan--chapter-8-vllm-wrapper-serve.modal.run';
 DT = 1.0;
-B_SWEEP = [1 2 4 8 12 16 24 32 40 50];
-N_REPS = 4;
+% Quick-trial profile to complete inside the current MATLAB tool runtime.
+B_SWEEP = [1 4 8];
+N_REPS = 2;
 PROMPT_REPEAT = 192;
 MAX_TOKENS = 32;
-WARMUP_ENQS = 12;
-TIMEOUT_S = 240;
+WARMUP_ENQS = 4;
+TIMEOUT_S = 120;
 TRACE_FILE = fullfile(fileparts(mfilename('fullpath')), 'characterise_trace.txt');
 
 if exist(TRACE_FILE, 'file')
