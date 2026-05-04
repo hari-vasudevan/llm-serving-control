@@ -186,7 +186,7 @@ end
 function out = srv_post(server, path, payload)
 body = jsonencode(payload);
 body_escaped = strrep(body, '"', '\"');
-cmd = sprintf('curl -sS -X POST "%s%s" -H "Content-Type: application/json" -d "%s"', ...
+cmd = sprintf('curl -sSL -X POST "%s%s" -H "Content-Type: application/json" -d "%s"', ...
     server, path, body_escaped);
 [status, raw] = system(cmd);
 assert(status == 0, 'POST failed: %s', raw);
