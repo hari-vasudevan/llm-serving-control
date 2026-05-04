@@ -43,10 +43,10 @@ perturbed.B_min = B_min;
 perturbed.B_max = B_max;
 perturbed.q_min = Q_REF_MIN;
 perturbed.q_max = Q_MAX;
-perturbed.tau_in = 1.0;
-perturbed.tau_out = 300.0;
-perturbed.inner_integral_fraction = 0.00;
-perturbed.inner_xi_leak = 1.00;
+perturbed.tau_in = 1;
+perturbed.tau_out = 15.0;
+perturbed.inner_integral_fraction = 0.4;
+perturbed.inner_xi_leak = 1;
 
 fprintf('[op] B0=%d B_max=%d lambda_mean=%.2f q0=%.2f L_target=%.2f\n', ...
     perturbed.B0, perturbed.B_max, perturbed.lambda_mean, perturbed.q0, perturbed.L_mean_target);
@@ -75,8 +75,9 @@ beta = max(perturbed.beta, 1e-3);
 
 % Inner loop, Chapter 2 form over carry-over backlog:
 %   q[k+1] = q[k] + arrivals[k] - B[k]
-%   B[k] = arrivals[k] + K_q*(q[k] - q_ref[k]) + integral trim
-% so the direct backlog plant gain from B to q is one request/request.
+%   B[k] = B0 + K_q*(q[k] - q_ref[k]) + integral trim
+% There is deliberately no arrival feedforward: the lesson is that the
+% inner feedback loop must learn the required batch size around B0.
 rho_in = exp(-dt / perturbed.tau_in);
 K_q = (1 - rho_in);
 K_i_q = perturbed.inner_integral_fraction * K_q;
@@ -92,14 +93,14 @@ if abs(K_i_q) < 1e-12
     xi_q_min = 0;
     xi_q_max = 0;
 else
-    xi_q_max = (perturbed.B_max - B0) / abs(K_i_q);
-    xi_q_min = -(B0 - perturbed.B_min) / abs(K_i_q);
+    xi_q_min = -(perturbed.B_max - B0) / abs(K_i_q);
+    xi_q_max = (B0 - perturbed.B_min) / abs(K_i_q);
 end
 xi_l_max = (perturbed.q_max - q0) / max(abs(K_i_l), 1e-9);
 xi_l_min = -(q0 - perturbed.q_min) / max(abs(K_i_l), 1e-9);
 
 fprintf('Inner B->q: backlog gain=1.0000 K_q=%.6f K_i_q=%.6f rho=%.4f\n', K_q, K_i_q, rho_in);
-fprintf('  sign convention: q[k+1] = q[k] + arrivals[k] - B[k]\n');
+fprintf('  sign convention: q[k+1] = q[k] + arrivals[k] - B[k], no arrival feedforward\n');
 fprintf('Outer q_ref->L_mean: beta=%.4f K_i_l=%.6f rho=%.4f\n', beta, K_i_l, rho_out);
 
 controller = struct();

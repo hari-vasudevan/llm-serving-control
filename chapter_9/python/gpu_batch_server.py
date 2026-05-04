@@ -432,7 +432,7 @@ class Plant:
                 xi_q_leak = _clamp(float(inner.get("xi_leak", 1.0)), 0.0, 1.0)
                 xi_q_trial = _clamp(xi_q_leak * xi_q + e_q, float(inner["xi_min"]), float(inner["xi_max"]))
                 b_unsat = (
-                    float(arrivals)
+                    float(inner["B0"])
                     + float(inner["K_q"]) * (q - q_ref)
                     - float(inner["K_i_q"]) * xi_q_trial
                 )

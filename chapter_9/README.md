@@ -221,13 +221,13 @@ The current working controller uses a physically trackable inner state:
 
 ```text
 q[k] = carry-over backlog after the previous dispatch
-B[k] = arrivals[k] + K_q * (q[k] - q_ref[k])
+B[k] = B0 + K_q * (q[k] - q_ref[k]) - K_i_q * xi_q[k]
 ```
 
-The arrival feedforward term is important.  Without it, the inner integral
-tries to discover the load and can look like it is directly regulating
-latency.  With feedforward, `B` follows arrivals plus a small backlog
-correction, and `q` tracks `q_ref` cleanly.
+There is deliberately no arrival feedforward in this teaching version.
+That makes the inner loop slower, but it keeps the experiment faithful to
+the Chapter 2 cascade structure: `B` is a direct actuator and the inner
+feedback controller must discover the batch size required to hold `q`.
 
 For the current demonstration operating point:
 
@@ -239,10 +239,10 @@ L_mean_target = 300 ms
 B_max_effective = 2400
 ```
 
-The inner integral is disabled in this version:
+The inner loop therefore uses a small integral term:
 
 ```text
-K_i_q = 0
+K_i_q > 0
 ```
 
 The result is the expected Chapter 2 split:
