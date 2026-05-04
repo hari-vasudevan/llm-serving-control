@@ -18,7 +18,7 @@ The experiment keeps the Chapter 2 controller vocabulary:
 - inner loop: `B -> q`
 - outer loop: `q_ref -> L_mean`
 - actuator: `B[k]`, the commanded batch size
-- plant state: `q[k]`, the FIFO queue depth
+- plant state: `q[k]`, the carry-over FIFO backlog after dispatch
 - outer-loop output: `L_mean[k]`, measured request latency
 - optional output: `L_p95[k]`, rolling measured p95 latency
 - arrivals: `lambda[k]`, sampled arrivals per control tick
@@ -34,7 +34,11 @@ L_p95[k] = L_mean[k] + 1.645*delta/sqrt(B[k])
 ```
 
 Chapter 9 identifies the corresponding quantities from a real GPU batch
-workload instead of assuming them.
+workload instead of assuming them.  In the final closed-loop version, the
+inner-loop `q` is deliberately the carry-over backlog after dispatch
+(`q_after`), not the pre-dispatch queue.  The pre-dispatch queue includes the
+current tick's arrivals and therefore has a moving arrival floor; using it as
+`q` made `q_ref` physically untrackable.
 
 ## Architecture
 
@@ -57,9 +61,10 @@ The scheduler is deliberately ticked, not eager:
 
 ```text
 once per DT:
+    inject lambda[k] arrivals
     pop up to B[k] jobs from FIFO
     run one GPU batch
-    leave the remainder in q[k]
+    leave the remainder as carry-over backlog q[k+1]
 ```
 
 This is important.  If the worker drains continuously, `B` becomes only a
@@ -142,6 +147,11 @@ POST /controller_config
 The Modal container therefore picks up the locally computed Chapter 2
 coefficients without needing access to the local filesystem.
 
+The closed-loop run is Modal-side.  MATLAB uploads the controller and asks
+Modal to execute the timed experiment; Modal owns the arrival generator,
+metrics snapshot, scheduler, and GPU dispatch.  This avoids MATLAB/network
+round trips becoming part of the control clock.
+
 For a local CPU smoke test only:
 
 ```bash
@@ -205,6 +215,56 @@ cascade theory is not matching the real scheduling plant.  If it is positive
 here but not in Chapter 8, then Chapter 8 failed because the top-level serving
 stack hid the plant, not because the cascade idea was wrong.
 
+## Final Closed-Loop Structure
+
+The current working controller uses a physically trackable inner state:
+
+```text
+q[k] = carry-over backlog after the previous dispatch
+B[k] = arrivals[k] + K_q * (q[k] - q_ref[k])
+```
+
+The arrival feedforward term is important.  Without it, the inner integral
+tries to discover the load and can look like it is directly regulating
+latency.  With feedforward, `B` follows arrivals plus a small backlog
+correction, and `q` tracks `q_ref` cleanly.
+
+For the current demonstration operating point:
+
+```text
+B0 = 1200
+lambda0 = 1200 arrivals/tick
+q0 = 600 carry-over requests
+L_mean_target = 300 ms
+B_max_effective = 2400
+```
+
+The inner integral is disabled in this version:
+
+```text
+K_i_q = 0
+```
+
+The result is the expected Chapter 2 split:
+
+- the inner loop tracks `q_ref` with the controllable backlog state,
+- the outer loop moves `q_ref` slowly in response to measured latency,
+- `B` remains an exact GPU batch-size actuator.
+
+One remaining modeling caveat is that total latency is not only a function of
+backlog.  It also contains a service-time term that changes with batch size and
+arrival regime:
+
+```text
+L_mean ~= queue_wait(q) + service(B)
+```
+
+So the final Chapter 9 lesson is slightly sharper than the original plan:
+the lower-level GPU experiment validates the inner `B -> q` scheduler plant
+once `q` is defined as carry-over backlog, while the outer `q_ref -> L_mean`
+model should account for service-time variation instead of treating total
+latency as a pure queue-depth output.
+
 ## Operating Point Selection
 
 The useful actuator range stops when larger `B` no longer increases
@@ -216,8 +276,8 @@ B_max_effective = first B with completions >= 98% of max(completions)
 
 For the current Modal T4 workload this has been around `B = 2400`; `B = 3200`
 does not materially improve drain rate and should not be used as the controller
-upper limit.  The controller still uses the Chapter 2 sign convention:
+upper limit.  The closed-loop controller uses the carry-over backlog dynamics:
 
 ```text
-dq[k+1] = dq[k] - beta_q*dB[k], beta_q > 0
+q[k+1] = q[k] + arrivals[k] - B[k]
 ```
