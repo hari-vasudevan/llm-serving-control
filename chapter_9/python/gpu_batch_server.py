@@ -394,6 +394,8 @@ class Plant:
         for seg in segments:
             label = str(seg.get("label", "segment"))
             lam = float(seg["lambda"])
+            l_target = float(seg.get("L_mean_target", outer["L_mean_target"]))
+            l_p95_target = float(seg.get("L_p95_target", outer["L_p95_target"]))
             n_ticks = int(seg["ticks"])
             for _ in range(n_ticks):
                 tick += 1
@@ -402,18 +404,18 @@ class Plant:
                 comps = _metric_or_default(m, "completions_tick", 0.0)
                 if not have_batch_measurement and comps <= 0:
                     q = float(outer["q0"])
-                    l_mean = float(outer["L_mean_target"])
-                    l_p95 = float(outer["L_p95_target"])
+                    l_mean = l_target
+                    l_p95 = l_p95_target
                     service_ms = float("nan")
                 else:
                     have_batch_measurement = True
                     last_batch = m.get("last_batch") if isinstance(m.get("last_batch"), dict) else {}
                     q = _metric_or_default(last_batch, "q_after", float(outer["q0"]))
-                    l_mean = _metric_or_default(m, "l_mean_ms", float(outer["L_mean_target"]))
-                    l_p95 = _metric_or_default(m, "l_p95_ms", float(outer["L_p95_target"]))
+                    l_mean = _metric_or_default(m, "l_mean_ms", l_target)
+                    l_p95 = _metric_or_default(m, "l_p95_ms", l_p95_target)
                     service_ms = _metric_or_default(m, "service_mean_ms", float("nan"))
 
-                e_l = float(outer["L_mean_target"]) - l_mean
+                e_l = l_target - l_mean
                 xi_l_trial = _clamp(xi_l + e_l, float(outer["xi_min"]), float(outer["xi_max"]))
                 q_ref_trial = _clamp(
                     float(outer["q0"]) + float(outer["K_i_l"]) * xi_l_trial,
@@ -451,6 +453,7 @@ class Plant:
                     "tick": tick,
                     "label": label,
                     "lambda": lam,
+                    "L_target": l_target,
                     "arrivals": arrivals,
                     "q": q,
                     "q_ref": q_ref,

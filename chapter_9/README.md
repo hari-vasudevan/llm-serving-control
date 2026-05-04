@@ -251,6 +251,11 @@ The result is the expected Chapter 2 split:
 - the outer loop moves `q_ref` slowly in response to measured latency,
 - `B` remains an exact GPU batch-size actuator.
 
+The closed-loop runner can also exercise outer-loop reference changes.  Each
+segment may provide `L_mean_target` / `L_p95_target`, so the default script
+tests both load steps and a +/-25% latency-reference schedule.  MATLAB logs a
+per-segment latency MAE, latency bias, and completion ratio after each run.
+
 One remaining modeling caveat is that total latency is not only a function of
 backlog.  It also contains a service-time term that changes with batch size and
 arrival regime:
