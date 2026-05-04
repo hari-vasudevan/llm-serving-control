@@ -14,7 +14,7 @@ fprintf('=== Chapter 9 Cascade Design ===\n');
 % characterization, but the closed-loop demo should not sit next to B_max.
 DEMO_B0 = 1200;
 DEMO_LAMBDA_NOMINAL = 1200;
-DEMO_Q0 = 1800;
+DEMO_Q0 = 600;
 DEMO_L_MEAN_TARGET = 300;
 if exist('LAMBDA_SWEEP', 'var') && exist('qmean_lambda', 'var') && exist('lmean_lambda', 'var')
     [~, demo_idx] = min(abs(LAMBDA_SWEEP - DEMO_LAMBDA_NOMINAL));
@@ -41,12 +41,12 @@ perturbed.L_mean_target = L_mean_target;
 perturbed.L_p95_target = L_p95_target;
 perturbed.B_min = B_min;
 perturbed.B_max = B_max;
-perturbed.q_min = max(Q_REF_MIN, lambda_mean);
+perturbed.q_min = Q_REF_MIN;
 perturbed.q_max = Q_MAX;
 perturbed.tau_in = 1.0;
 perturbed.tau_out = 300.0;
-perturbed.inner_integral_fraction = 0.60;
-perturbed.inner_xi_leak = 0.85;
+perturbed.inner_integral_fraction = 0.00;
+perturbed.inner_xi_leak = 1.00;
 
 fprintf('[op] B0=%d B_max=%d lambda_mean=%.2f q0=%.2f L_target=%.2f\n', ...
     perturbed.B0, perturbed.B_max, perturbed.lambda_mean, perturbed.q0, perturbed.L_mean_target);
@@ -71,14 +71,14 @@ function controller = design_cascade(perturbed)
 B0 = perturbed.B0;
 q0 = perturbed.q0;
 dt = perturbed.dt;
-beta_q = max(perturbed.beta_q, 1e-3);
 beta = max(perturbed.beta, 1e-3);
 
-% Inner loop, Chapter 2 form:
-%   dq[k+1] = dq[k] - beta_q*dB[k]
-%   dB[k] = -K_q*dq[k] - K_i_q*xi_q[k]
+% Inner loop, Chapter 2 form over carry-over backlog:
+%   q[k+1] = q[k] + arrivals[k] - B[k]
+%   B[k] = arrivals[k] + K_q*(q[k] - q_ref[k]) + integral trim
+% so the direct backlog plant gain from B to q is one request/request.
 rho_in = exp(-dt / perturbed.tau_in);
-K_q = (1 - rho_in) / beta_q;
+K_q = (1 - rho_in);
 K_i_q = perturbed.inner_integral_fraction * K_q;
 
 % Outer loop, Chapter 2 static-gain form:

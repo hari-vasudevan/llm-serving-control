@@ -381,7 +381,7 @@ class Plant:
 
         self.reset()
         self.set_B(round(float(inner["B0"])))
-        initial_backlog = int(round(max(0.0, float(outer["q0"]) - lambda_mean)))
+        initial_backlog = int(round(max(0.0, float(outer["q0"]))))
         if initial_backlog > 0:
             self.enqueue(initial_backlog, "closed_loop_initial_backlog")
         xi_q = 0.0
@@ -407,7 +407,8 @@ class Plant:
                     service_ms = float("nan")
                 else:
                     have_batch_measurement = True
-                    q = _metric_or_default(m, "q_mean_tick", float(outer["q0"]))
+                    last_batch = m.get("last_batch") if isinstance(m.get("last_batch"), dict) else {}
+                    q = _metric_or_default(last_batch, "q_after", float(outer["q0"]))
                     l_mean = _metric_or_default(m, "l_mean_ms", float(outer["L_mean_target"]))
                     l_p95 = _metric_or_default(m, "l_p95_ms", float(outer["L_p95_target"]))
                     service_ms = _metric_or_default(m, "service_mean_ms", float("nan"))
@@ -426,11 +427,12 @@ class Plant:
                     xi_l = xi_l_trial
                     q_ref = q_ref_trial
 
+                arrivals = int(rng.poisson(lam))
                 e_q = q_ref - q
                 xi_q_leak = _clamp(float(inner.get("xi_leak", 1.0)), 0.0, 1.0)
                 xi_q_trial = _clamp(xi_q_leak * xi_q + e_q, float(inner["xi_min"]), float(inner["xi_max"]))
                 b_unsat = (
-                    float(inner["B0"])
+                    float(arrivals)
                     + float(inner["K_q"]) * (q - q_ref)
                     - float(inner["K_i_q"]) * xi_q_trial
                 )
@@ -442,7 +444,6 @@ class Plant:
                     xi_q = xi_q_trial
 
                 self.set_B(b_cmd)
-                arrivals = int(rng.poisson(lam))
                 self.enqueue(arrivals, f"closed_loop_tick_{tick:03d}")
                 self._dispatch_once()
 
