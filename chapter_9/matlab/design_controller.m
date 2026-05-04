@@ -14,15 +14,17 @@ fprintf('=== Chapter 9 Cascade Design ===\n');
 % characterization, but the closed-loop demo should not sit next to B_max.
 DEMO_B0 = 1200;
 DEMO_LAMBDA_NOMINAL = 1200;
+DEMO_Q0 = 1800;
+DEMO_L_MEAN_TARGET = 300;
 if exist('LAMBDA_SWEEP', 'var') && exist('qmean_lambda', 'var') && exist('lmean_lambda', 'var')
     [~, demo_idx] = min(abs(LAMBDA_SWEEP - DEMO_LAMBDA_NOMINAL));
     B0 = DEMO_B0;
     lambda_mean = LAMBDA_SWEEP(demo_idx);
-    q0 = qmean_lambda(demo_idx);
-    L_mean_target = lmean_lambda(demo_idx);
-    L_p95_target = lp95_lambda(demo_idx);
-    fprintf('[demo op] overriding saved op to B0=%d lambda0=%.2f using characterization point index %d\n', ...
-        B0, lambda_mean, demo_idx);
+    q0 = DEMO_Q0;
+    L_mean_target = DEMO_L_MEAN_TARGET;
+    L_p95_target = DEMO_L_MEAN_TARGET;
+    fprintf('[demo op] overriding saved op to B0=%d lambda0=%.2f q0=%.2f L_target=%.2f using characterization point index %d\n', ...
+        B0, lambda_mean, q0, L_mean_target, demo_idx);
 end
 
 perturbed = struct();
@@ -39,7 +41,7 @@ perturbed.L_mean_target = L_mean_target;
 perturbed.L_p95_target = L_p95_target;
 perturbed.B_min = B_min;
 perturbed.B_max = B_max;
-perturbed.q_min = max(Q_REF_MIN, q0);
+perturbed.q_min = max(Q_REF_MIN, lambda_mean);
 perturbed.q_max = Q_MAX;
 perturbed.tau_in = 1.0;
 perturbed.tau_out = 300.0;

@@ -381,6 +381,9 @@ class Plant:
 
         self.reset()
         self.set_B(round(float(inner["B0"])))
+        initial_backlog = int(round(max(0.0, float(outer["q0"]) - lambda_mean)))
+        if initial_backlog > 0:
+            self.enqueue(initial_backlog, "closed_loop_initial_backlog")
         xi_q = 0.0
         xi_l = 0.0
         q_ref = float(outer["q0"])
