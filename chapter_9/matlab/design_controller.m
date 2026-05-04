@@ -43,8 +43,8 @@ perturbed.B_min = B_min;
 perturbed.B_max = B_max;
 perturbed.q_min = Q_REF_MIN;
 perturbed.q_max = Q_MAX;
-perturbed.tau_in = 1;
-perturbed.tau_out = 15.0;
+perturbed.tau_in = 0.25;
+perturbed.tau_out = 7.5;
 perturbed.inner_integral_fraction = 0.4;
 perturbed.inner_xi_leak = 1;
 

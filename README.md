@@ -16,6 +16,7 @@ A blog series applying classical control theory to LLM inference serving systems
 | [Chapter 6](chapter_6/) | Intel Mac queue server (qwen2.5:0.5b) | Single-loop integral on TTFT | Real FIFO queue server — requests genuinely wait; key lesson: l_total = queue_wait + TTFT, must use TTFT-only signal for stable control; CPU machine cannot support cascade |
 | [Chapter 7](chapter_7/) | Modal + native vLLM on NVIDIA GPU | Remote single-loop / characterization | Remote GPU serving path works, but serverless/runtime effects hide a clean native queue signal; motivates a wrapper-based attempt |
 | [Chapter 8](chapter_8/) | Modal wrapper queue + vLLM on NVIDIA GPU | MATLAB cascade attempt | End-to-end remote cascade plumbing works, but top-level LLM latency does not expose a trustworthy Chapter 2 outer plant; pivot to lower-level GPU batching for Chapter 9 |
+| [Chapter 9](chapter_9/) | Modal lower-level GPU batching plant | Chapter 2 cascade (inner: B→q, outer: q_ref→L_mean) | Success — exact batch-size actuator, real carry-over backlog state, and measured GPU batch service expose the cascade plant cleanly |
 
 ---
 
@@ -36,10 +37,11 @@ Chapter 6: Real queue server (Intel Mac)
     MATLAB controller ──► queue_server.py HTTP ──► Ollama ──► CPU
     (controller on M-Mac, server on Intel Mac at 192.168.68.106:8002)
 
-Chapter 7–8: Remote GPU serving on Modal
+Chapter 7–9: Remote GPU experiments on Modal
     MATLAB controller ──► Modal wrapper / vLLM ──► NVIDIA GPU
     Chapter 7: native remote serving characterization
     Chapter 8: wrapper queue + MATLAB cascade attempt
+    Chapter 9: lower-level GPU batching plant with exact B actuator
 ```
 
 ---
@@ -66,19 +68,21 @@ That negative slope is a warning that top-level request latency is not exposing 
 
 ---
 
-## Next: Chapter 9
+**Ch9:** Moving one level down to a fixed GPU tensor workload exposes the Chapter 2 plant directly. Batch size `B` is an exact actuator, `q` is the carry-over FIFO backlog after dispatch, and service time is measured per batch. The no-feedforward cascade regulates latency using the inner `B -> q` loop and the outer `q_ref -> L_mean` loop.
 
-Chapter 9 should pivot away from top-level HTTP LLM latency and toward a
-lower-level GPU batching experiment:
+![Chapter 9 closed-loop cascade](chapter_9/matlab/ch9_closed_loop.png)
 
-- fixed model, prompt length, and output length,
-- software queue outside the model runtime,
-- exact batch-size control `B[k]`,
-- direct measurement of batch service time,
-- explicit queue evolution and completion latency.
+![Chapter 9 open-loop characterisation](chapter_9/matlab/ch9_characterise.png)
 
-That setup should match the Chapter 1/2 equations much more faithfully than a
-whole-serving-stack latency experiment.
+---
+
+## Next: Chapter 10
+
+Chapter 9 validates the lower-level GPU scheduling plant.  Chapter 10 can now
+build on that result rather than fighting the top-level serving stack: either
+extend the plant model to include the service-time term explicitly, or move
+back upward with a clearer definition of which latency component should be
+controlled.
 
 ---
 
@@ -119,6 +123,12 @@ chapter_7/          Modal native vLLM remote experiment
 chapter_8/          Modal wrapper queue + MATLAB cascade attempt
   modal_vllm_wrapper.py
   remote/
+  matlab/
+  README.md
+
+chapter_9/          Modal lower-level GPU batching cascade
+  modal_gpu_batch_server.py
+  python/
   matlab/
   README.md
 ```

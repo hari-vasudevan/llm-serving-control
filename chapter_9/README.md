@@ -96,6 +96,13 @@ This removes:
   Chapter 2-style cascade controller design.
 - `matlab/run_cascade_controller.m`
   Closed-loop test with steady load and arrival spikes.
+- `matlab/ch9_characterise.png`
+  Final open-loop plant characterisation plot.
+- `matlab/ch9_closed_loop.png`
+  Final closed-loop cascade run with staggered load and latency-reference
+  changes.
+- `matlab/ch9_closed_loop_1.png`
+  Earlier closed-loop reference run retained for comparison.
 
 ## Run Flow
 
@@ -255,6 +262,39 @@ The closed-loop runner can also exercise outer-loop reference changes.  Each
 segment may provide `L_mean_target` / `L_p95_target`, so the default script
 tests both load steps and a +/-25% latency-reference schedule.  MATLAB logs a
 per-segment latency MAE, latency bias, and completion ratio after each run.
+
+The final tuning used for the saved run is:
+
+```text
+tau_in = 0.25
+tau_out = 7.5
+inner_integral_fraction = 0.4
+inner_xi_leak = 1.0
+```
+
+## Final Results
+
+### Open-Loop Characterisation
+
+![Chapter 9 open-loop characterisation](matlab/ch9_characterise.png)
+
+The characterisation identifies the useful actuator range, the negative
+`B -> q` relationship expected from a drain-rate actuator, the positive
+`q -> L_mean` relationship needed by the Chapter 2 cascade, and the GPU batch
+service-time curve.
+
+### Closed-Loop Cascade Performance
+
+![Chapter 9 closed-loop cascade](matlab/ch9_closed_loop.png)
+
+The final closed-loop run uses no arrival feedforward.  `B` is commanded
+directly by the inner `B -> q` loop, while the outer loop moves `q_ref` to
+track `L_mean` targets.  Load changes and latency-reference changes are
+staggered so their effects can be read separately.
+
+### Reference Closed-Loop Run
+
+![Chapter 9 reference closed-loop cascade](matlab/ch9_closed_loop_1.png)
 
 One remaining modeling caveat is that total latency is not only a function of
 backlog.  It also contains a service-time term that changes with batch size and
