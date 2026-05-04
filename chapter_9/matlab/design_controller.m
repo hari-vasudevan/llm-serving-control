@@ -88,13 +88,18 @@ K_i_q = perturbed.inner_integral_fraction * K_q;
 rho_out = exp(-dt / perturbed.tau_out);
 K_i_l = (1 - rho_out) / beta;
 
-xi_q_max = (perturbed.B_max - B0) / max(abs(K_i_q), 1e-9);
-xi_q_min = -(B0 - perturbed.B_min) / max(abs(K_i_q), 1e-9);
+if abs(K_i_q) < 1e-12
+    xi_q_min = 0;
+    xi_q_max = 0;
+else
+    xi_q_max = (perturbed.B_max - B0) / abs(K_i_q);
+    xi_q_min = -(B0 - perturbed.B_min) / abs(K_i_q);
+end
 xi_l_max = (perturbed.q_max - q0) / max(abs(K_i_l), 1e-9);
 xi_l_min = -(q0 - perturbed.q_min) / max(abs(K_i_l), 1e-9);
 
-fprintf('Inner B->q: beta_q=%.4f K_q=%.6f K_i_q=%.6f rho=%.4f\n', beta_q, K_q, K_i_q, rho_in);
-fprintf('  sign convention: dq[k+1] = dq[k] - beta_q*dB[k]\n');
+fprintf('Inner B->q: backlog gain=1.0000 K_q=%.6f K_i_q=%.6f rho=%.4f\n', K_q, K_i_q, rho_in);
+fprintf('  sign convention: q[k+1] = q[k] + arrivals[k] - B[k]\n');
 fprintf('Outer q_ref->L_mean: beta=%.4f K_i_l=%.6f rho=%.4f\n', beta, K_i_l, rho_out);
 
 controller = struct();
