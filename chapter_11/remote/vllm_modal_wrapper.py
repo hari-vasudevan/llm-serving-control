@@ -77,6 +77,7 @@ METRICS_URL = "http://127.0.0.1:8001/metrics"
 HEALTH_URL = "http://127.0.0.1:8001/health"
 API_KEY = ""
 CONTROL_FILE = "/tmp/ch11_scheduler_control.json"
+STATUS_FILE = "/tmp/ch11_scheduler_status.json"
 LAST_CONTROL_SOURCE = "startup"
 LAST_CONTROL_TS = ""
 QUEUE_AREA = 0.0
@@ -97,6 +98,7 @@ PROXY_LAT_BUF = collections.deque(maxlen=1000)
 PROXY_TTFT_BUF = collections.deque(maxlen=1000)
 PROXY_ERRORS = 0
 NVML_HANDLE = None
+CONTROL_WRITE_LOCK = threading.Lock()
 
 
 def log(message):
@@ -169,6 +171,31 @@ def gpu_snapshot():
         return {"gpu_power_error": str(exc)}
 
 
+def scheduler_status():
+    try:
+        with open(STATUS_FILE) as f:
+            payload = json.load(f)
+        return {
+            "scheduler_mode": payload.get("mode"),
+            "scheduler_admission_fraction": payload.get("admission_fraction"),
+            "scheduler_token_cap": payload.get("token_cap"),
+            "scheduler_running_cap": payload.get("running_cap"),
+            "scheduler_target_ttft_ms": payload.get("target_ttft_ms"),
+            "scheduler_measured_ttft_ms": payload.get("measured_ttft_ms"),
+            "scheduler_xi": payload.get("xi"),
+        }
+    except Exception:
+        return {}
+
+
+def write_scheduler_control(payload):
+    with CONTROL_WRITE_LOCK:
+        tmp = CONTROL_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, CONTROL_FILE)
+
+
 def metric_delta_mean_ms(before, after, stem):
     d_sum = after.get(f"{stem}_sum", 0.0) - before.get(f"{stem}_sum", 0.0)
     d_count = after.get(f"{stem}_count", 0.0) - before.get(f"{stem}_count", 0.0)
@@ -228,8 +255,7 @@ def run_internal_budget_sweep(body):
             "source": "run_internal_budget_sweep",
             "timestamp": datetime.now().isoformat(),
         }
-        with open(CONTROL_FILE, "w") as f:
-            json.dump(control, f)
+        write_scheduler_control(control)
         log(f"internal budget sweep set scheduler control {CONTROL_FILE}: {control}")
         time.sleep(float(body.get("settle_s", 2.0)))
 
@@ -490,6 +516,7 @@ def build_metrics():
         "timestamp": datetime.now().isoformat(),
     }
     metrics.update(power)
+    metrics.update(scheduler_status())
     return metrics
 
 

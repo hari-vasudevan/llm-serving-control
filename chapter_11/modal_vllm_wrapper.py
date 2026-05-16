@@ -33,6 +33,7 @@ image = (
             "CH11_SCHEDULER_ENABLED": "1",
             "CH11_CONTROL_MODE": "open_loop",
             "CH11_CONTROL_FILE": "/tmp/ch11_scheduler_control.json",
+            "CH11_STATUS_FILE": "/tmp/ch11_scheduler_status.json",
         }
     )
     .add_local_file(
