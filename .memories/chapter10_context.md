@@ -1109,3 +1109,59 @@ on branch chapter-10-experimental-not-for-merge-yet.
 
 All code edits should happen here. Push back to origin when ready to
 deploy via Modal from either checkout.
+
+## Session 2 Experimental Results (May 16 2026, continued)
+
+### Token Budget Cap Actuator Works
+
+Confirmed: temporarily capping self.max_num_scheduled_tokens and
+self.max_num_running_reqs before super().schedule() has a real, measurable
+effect on vLLM behavior. At kp=0.5 with target=100ms, the system starved
+(98% error rate, GPU power dropped from 59W to 26W). With kp=0.15, at
+qps=30 the controlled case showed TTFT p95 jumping from 93ms to 1060ms
+in one run.
+
+### Key Finding: Feedback Signal Mismatch
+
+The controller PI loop measures mean_wait_ms from vLLM's internal waiting
+queue (self.waiting). But with continuous batching, vLLM admits requests
+from the waiting queue every step (every few ms). The token budget cap
+does not cause requests to accumulate in the waiting queue — instead it
+forces prefill to be chunked into smaller pieces, increasing TTFT.
+
+Result: the controller's error signal stays at e_norm=1.0 (full error)
+because mean_wait_ms never rises from 0. The integrator saturates at the
+clamp limit. The controller runs open-loop at a fixed fraction determined
+by the integrator ceiling.
+
+This is a fundamental feedback gap: the actuator (token budget) affects
+the output (TTFT, throughput) through prefill chunking, not through
+queue wait. The measurement (waiting queue time) is not the right
+feedback variable.
+
+### Options to Fix the Feedback Loop
+
+Option 1: Change the feedback variable to top-level TTFT. The wrapper
+already measures TTFT per request. Write it to the control file or a
+shared metric that the scheduler can read. The PI loop would then
+target mean TTFT instead of mean queue wait.
+
+Option 2: Use the wrapper-level admission queue as the actuator (Path B).
+The wrapper holds requests in a FIFO before forwarding to vLLM. The
+controller adjusts the release rate. This gives a clean feedback loop
+(measure wrapper queue wait, actuate release rate) but is not lowest-layer.
+
+Option 3: Measure something that the scheduler CAN see. The scheduler
+knows how many tokens are in the running batch (running request count ×
+avg tokens). It could target a running-batch-size setpoint instead of a
+queue-wait setpoint. This is effectively load shedding via batch size
+control.
+
+### Current Gain Settings
+
+Default gains in controlled_scheduler.py:
+  kp = 0.15 (env CH10_QUEUE_KP)
+  ki = 0.02 (env CH10_QUEUE_KI)
+Normalized error: e_norm = (target - measured) / target
+Conditional integration with clamp [-10, 10]
+Fraction floor: 0.01, ceiling: 1.0

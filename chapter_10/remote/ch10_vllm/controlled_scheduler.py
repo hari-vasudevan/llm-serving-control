@@ -197,7 +197,7 @@ class ControlledScheduler(DefaultScheduler):
         if at_ceiling and e_norm < 0:  # want to go higher but already at ceiling
             should_integrate = False
         if should_integrate:
-            self._xi = _clamp(self._xi + e_norm * dt, -10.0, 10.0)
+            self._xi = _clamp(self._xi + e_norm * dt, -40.0, 40.0)
 
         # kp and ki now operate on the normalized error, producing a
         # direct change in fraction. kp=0.15 means full normalized error
