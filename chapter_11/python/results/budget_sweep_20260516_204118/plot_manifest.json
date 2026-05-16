@@ -1,0 +1,13 @@
+[
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/phase1_dashboard.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/ttft_mean_ms.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/ttft_p95_ms.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/total_mean_ms.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/total_p95_ms.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/throughput_req_s.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/gpu_power_mean_w.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/gpu_power_peak_w.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/energy_per_request_j.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/error_rate.svg",
+  "chapter_11/python/results/budget_sweep_20260516_204118/plots/vllm_queue_wait_mean_ms.svg"
+]

@@ -1,0 +1,262 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1050" viewBox="0 0 1400 1050">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="32" y="42" font-size="28" font-family="Arial" font-weight="700">Chapter 11 Phase 1: Token-Budget Plant Curves</text>
+<g transform="translate(0,70)">
+<text x="72" y="24" font-size="20" font-family="Arial" font-weight="700" fill="#111827">Mean TTFT</text>
+<text x="72" y="332" font-size="13" font-family="Arial" fill="#374151">admission_fraction</text>
+<text x="18" y="36" font-size="13" font-family="Arial" fill="#374151">ms</text>
+<line x1="72" y1="292.0" x2="665" y2="292.0" stroke="#e5e7eb"/>
+<text x="62" y="296.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">62.0</text>
+<line x1="72" y1="243.2" x2="665" y2="243.2" stroke="#e5e7eb"/>
+<text x="62" y="247.2" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">181</text>
+<line x1="72" y1="194.4" x2="665" y2="194.4" stroke="#e5e7eb"/>
+<text x="62" y="198.4" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">300</text>
+<line x1="72" y1="145.6" x2="665" y2="145.6" stroke="#e5e7eb"/>
+<text x="62" y="149.6" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">419</text>
+<line x1="72" y1="96.8" x2="665" y2="96.8" stroke="#e5e7eb"/>
+<text x="62" y="100.8" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">538</text>
+<line x1="72" y1="48.0" x2="665" y2="48.0" stroke="#e5e7eb"/>
+<text x="62" y="52.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">658</text>
+<line x1="72.0" y1="48" x2="72.0" y2="292" stroke="#f3f4f6"/>
+<text x="72.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.05</text>
+<line x1="103.2" y1="48" x2="103.2" y2="292" stroke="#f3f4f6"/>
+<text x="103.2" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.1</text>
+<line x1="196.8" y1="48" x2="196.8" y2="292" stroke="#f3f4f6"/>
+<text x="196.8" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.25</text>
+<line x1="352.9" y1="48" x2="352.9" y2="292" stroke="#f3f4f6"/>
+<text x="352.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.5</text>
+<line x1="508.9" y1="48" x2="508.9" y2="292" stroke="#f3f4f6"/>
+<text x="508.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.75</text>
+<line x1="665.0" y1="48" x2="665.0" y2="292" stroke="#f3f4f6"/>
+<text x="665.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">1</text>
+<rect x="72" y="48" width="593" height="244" fill="none" stroke="#9ca3af"/>
+<polyline points="665.0,275.2 508.9,269.3 352.9,267.2 196.8,268.9 103.2,190.2 72.0,64.8" fill="none" stroke="#2563eb" stroke-width="3"/>
+<circle cx="665.0" cy="275.2" r="5" fill="#2563eb"/>
+<text x="665.0" y="265.2" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">103</text>
+<circle cx="508.9" cy="269.3" r="5" fill="#2563eb"/>
+<text x="508.9" y="259.3" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">117</text>
+<circle cx="352.9" cy="267.2" r="5" fill="#2563eb"/>
+<text x="352.9" y="257.2" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">122</text>
+<circle cx="196.8" cy="268.9" r="5" fill="#2563eb"/>
+<text x="196.8" y="258.9" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">118</text>
+<circle cx="103.2" cy="190.2" r="5" fill="#2563eb"/>
+<text x="103.2" y="180.2" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">310</text>
+<circle cx="72.0" cy="64.8" r="5" fill="#2563eb"/>
+<text x="72.0" y="54.8" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">617</text>
+</g>
+<g transform="translate(700,70)">
+<text x="72" y="24" font-size="20" font-family="Arial" font-weight="700" fill="#111827">Mean Total Latency</text>
+<text x="72" y="332" font-size="13" font-family="Arial" fill="#374151">admission_fraction</text>
+<text x="18" y="36" font-size="13" font-family="Arial" fill="#374151">ms</text>
+<line x1="72" y1="292.0" x2="665" y2="292.0" stroke="#e5e7eb"/>
+<text x="62" y="296.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1651</text>
+<line x1="72" y1="243.2" x2="665" y2="243.2" stroke="#e5e7eb"/>
+<text x="62" y="247.2" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1701</text>
+<line x1="72" y1="194.4" x2="665" y2="194.4" stroke="#e5e7eb"/>
+<text x="62" y="198.4" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1752</text>
+<line x1="72" y1="145.6" x2="665" y2="145.6" stroke="#e5e7eb"/>
+<text x="62" y="149.6" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1802</text>
+<line x1="72" y1="96.8" x2="665" y2="96.8" stroke="#e5e7eb"/>
+<text x="62" y="100.8" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1853</text>
+<line x1="72" y1="48.0" x2="665" y2="48.0" stroke="#e5e7eb"/>
+<text x="62" y="52.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1903</text>
+<line x1="72.0" y1="48" x2="72.0" y2="292" stroke="#f3f4f6"/>
+<text x="72.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.05</text>
+<line x1="103.2" y1="48" x2="103.2" y2="292" stroke="#f3f4f6"/>
+<text x="103.2" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.1</text>
+<line x1="196.8" y1="48" x2="196.8" y2="292" stroke="#f3f4f6"/>
+<text x="196.8" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.25</text>
+<line x1="352.9" y1="48" x2="352.9" y2="292" stroke="#f3f4f6"/>
+<text x="352.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.5</text>
+<line x1="508.9" y1="48" x2="508.9" y2="292" stroke="#f3f4f6"/>
+<text x="508.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.75</text>
+<line x1="665.0" y1="48" x2="665.0" y2="292" stroke="#f3f4f6"/>
+<text x="665.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">1</text>
+<rect x="72" y="48" width="593" height="244" fill="none" stroke="#9ca3af"/>
+<polyline points="665.0,275.2 508.9,209.8 352.9,76.5 196.8,184.3 103.2,64.8 72.0,148.0" fill="none" stroke="#2563eb" stroke-width="3"/>
+<circle cx="665.0" cy="275.2" r="5" fill="#2563eb"/>
+<text x="665.0" y="265.2" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">1668</text>
+<circle cx="508.9" cy="209.8" r="5" fill="#2563eb"/>
+<text x="508.9" y="199.8" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">1736</text>
+<circle cx="352.9" cy="76.5" r="5" fill="#2563eb"/>
+<text x="352.9" y="66.5" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">1874</text>
+<circle cx="196.8" cy="184.3" r="5" fill="#2563eb"/>
+<text x="196.8" y="174.3" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">1762</text>
+<circle cx="103.2" cy="64.8" r="5" fill="#2563eb"/>
+<text x="103.2" y="54.8" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">1886</text>
+<circle cx="72.0" cy="148.0" r="5" fill="#2563eb"/>
+<text x="72.0" y="138.0" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">1800</text>
+</g>
+<g transform="translate(0,420)">
+<text x="72" y="24" font-size="20" font-family="Arial" font-weight="700" fill="#111827">Throughput</text>
+<text x="72" y="332" font-size="13" font-family="Arial" fill="#374151">admission_fraction</text>
+<text x="18" y="36" font-size="13" font-family="Arial" fill="#374151">req/s</text>
+<line x1="72" y1="292.0" x2="665" y2="292.0" stroke="#e5e7eb"/>
+<text x="62" y="296.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1.69</text>
+<line x1="72" y1="243.2" x2="665" y2="243.2" stroke="#e5e7eb"/>
+<text x="62" y="247.2" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1.82</text>
+<line x1="72" y1="194.4" x2="665" y2="194.4" stroke="#e5e7eb"/>
+<text x="62" y="198.4" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1.96</text>
+<line x1="72" y1="145.6" x2="665" y2="145.6" stroke="#e5e7eb"/>
+<text x="62" y="149.6" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">2.09</text>
+<line x1="72" y1="96.8" x2="665" y2="96.8" stroke="#e5e7eb"/>
+<text x="62" y="100.8" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">2.22</text>
+<line x1="72" y1="48.0" x2="665" y2="48.0" stroke="#e5e7eb"/>
+<text x="62" y="52.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">2.36</text>
+<line x1="72.0" y1="48" x2="72.0" y2="292" stroke="#f3f4f6"/>
+<text x="72.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.05</text>
+<line x1="103.2" y1="48" x2="103.2" y2="292" stroke="#f3f4f6"/>
+<text x="103.2" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.1</text>
+<line x1="196.8" y1="48" x2="196.8" y2="292" stroke="#f3f4f6"/>
+<text x="196.8" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.25</text>
+<line x1="352.9" y1="48" x2="352.9" y2="292" stroke="#f3f4f6"/>
+<text x="352.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.5</text>
+<line x1="508.9" y1="48" x2="508.9" y2="292" stroke="#f3f4f6"/>
+<text x="508.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.75</text>
+<line x1="665.0" y1="48" x2="665.0" y2="292" stroke="#f3f4f6"/>
+<text x="665.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">1</text>
+<rect x="72" y="48" width="593" height="244" fill="none" stroke="#9ca3af"/>
+<polyline points="665.0,64.8 508.9,250.9 352.9,218.5 196.8,105.3 103.2,153.8 72.0,275.2" fill="none" stroke="#2563eb" stroke-width="3"/>
+<circle cx="665.0" cy="64.8" r="5" fill="#2563eb"/>
+<text x="665.0" y="54.8" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">2.31</text>
+<circle cx="508.9" cy="250.9" r="5" fill="#2563eb"/>
+<text x="508.9" y="240.9" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">1.80</text>
+<circle cx="352.9" cy="218.5" r="5" fill="#2563eb"/>
+<text x="352.9" y="208.5" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">1.89</text>
+<circle cx="196.8" cy="105.3" r="5" fill="#2563eb"/>
+<text x="196.8" y="95.3" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">2.20</text>
+<circle cx="103.2" cy="153.8" r="5" fill="#2563eb"/>
+<text x="103.2" y="143.8" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">2.07</text>
+<circle cx="72.0" cy="275.2" r="5" fill="#2563eb"/>
+<text x="72.0" y="265.2" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">1.73</text>
+</g>
+<g transform="translate(700,420)">
+<text x="72" y="24" font-size="20" font-family="Arial" font-weight="700" fill="#111827">Mean GPU Power</text>
+<text x="72" y="332" font-size="13" font-family="Arial" fill="#374151">admission_fraction</text>
+<text x="18" y="36" font-size="13" font-family="Arial" fill="#374151">W</text>
+<line x1="72" y1="292.0" x2="665" y2="292.0" stroke="#e5e7eb"/>
+<text x="62" y="296.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">63.9</text>
+<line x1="72" y1="243.2" x2="665" y2="243.2" stroke="#e5e7eb"/>
+<text x="62" y="247.2" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">64.4</text>
+<line x1="72" y1="194.4" x2="665" y2="194.4" stroke="#e5e7eb"/>
+<text x="62" y="198.4" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">64.9</text>
+<line x1="72" y1="145.6" x2="665" y2="145.6" stroke="#e5e7eb"/>
+<text x="62" y="149.6" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">65.4</text>
+<line x1="72" y1="96.8" x2="665" y2="96.8" stroke="#e5e7eb"/>
+<text x="62" y="100.8" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">66.0</text>
+<line x1="72" y1="48.0" x2="665" y2="48.0" stroke="#e5e7eb"/>
+<text x="62" y="52.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">66.5</text>
+<line x1="72.0" y1="48" x2="72.0" y2="292" stroke="#f3f4f6"/>
+<text x="72.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.05</text>
+<line x1="103.2" y1="48" x2="103.2" y2="292" stroke="#f3f4f6"/>
+<text x="103.2" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.1</text>
+<line x1="196.8" y1="48" x2="196.8" y2="292" stroke="#f3f4f6"/>
+<text x="196.8" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.25</text>
+<line x1="352.9" y1="48" x2="352.9" y2="292" stroke="#f3f4f6"/>
+<text x="352.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.5</text>
+<line x1="508.9" y1="48" x2="508.9" y2="292" stroke="#f3f4f6"/>
+<text x="508.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.75</text>
+<line x1="665.0" y1="48" x2="665.0" y2="292" stroke="#f3f4f6"/>
+<text x="665.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">1</text>
+<rect x="72" y="48" width="593" height="244" fill="none" stroke="#9ca3af"/>
+<polyline points="665.0,260.2 508.9,275.2 352.9,180.4 196.8,98.0 103.2,162.1 72.0,64.8" fill="none" stroke="#2563eb" stroke-width="3"/>
+<circle cx="665.0" cy="260.2" r="5" fill="#2563eb"/>
+<text x="665.0" y="250.2" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">64.2</text>
+<circle cx="508.9" cy="275.2" r="5" fill="#2563eb"/>
+<text x="508.9" y="265.2" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">64.0</text>
+<circle cx="352.9" cy="180.4" r="5" fill="#2563eb"/>
+<text x="352.9" y="170.4" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">65.1</text>
+<circle cx="196.8" cy="98.0" r="5" fill="#2563eb"/>
+<text x="196.8" y="88.0" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">66.0</text>
+<circle cx="103.2" cy="162.1" r="5" fill="#2563eb"/>
+<text x="103.2" y="152.1" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">65.3</text>
+<circle cx="72.0" cy="64.8" r="5" fill="#2563eb"/>
+<text x="72.0" y="54.8" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">66.3</text>
+</g>
+<g transform="translate(0,770)">
+<text x="72" y="24" font-size="20" font-family="Arial" font-weight="700" fill="#111827">Energy Per Request</text>
+<text x="72" y="332" font-size="13" font-family="Arial" fill="#374151">admission_fraction</text>
+<text x="18" y="36" font-size="13" font-family="Arial" fill="#374151">J/req</text>
+<line x1="72" y1="292.0" x2="665" y2="292.0" stroke="#e5e7eb"/>
+<text x="62" y="296.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">33.2</text>
+<line x1="72" y1="243.2" x2="665" y2="243.2" stroke="#e5e7eb"/>
+<text x="62" y="247.2" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">37.0</text>
+<line x1="72" y1="194.4" x2="665" y2="194.4" stroke="#e5e7eb"/>
+<text x="62" y="198.4" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">40.9</text>
+<line x1="72" y1="145.6" x2="665" y2="145.6" stroke="#e5e7eb"/>
+<text x="62" y="149.6" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">44.8</text>
+<line x1="72" y1="96.8" x2="665" y2="96.8" stroke="#e5e7eb"/>
+<text x="62" y="100.8" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">48.7</text>
+<line x1="72" y1="48.0" x2="665" y2="48.0" stroke="#e5e7eb"/>
+<text x="62" y="52.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">52.6</text>
+<line x1="72.0" y1="48" x2="72.0" y2="292" stroke="#f3f4f6"/>
+<text x="72.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.05</text>
+<line x1="103.2" y1="48" x2="103.2" y2="292" stroke="#f3f4f6"/>
+<text x="103.2" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.1</text>
+<line x1="196.8" y1="48" x2="196.8" y2="292" stroke="#f3f4f6"/>
+<text x="196.8" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.25</text>
+<line x1="352.9" y1="48" x2="352.9" y2="292" stroke="#f3f4f6"/>
+<text x="352.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.5</text>
+<line x1="508.9" y1="48" x2="508.9" y2="292" stroke="#f3f4f6"/>
+<text x="508.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.75</text>
+<line x1="665.0" y1="48" x2="665.0" y2="292" stroke="#f3f4f6"/>
+<text x="665.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">1</text>
+<rect x="72" y="48" width="593" height="244" fill="none" stroke="#9ca3af"/>
+<polyline points="665.0,275.2 508.9,160.9 352.9,177.4 196.8,242.1 103.2,207.4 72.0,64.8" fill="none" stroke="#2563eb" stroke-width="3"/>
+<circle cx="665.0" cy="275.2" r="5" fill="#2563eb"/>
+<text x="665.0" y="265.2" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">34.5</text>
+<circle cx="508.9" cy="160.9" r="5" fill="#2563eb"/>
+<text x="508.9" y="150.9" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">43.6</text>
+<circle cx="352.9" cy="177.4" r="5" fill="#2563eb"/>
+<text x="352.9" y="167.4" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">42.3</text>
+<circle cx="196.8" cy="242.1" r="5" fill="#2563eb"/>
+<text x="196.8" y="232.1" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">37.1</text>
+<circle cx="103.2" cy="207.4" r="5" fill="#2563eb"/>
+<text x="103.2" y="197.4" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">39.9</text>
+<circle cx="72.0" cy="64.8" r="5" fill="#2563eb"/>
+<text x="72.0" y="54.8" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">51.2</text>
+</g>
+<g transform="translate(700,770)">
+<text x="72" y="24" font-size="20" font-family="Arial" font-weight="700" fill="#111827">Error Rate</text>
+<text x="72" y="332" font-size="13" font-family="Arial" fill="#374151">admission_fraction</text>
+<text x="18" y="36" font-size="13" font-family="Arial" fill="#374151">fraction</text>
+<line x1="72" y1="292.0" x2="665" y2="292.0" stroke="#e5e7eb"/>
+<text x="62" y="296.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">-1.00</text>
+<line x1="72" y1="243.2" x2="665" y2="243.2" stroke="#e5e7eb"/>
+<text x="62" y="247.2" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">-0.60</text>
+<line x1="72" y1="194.4" x2="665" y2="194.4" stroke="#e5e7eb"/>
+<text x="62" y="198.4" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">-0.20</text>
+<line x1="72" y1="145.6" x2="665" y2="145.6" stroke="#e5e7eb"/>
+<text x="62" y="149.6" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">0.20</text>
+<line x1="72" y1="96.8" x2="665" y2="96.8" stroke="#e5e7eb"/>
+<text x="62" y="100.8" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">0.60</text>
+<line x1="72" y1="48.0" x2="665" y2="48.0" stroke="#e5e7eb"/>
+<text x="62" y="52.0" text-anchor="end" font-size="12" font-family="Arial" fill="#374151">1.00</text>
+<line x1="72.0" y1="48" x2="72.0" y2="292" stroke="#f3f4f6"/>
+<text x="72.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.05</text>
+<line x1="103.2" y1="48" x2="103.2" y2="292" stroke="#f3f4f6"/>
+<text x="103.2" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.1</text>
+<line x1="196.8" y1="48" x2="196.8" y2="292" stroke="#f3f4f6"/>
+<text x="196.8" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.25</text>
+<line x1="352.9" y1="48" x2="352.9" y2="292" stroke="#f3f4f6"/>
+<text x="352.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.5</text>
+<line x1="508.9" y1="48" x2="508.9" y2="292" stroke="#f3f4f6"/>
+<text x="508.9" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">0.75</text>
+<line x1="665.0" y1="48" x2="665.0" y2="292" stroke="#f3f4f6"/>
+<text x="665.0" y="316" text-anchor="middle" font-size="12" font-family="Arial" fill="#374151">1</text>
+<rect x="72" y="48" width="593" height="244" fill="none" stroke="#9ca3af"/>
+<polyline points="665.0,170.0 508.9,170.0 352.9,170.0 196.8,170.0 103.2,170.0 72.0,170.0" fill="none" stroke="#2563eb" stroke-width="3"/>
+<circle cx="665.0" cy="170.0" r="5" fill="#2563eb"/>
+<text x="665.0" y="160.0" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">0.00</text>
+<circle cx="508.9" cy="170.0" r="5" fill="#2563eb"/>
+<text x="508.9" y="160.0" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">0.00</text>
+<circle cx="352.9" cy="170.0" r="5" fill="#2563eb"/>
+<text x="352.9" y="160.0" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">0.00</text>
+<circle cx="196.8" cy="170.0" r="5" fill="#2563eb"/>
+<text x="196.8" y="160.0" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">0.00</text>
+<circle cx="103.2" cy="170.0" r="5" fill="#2563eb"/>
+<text x="103.2" y="160.0" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">0.00</text>
+<circle cx="72.0" cy="170.0" r="5" fill="#2563eb"/>
+<text x="72.0" y="160.0" text-anchor="middle" font-size="11" font-family="Arial" fill="#1f2937">0.00</text>
+</g>
+</svg>
