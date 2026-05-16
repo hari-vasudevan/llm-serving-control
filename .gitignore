@@ -28,6 +28,15 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.modal-venv/
+
+# Chapter 10 generated benchmark traces can get large. Keep curated summary
+# JSON files explicitly when useful.
+chapter_10/python/results/**/
+chapter_10/python/results/*.csv
+chapter_10/python/results/*.jsonl
+!chapter_10/python/results/
+!chapter_10/python/results/internal_*.json
 *.egg-info/
 
 # Logs

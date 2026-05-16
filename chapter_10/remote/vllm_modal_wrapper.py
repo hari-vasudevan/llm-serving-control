@@ -17,6 +17,7 @@ import collections
 import json
 import math
 import os
+import random
 import re
 import statistics
 import threading
@@ -166,6 +167,182 @@ def gpu_snapshot():
         return out
     except Exception as exc:
         return {"gpu_power_error": str(exc)}
+
+
+def metric_delta_mean_ms(before, after, stem):
+    d_sum = after.get(f"{stem}_sum", 0.0) - before.get(f"{stem}_sum", 0.0)
+    d_count = after.get(f"{stem}_count", 0.0) - before.get(f"{stem}_count", 0.0)
+    if d_count <= 0:
+        return None
+    return 1000.0 * d_sum / d_count
+
+
+def percentile(values, pct):
+    vals = sorted(v for v in values if v is not None and math.isfinite(v))
+    if not vals:
+        return None
+    idx = min(len(vals) - 1, max(0, round((pct / 100.0) * (len(vals) - 1))))
+    return vals[idx]
+
+
+def integrate_power(samples):
+    if len(samples) < 2:
+        return None
+    total = 0.0
+    for a, b in zip(samples, samples[1:]):
+        p0 = a.get("gpu_power_w")
+        p1 = b.get("gpu_power_w")
+        if p0 is None or p1 is None:
+            continue
+        total += 0.5 * (float(p0) + float(p1)) * max(0.0, float(b["t"]) - float(a["t"]))
+    return total
+
+
+def make_benchmark_prompt(index, repeat):
+    seeds = [
+        "Explain queueing delay and model service time in one concise paragraph.",
+        "Summarize how admission control changes latency and throughput.",
+        "Describe why GPU power can change under different request schedules.",
+        "Compare eager scheduling with controlled queue wait for LLM serving.",
+    ]
+    return " ".join([seeds[index % len(seeds)]] * max(1, repeat))
+
+
+def run_internal_sweep(body):
+    targets = [float(x) for x in body.get("target_wait_ms", [0, 100])]
+    offered_rate = float(body.get("offered_rate_qps", 4.0))
+    duration_s = float(body.get("duration_s", 30.0))
+    warmup_s = float(body.get("warmup_s", 5.0))
+    max_tokens = int(body.get("max_tokens", MAX_TOKENS_DEFAULT))
+    prompt_repeat = int(body.get("prompt_repeat", 48))
+    kp = body.get("kp")
+    ki = body.get("ki")
+    seed = int(body.get("seed", 10))
+    random.seed(seed)
+
+    summaries = []
+    for target in targets:
+        control = {"target_queue_ms": target, "enabled": True}
+        if kp is not None:
+            control["kp"] = float(kp)
+        if ki is not None:
+            control["ki"] = float(ki)
+        with open(CONTROL_FILE, "w") as f:
+            json.dump(control, f)
+
+        before = fetch_backend_metrics()
+        stop = threading.Event()
+        sem = threading.Semaphore(int(body.get("max_outstanding", 256)))
+        lock = threading.Lock()
+        records = []
+        power_samples = []
+
+        def power_loop():
+            while not stop.is_set():
+                sample = gpu_snapshot()
+                sample["t"] = time.perf_counter()
+                power_samples.append(sample)
+                time.sleep(float(body.get("metric_period_s", 1.0)))
+
+        def one_request(i, measure):
+            prompt = make_benchmark_prompt(i, prompt_repeat)
+            t_send = time.perf_counter()
+            t_first = None
+            status = "ok"
+            try:
+                payload = {
+                    "model": MODEL,
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,
+                    "stream": True,
+                }
+                with requests.post(
+                    f"{BACKEND_URL}/v1/completions",
+                    data=json.dumps(payload),
+                    headers=headers(),
+                    stream=True,
+                    timeout=TIMEOUT,
+                ) as resp:
+                    resp.raise_for_status()
+                    for chunk in resp.iter_lines():
+                        if chunk and chunk != b"data: [DONE]" and t_first is None:
+                            t_first = time.perf_counter()
+            except Exception as exc:
+                status = f"error:{exc!r}"
+            finally:
+                t_done = time.perf_counter()
+                if measure:
+                    with lock:
+                        records.append(
+                            {
+                                "status": status,
+                                "ttft_ms": 1000.0 * (t_first - t_send) if t_first else None,
+                                "total_ms": 1000.0 * (t_done - t_send),
+                            }
+                        )
+                sem.release()
+
+        power_thread = threading.Thread(target=power_loop, daemon=True)
+        power_thread.start()
+        threads = []
+        t_start = time.perf_counter()
+        t_measure_start = t_start + warmup_s
+        t_end = t_measure_start + duration_s
+        next_arrival = t_start
+        req_id = 0
+        while time.perf_counter() < t_end:
+            now = time.perf_counter()
+            if now < next_arrival:
+                time.sleep(min(0.01, next_arrival - now))
+                continue
+            if sem.acquire(timeout=0.1):
+                req_id += 1
+                measure = now >= t_measure_start
+                thread = threading.Thread(target=one_request, args=(req_id, measure), daemon=True)
+                thread.start()
+                threads.append(thread)
+            next_arrival += random.expovariate(offered_rate) if offered_rate > 0 else 1.0
+
+        for thread in threads:
+            thread.join(timeout=TIMEOUT)
+        stop.set()
+        power_thread.join(timeout=5)
+        after = fetch_backend_metrics()
+
+        ok = [r for r in records if r["status"] == "ok"]
+        ttfts = [r["ttft_ms"] for r in ok if r["ttft_ms"] is not None]
+        totals = [r["total_ms"] for r in ok]
+        energy = integrate_power(power_samples)
+        summaries.append(
+            {
+                "target_wait_ms": target,
+                "control": control,
+                "offered_rate_qps": offered_rate,
+                "requests_measured": len(records),
+                "requests_ok": len(ok),
+                "error_rate": 1.0 - len(ok) / max(len(records), 1),
+                "ttft_mean_ms": statistics.mean(ttfts) if ttfts else None,
+                "ttft_p95_ms": percentile(ttfts, 95),
+                "total_mean_ms": statistics.mean(totals) if totals else None,
+                "total_p95_ms": percentile(totals, 95),
+                "vllm_queue_wait_mean_ms": metric_delta_mean_ms(before, after, "vllm:request_queue_time_seconds"),
+                "vllm_ttft_mean_ms": metric_delta_mean_ms(before, after, "vllm:time_to_first_token_seconds"),
+                "vllm_e2e_mean_ms": metric_delta_mean_ms(before, after, "vllm:e2e_request_latency_seconds"),
+                "gpu_power_mean_w": statistics.mean(
+                    [float(x["gpu_power_w"]) for x in power_samples if "gpu_power_w" in x]
+                )
+                if any("gpu_power_w" in x for x in power_samples)
+                else None,
+                "gpu_power_peak_w": max(
+                    [float(x["gpu_power_w"]) for x in power_samples if "gpu_power_w" in x],
+                    default=None,
+                ),
+                "energy_j": energy,
+                "energy_per_request_j": energy / len(ok) if energy is not None and ok else None,
+            }
+        )
+    return {"status": "ok", "summaries": summaries}
 
 
 def recent_arrival_rate():
@@ -669,6 +846,11 @@ class Handler(BaseHTTPRequestHandler):
                 json.dump(payload, f)
             log(f"updated scheduler control file {CONTROL_FILE}: {payload}")
             self._send_json(200, {"status": "ok", "control": payload})
+            return
+
+        if parsed.path == "/run_internal_sweep":
+            result = run_internal_sweep(body)
+            self._send_json(200, result)
             return
 
         if parsed.path == "/enqueue":

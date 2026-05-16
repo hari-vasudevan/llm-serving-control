@@ -73,6 +73,8 @@ def main() -> None:
     ap.add_argument("--prompt-repeat", type=int, default=96)
     ap.add_argument("--max-outstanding", type=int, default=128)
     ap.add_argument("--metric-period-s", type=float, default=1.0)
+    ap.add_argument("--controller-kp", type=float, default=None)
+    ap.add_argument("--controller-ki", type=float, default=None)
     ap.add_argument("--out-dir", default=str(Path(__file__).resolve().parent / "results"))
     ap.add_argument("--seed", type=int, default=10)
     args = ap.parse_args()
@@ -98,7 +100,7 @@ def main() -> None:
 
 
 def run_one_target(args: argparse.Namespace, target_wait_ms: float, out_dir: Path) -> dict[str, Any]:
-    configure_target(args.url, target_wait_ms)
+    configure_target(args.url, target_wait_ms, args.controller_kp, args.controller_ki)
     wait_for_health(args.url)
 
     records: list[RequestRecord] = []
@@ -167,13 +169,18 @@ def run_one_target(args: argparse.Namespace, target_wait_ms: float, out_dir: Pat
     return summary
 
 
-def configure_target(url: str, target_wait_ms: float) -> None:
+def configure_target(url: str, target_wait_ms: float, kp: float | None = None, ki: float | None = None) -> None:
     # The Chapter 10 wrapper can expose this endpoint. Direct vLLM will return
     # 404, which is fine when the target is configured by environment/deploy.
+    payload: dict[str, Any] = {"target_wait_ms": target_wait_ms}
+    if kp is not None:
+        payload["kp"] = kp
+    if ki is not None:
+        payload["ki"] = ki
     try:
         requests.post(
             f"{url.rstrip('/')}/control/queue_wait_target",
-            json={"target_wait_ms": target_wait_ms},
+            json=payload,
             timeout=5,
         )
     except Exception:

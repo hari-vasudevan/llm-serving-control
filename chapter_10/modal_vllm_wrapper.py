@@ -51,6 +51,7 @@ image = (
     gpu="T4",
     timeout=60 * 60,
     scaledown_window=300,
+    max_containers=1,
 )
 @modal.web_server(port=WRAPPER_PORT, startup_timeout=480.0)
 def serve():
