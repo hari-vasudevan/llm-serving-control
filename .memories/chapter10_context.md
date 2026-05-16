@@ -1165,3 +1165,109 @@ Default gains in controlled_scheduler.py:
 Normalized error: e_norm = (target - measured) / target
 Conditional integration with clamp [-10, 10]
 Fraction floor: 0.01, ceiling: 1.0
+
+## Chapter 10 Post-Mortem: Why Queue-Wait Control Failed at GPU Batch Level
+
+### Session 2 Results Summary (May 16 2026)
+
+#### Actuator fix: token budget cap
+
+The original actuator (mutating scheduler_config.max_num_seqs) was broken
+because vLLM v1 copies it to self.max_num_running_reqs at init and never
+re-reads. We fixed this by overriding schedule() to temporarily cap
+self.max_num_scheduled_tokens and self.max_num_running_reqs before calling
+super().schedule(), then restoring. This actuator WORKS — it genuinely
+constrains how many tokens vLLM schedules per step.
+
+#### Evidence the actuator works
+
+With Qwen2.5-3B-Instruct on T4 at qps=8:
+
+  target=0ms (frac=1.0):
+    vllm_ttft_mean_ms: 318
+    total_mean_ms: 1939
+    gpu_power_mean_w: 62.4
+
+  target=100ms (frac ramped down to ~0.36, tok_cap=727, run_cap=23):
+    vllm_ttft_mean_ms: 108  (66% reduction)
+    total_mean_ms: 1805
+    gpu_power_mean_w: 69.1
+
+TTFT and total latency shifted measurably. The token budget cap bites.
+
+#### Why queue wait stayed near zero
+
+vLLM's continuous batching scheduler runs at GPU step frequency (~100+
+times per second). A request enters self.waiting, and the very next
+schedule() call (microseconds later) pops it. There is no measurable
+queue wait because the scheduler never lets anything sit. This is
+fundamental to continuous batching — the design philosophy is "never let
+a request wait if there's any budget at all."
+
+Even with Qwen2.5-3B (6x heavier than 0.5B), and even at tok_cap reduced
+to 11% of nominal (236 tokens), waiting=0 consistently in scheduler logs.
+
+With Qwen2.5-0.5B the model was so fast that even extreme budget reduction
+had no visible effect. Switching to 3B showed the actuator working on TTFT
+and latency, but still zero queue wait.
+
+#### The fundamental finding
+
+The plant dynamics at the GPU batch scheduling level are NOT queue-based.
+They are token-throughput-based. The correct block diagram is:
+
+  token_budget (actuator) -> tokens_per_step -> TTFT, throughput, power
+
+Not:
+
+  token_budget -> queue_depth -> queue_wait (this path does not exist)
+
+Continuous batching eliminates queue dynamics entirely at the scheduler
+level. The real control variables are TTFT, throughput, and GPU power,
+all of which respond to the token budget.
+
+#### Gain tuning journey
+
+1. kp=0.02, ki=0.002 (raw ms error): fraction barely moved (0.87 after
+   20s). Error units were wrong — ms error vs fraction actuator.
+
+2. kp=0.5, ki=0.1 (normalized error): 98% request failure rate. Controller
+   starved vLLM by driving fraction to floor immediately.
+
+3. kp=0.15, ki=0.02 (normalized, conditional anti-windup, xi clamp +-40):
+   stable, no failures, fraction reached ~0.36. But measured variable
+   (queue wait) stayed at zero, so the PI had no feedback to regulate.
+
+#### Model progression
+
+- Started with Qwen2.5-0.5B-Instruct: too lightweight, even 11% budget
+  was more than enough to process 8 qps instantly.
+- Switched to Qwen2.5-3B-Instruct: 6x heavier, actual GPU contention.
+  Token budget cap now visibly affects TTFT and latency. But queue wait
+  still zero because continuous batching scheduler pops requests per-step.
+
+#### Chapter 10 verdict: FAILED as queue-wait controller
+
+The cascade controller designed in Chapters 2b-9 assumes queue dynamics
+(requests accumulate, wait time grows, controller adjusts admission rate).
+At the GPU batch scheduling level inside vLLM, this queue does not form.
+The correct approach is token throughput control, which becomes Chapter 11.
+
+### Transition to Chapter 11
+
+Chapter 11 redesigns the solution as a token throughput control system:
+
+- Inner actuator: token budget cap via schedule() override (proven to work)
+- Outer loop option A: TTFT controller — regulate rolling TTFT to a target
+- Outer loop option B: Power controller — regulate GPU power via NVML
+- Both use the same actuator (admission_fraction -> tok_cap, run_cap)
+
+The open-loop plant characterization (budget sweep) is needed first to
+understand the static mapping from token budget to TTFT/throughput/power.
+Then close the loop with PI control on the chosen variable.
+
+Key files carried forward from Ch10:
+- controlled_scheduler.py: schedule() override with token budget cap
+- vllm_modal_wrapper.py: Modal deployment, metrics, power telemetry
+- modal_vllm_wrapper.py: Modal app definition
+- run_queue_wait_sweep.py: benchmark harness (needs adaptation for Ch11)
