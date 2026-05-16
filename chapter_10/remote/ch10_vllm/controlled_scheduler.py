@@ -74,8 +74,8 @@ class ControlledScheduler(DefaultScheduler):
         super().__init__(*args, **kwargs)
         self.target_queue_ms = float(os.getenv("CH10_TARGET_QUEUE_MS", "0"))
         self.control_file = os.getenv("CH10_CONTROL_FILE", "/tmp/ch10_scheduler_control.json")
-        self.kp = float(os.getenv("CH10_QUEUE_KP", "0.5"))
-        self.ki = float(os.getenv("CH10_QUEUE_KI", "0.1"))
+        self.kp = float(os.getenv("CH10_QUEUE_KP", "0.15"))
+        self.ki = float(os.getenv("CH10_QUEUE_KI", "0.02"))
         self.control_period_s = float(os.getenv("CH10_CONTROL_PERIOD_S", "0.25"))
         self.enabled = os.getenv("CH10_SCHEDULER_ENABLED", "1") not in {"0", "false", "False"}
 
@@ -186,11 +186,22 @@ class ControlledScheduler(DefaultScheduler):
         # e_norm < 0 means over-waiting  -> increase fraction
         e_norm = (self.target_queue_ms - mean_wait_ms) / max(self.target_queue_ms, 1.0)
         dt = self.control_period_s
-        self._xi = _clamp(self._xi + e_norm * dt, -100.0, 100.0)
+
+        # conditional integration: only integrate when not saturated, or
+        # when the error would move us away from saturation
+        at_floor = self._admission_fraction <= 0.02
+        at_ceiling = self._admission_fraction >= 0.99
+        should_integrate = True
+        if at_floor and e_norm > 0:  # want to go lower but already at floor
+            should_integrate = False
+        if at_ceiling and e_norm < 0:  # want to go higher but already at ceiling
+            should_integrate = False
+        if should_integrate:
+            self._xi = _clamp(self._xi + e_norm * dt, -10.0, 10.0)
 
         # kp and ki now operate on the normalized error, producing a
-        # direct change in fraction. kp=1.0 means full error drives
-        # fraction by 1.0 (aggressive). typical: kp=0.5, ki=0.1
+        # direct change in fraction. kp=0.15 means full normalized error
+        # reduces fraction by 0.15 (gentle). ki=0.02 gives slow integral.
         delta = self.kp * e_norm + self.ki * self._xi
         self._admission_fraction = _clamp(1.0 - delta, 0.01, 1.0)
 
