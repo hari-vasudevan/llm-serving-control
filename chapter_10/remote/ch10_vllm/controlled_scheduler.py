@@ -74,8 +74,8 @@ class ControlledScheduler(DefaultScheduler):
         super().__init__(*args, **kwargs)
         self.target_queue_ms = float(os.getenv("CH10_TARGET_QUEUE_MS", "0"))
         self.control_file = os.getenv("CH10_CONTROL_FILE", "/tmp/ch10_scheduler_control.json")
-        self.kp = float(os.getenv("CH10_QUEUE_KP", "0.02"))
-        self.ki = float(os.getenv("CH10_QUEUE_KI", "0.002"))
+        self.kp = float(os.getenv("CH10_QUEUE_KP", "0.5"))
+        self.ki = float(os.getenv("CH10_QUEUE_KI", "0.1"))
         self.control_period_s = float(os.getenv("CH10_CONTROL_PERIOD_S", "0.25"))
         self.enabled = os.getenv("CH10_SCHEDULER_ENABLED", "1") not in {"0", "false", "False"}
 
@@ -180,31 +180,29 @@ class ControlledScheduler(DefaultScheduler):
         mean_wait_ms = sum(waits_ms) / len(waits_ms) if waits_ms else 0.0
         oldest_wait_ms = max(waits_ms) if waits_ms else 0.0
 
-        # pi control law
-        # positive error = queue waiting less than target -> reduce fraction
-        # negative error = queue waiting more than target -> increase fraction
-        error_ms = self.target_queue_ms - mean_wait_ms
+        # pi control law on normalized error
+        # e_norm = (target - measured) / target, in [-inf, 1]
+        # e_norm > 0 means under-waiting -> reduce fraction
+        # e_norm < 0 means over-waiting  -> increase fraction
+        e_norm = (self.target_queue_ms - mean_wait_ms) / max(self.target_queue_ms, 1.0)
         dt = self.control_period_s
-        self._xi = _clamp(self._xi + error_ms * dt, -50_000.0, 50_000.0)
+        self._xi = _clamp(self._xi + e_norm * dt, -100.0, 100.0)
 
-        # controller output: how much to reduce from full capacity
-        # when error is positive (under-waiting), we want to slow admission
-        # so reduction > 0 -> fraction < 1
-        reduction = self.kp * error_ms + self.ki * self._xi
-        # reduction is in "units of target_ms" roughly; normalize to a fraction
-        # scale factor: reduction of target_queue_ms corresponds to ~50% cut
-        scale = 2.0 / max(self.target_queue_ms, 1.0)
-        self._admission_fraction = _clamp(1.0 - reduction * scale, 0.01, 1.0)
+        # kp and ki now operate on the normalized error, producing a
+        # direct change in fraction. kp=1.0 means full error drives
+        # fraction by 1.0 (aggressive). typical: kp=0.5, ki=0.1
+        delta = self.kp * e_norm + self.ki * self._xi
+        self._admission_fraction = _clamp(1.0 - delta, 0.01, 1.0)
 
         LOG.info(
             "CH10 control waiting=%d mean_wait=%.1fms oldest=%.1fms "
-            "target=%.1fms err=%.1f xi=%.1f frac=%.3f "
+            "target=%.1fms e_norm=%.3f xi=%.2f frac=%.3f "
             "tok_cap=%s run_cap=%s",
             len(waiting_ids),
             mean_wait_ms,
             oldest_wait_ms,
             self.target_queue_ms,
-            error_ms,
+            e_norm,
             self._xi,
             self._admission_fraction,
             int(round(self._nominal_max_tokens * self._admission_fraction))
