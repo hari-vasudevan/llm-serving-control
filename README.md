@@ -1,6 +1,6 @@
 # LLM Inference Control
 
-A learning project applying classical control theory to LLM inference serving systems. Nine chapters, two successes, and seven increasingly educational failures.
+A learning project applying classical control theory to LLM inference serving systems. Nine completed chapters, two successes, seven increasingly educational failures, and one new experimental chapter.
 
 The recurring lesson: characterising the plant is the most important step in control design. The control law was never wrong — it was being applied at the wrong layer of the stack. I did not know the right abstraction until I measured.
 
@@ -22,6 +22,7 @@ The recurring lesson: characterising the plant is the most important step in con
 | [7](chapter_7/) | Modal + native vLLM on NVIDIA T4 | Remote single-loop / characterization | **Partial** — remote GPU path works, but serverless overhead hides clean queue signal; vLLM queue stays near zero |
 | [8](chapter_8/) | Modal wrapper queue + vLLM on NVIDIA T4 | MATLAB cascade attempt | **Broke** — outer fit gives negative slope `l_mean = -4.92·q + 649`, physically impossible; top-level LLM latency is too entangled to expose the cascade plant |
 | [9](chapter_9/) | Modal lower-level GPU batching plant | Chapter 2 cascade (inner: B→q, outer: q_ref→L_mean) | **Works** — exact batch-size actuator, real carry-over backlog, measured GPU service time; cascade regulates latency |
+| [10](chapter_10/) | Modal vLLM/Qwen admission experiment | Queue-wait targets + latency/power measurement | **Starting** — measure how external admission queue wait affects top-level latency, throughput, GPU power, and energy/request |
 
 ### What broke and why
 
@@ -56,6 +57,10 @@ Chapter 7–9: Remote GPU experiments on Modal
     Chapter 7: native remote serving characterization
     Chapter 8: wrapper queue + MATLAB cascade attempt  [failed — wrong layer]
     Chapter 9: lower-level GPU batching plant with exact B actuator  [success]
+
+Chapter 10: Return to vLLM serving as an experimental measurement study
+    load generator ──► admission wrapper ──► vLLM/Qwen ──► NVIDIA GPU
+    measure queue-wait targets, top-level latency, throughput, power, energy/request
 ```
 
 ---
@@ -146,5 +151,11 @@ chapter_9/          Modal lower-level GPU batching cascade (success)
   modal_gpu_batch_server.py
   python/
   matlab/
+  README.md
+
+chapter_10/         Modal vLLM/Qwen admission + power/latency experiment
+  modal_vllm_wrapper.py
+  remote/
+  matlab/           copied scaffold; may be reduced once Python runner exists
   README.md
 ```
