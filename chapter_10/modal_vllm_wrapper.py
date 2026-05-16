@@ -13,11 +13,12 @@ MAX_NUM_SEQS = 192
 MAX_MODEL_LEN = 4096
 DEFAULT_B_MAX = 160
 DEFAULT_DT = 1.0
+DEFAULT_QUEUE_TARGET_MS = 0
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "vllm>=0.8",
+        "vllm>=0.16,<0.17",
         "fastapi",
         "uvicorn",
         "requests",
@@ -27,11 +28,19 @@ image = (
     .env(
         {
             "HF_XET_HIGH_PERFORMANCE": "1",
+            "PYTHONPATH": "/root",
+            "CH10_TARGET_QUEUE_MS": str(DEFAULT_QUEUE_TARGET_MS),
+            "CH10_SCHEDULER_ENABLED": "1",
+            "CH10_CONTROL_FILE": "/tmp/ch10_scheduler_control.json",
         }
     )
     .add_local_file(
         "chapter_10/remote/vllm_modal_wrapper.py",
         remote_path="/root/vllm_modal_wrapper.py",
+    )
+    .add_local_dir(
+        "chapter_10/remote/ch10_vllm",
+        remote_path="/root/ch10_vllm",
     )
 )
 
@@ -61,6 +70,8 @@ def serve():
         "TRITON_ATTN",
         "--generation-config",
         "vllm",
+        "--scheduler-cls",
+        "ch10_vllm.controlled_scheduler.ControlledScheduler",
     ]
     wrapper_cmd = [
         "python",

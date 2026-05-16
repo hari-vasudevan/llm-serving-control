@@ -29,6 +29,11 @@ from socketserver import ThreadingMixIn
 
 import requests
 
+try:
+    import pynvml
+except Exception:  # pragma: no cover - depends on NVIDIA runtime
+    pynvml = None
+
 
 @dataclass
 class QueueItem:
@@ -70,6 +75,7 @@ BACKEND_URL = "http://127.0.0.1:8001"
 METRICS_URL = "http://127.0.0.1:8001/metrics"
 HEALTH_URL = "http://127.0.0.1:8001/health"
 API_KEY = ""
+CONTROL_FILE = "/tmp/ch10_scheduler_control.json"
 LAST_CONTROL_SOURCE = "startup"
 LAST_CONTROL_TS = ""
 QUEUE_AREA = 0.0
@@ -86,6 +92,10 @@ LAST_TICK_SUMMARY = {
     "service_rate_tick": 0.0,
     "lambda_tick": 0.0,
 }
+PROXY_LAT_BUF = collections.deque(maxlen=1000)
+PROXY_TTFT_BUF = collections.deque(maxlen=1000)
+PROXY_ERRORS = 0
+NVML_HANDLE = None
 
 
 def log(message):
@@ -130,6 +140,32 @@ def fetch_backend_metrics():
     except Exception as exc:
         log(f"metrics fetch failed: {exc}")
         return {}
+
+
+def gpu_snapshot():
+    global NVML_HANDLE
+    if pynvml is None:
+        return {}
+    try:
+        if NVML_HANDLE is None:
+            pynvml.nvmlInit()
+            NVML_HANDLE = pynvml.nvmlDeviceGetHandleByIndex(0)
+        util = pynvml.nvmlDeviceGetUtilizationRates(NVML_HANDLE)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(NVML_HANDLE)
+        power_w = pynvml.nvmlDeviceGetPowerUsage(NVML_HANDLE) / 1000.0
+        out = {
+            "gpu_power_w": round(power_w, 3),
+            "gpu_util_percent": float(util.gpu),
+            "gpu_mem_util_percent": float(util.memory),
+            "gpu_memory_used_mb": round(mem.used / (1024.0 * 1024.0), 3),
+        }
+        try:
+            out["gpu_temperature_c"] = float(pynvml.nvmlDeviceGetTemperature(NVML_HANDLE, pynvml.NVML_TEMPERATURE_GPU))
+        except Exception:
+            pass
+        return out
+    except Exception as exc:
+        return {"gpu_power_error": str(exc)}
 
 
 def recent_arrival_rate():
@@ -210,6 +246,7 @@ def safe_p95(values):
 
 def build_metrics():
     backend = fetch_backend_metrics()
+    power = gpu_snapshot()
     with LOCK:
         q = len(FIFO)
         b = B
@@ -225,6 +262,9 @@ def build_metrics():
         qwaits = list(QWAIT_BUF)
         recent_events = list(RECENT_EVENTS)[-10:]
         recent_ticks = list(RECENT_TICKS)[-5:]
+        proxy_latencies = list(PROXY_LAT_BUF)
+        proxy_ttfts = list(PROXY_TTFT_BUF)
+        proxy_errors = PROXY_ERRORS
 
     metrics = {
         "status": "ok",
@@ -246,6 +286,11 @@ def build_metrics():
         "ttft_p95_ms": safe_p95(ttfts),
         "queue_wait_mean_ms": safe_mean(qwaits),
         "queue_wait_p95_ms": safe_p95(qwaits),
+        "proxy_total_mean_ms": safe_mean(proxy_latencies),
+        "proxy_total_p95_ms": safe_p95(proxy_latencies),
+        "proxy_ttft_mean_ms": safe_mean(proxy_ttfts),
+        "proxy_ttft_p95_ms": safe_p95(proxy_ttfts),
+        "proxy_errors": proxy_errors,
         "q_mean_tick": last_tick["q_mean_tick"],
         "q_max_tick": last_tick["q_max_tick"],
         "arrivals_tick": last_tick["arrivals_tick"],
@@ -263,6 +308,7 @@ def build_metrics():
         "recent_ticks": recent_ticks,
         "timestamp": datetime.now().isoformat(),
     }
+    metrics.update(power)
     return metrics
 
 
@@ -525,6 +571,60 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _proxy_completion(self, body):
+        global PROXY_ERRORS
+        t_recv = time.perf_counter()
+        body = dict(body)
+        stream = bool(body.get("stream", False))
+        backend_headers = headers()
+        try:
+            if stream:
+                with requests.post(
+                    f"{BACKEND_URL}/v1/completions",
+                    data=json.dumps(body),
+                    headers=backend_headers,
+                    stream=True,
+                    timeout=TIMEOUT,
+                ) as resp:
+                    self.send_response(resp.status_code)
+                    self.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream"))
+                    self.end_headers()
+                    t_first = None
+                    for chunk in resp.iter_lines():
+                        if chunk:
+                            if t_first is None and chunk != b"data: [DONE]":
+                                t_first = time.perf_counter()
+                            self.wfile.write(chunk + b"\n\n")
+                            self.wfile.flush()
+                    t_done = time.perf_counter()
+                    if t_first is not None and resp.ok:
+                        with LOCK:
+                            PROXY_TTFT_BUF.append(1000.0 * (t_first - t_recv))
+                            PROXY_LAT_BUF.append(1000.0 * (t_done - t_recv))
+                    return
+
+            body["stream"] = False
+            resp = requests.post(
+                f"{BACKEND_URL}/v1/completions",
+                data=json.dumps(body),
+                headers=backend_headers,
+                timeout=TIMEOUT,
+            )
+            t_done = time.perf_counter()
+            if resp.ok:
+                with LOCK:
+                    PROXY_LAT_BUF.append(1000.0 * (t_done - t_recv))
+            self.send_response(resp.status_code)
+            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(resp.content)))
+            self.end_headers()
+            self.wfile.write(resp.content)
+        except Exception as exc:
+            with LOCK:
+                PROXY_ERRORS += 1
+            log(f"proxy completion failed: {exc!r}")
+            self._send_json(502, {"status": "error", "message": repr(exc)})
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/health":
@@ -537,6 +637,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/metrics/prom":
             self._send_text(200, prom_metrics_text())
             return
+        if parsed.path == "/power":
+            self._send_json(200, gpu_snapshot())
+            return
         self._send_json(404, {"status": "error", "message": "not found"})
 
     def do_POST(self):
@@ -547,6 +650,25 @@ class Handler(BaseHTTPRequestHandler):
             body = parse_json(self)
         except Exception as exc:
             self._send_json(400, {"status": "error", "message": str(exc)})
+            return
+
+        if parsed.path == "/v1/completions":
+            self._proxy_completion(body)
+            return
+
+        if parsed.path == "/control/queue_wait_target":
+            payload = {
+                "target_queue_ms": float(body.get("target_wait_ms", body.get("target_queue_ms", 0.0))),
+                "enabled": bool(body.get("enabled", True)),
+            }
+            if "kp" in body:
+                payload["kp"] = float(body["kp"])
+            if "ki" in body:
+                payload["ki"] = float(body["ki"])
+            with open(CONTROL_FILE, "w") as f:
+                json.dump(payload, f)
+            log(f"updated scheduler control file {CONTROL_FILE}: {payload}")
+            self._send_json(200, {"status": "ok", "control": payload})
             return
 
         if parsed.path == "/enqueue":

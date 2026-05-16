@@ -55,20 +55,48 @@ Chapter 9 remains the conceptual reference for:
 
 ```text
 load generator
-  -> Chapter 10 admission wrapper
-      -> external FIFO queue
-      -> queue-wait target or q_ref target
-      -> release policy into vLLM
+  -> Chapter 10 public wrapper endpoint
   -> vLLM /v1/completions
+      -> experimental custom scheduler class
+      -> queue-wait target control file
+      -> Qwen execution
   -> Qwen on GPU
 ```
 
-The wrapper should measure:
+The first implementation inserts the controller at the lowest practical vLLM
+layer by starting vLLM with:
 
 ```text
-external_queue_wait = t_release_to_vllm - t_enter_wrapper
-ttft_external       = t_first_token - t_release_to_vllm
-total_query_latency = t_first_token - t_enter_wrapper
+--scheduler-cls ch10_vllm.controlled_scheduler.ControlledScheduler
+```
+
+The scheduler hook is intentionally experimental because vLLM's scheduler
+class is a private extension point. The hook:
+
+- subclasses vLLM's default scheduler,
+- observes the internal waiting queue when the private fields are available,
+- estimates internal waiting time,
+- adjusts the scheduler's active sequence budget from a queue-wait target,
+- rereads `/tmp/ch10_scheduler_control.json` so target changes do not require a
+  vLLM restart.
+
+The Modal image pins vLLM to `vllm>=0.16,<0.17` for this first experiment so
+the scheduler configuration surface is not floating underneath the code.
+
+The public wrapper still matters. It exposes:
+
+```text
+/v1/completions              proxy to local vLLM, so clients send normal queries
+/metrics                     combined wrapper, vLLM, and GPU power snapshot
+/power                       current NVML power/utilization snapshot
+/control/queue_wait_target   update scheduler target wait in ms
+```
+
+The client/runner should measure:
+
+```text
+ttft_client         = t_first_token - t_client_send
+total_query_latency = t_done - t_client_send
 ```
 
 When vLLM metrics are available, it should also record:
@@ -124,7 +152,41 @@ load generator -> vLLM -> Qwen
 The controlled/admission experiment should be:
 
 ```text
-load generator -> wrapper queue -> controlled release -> vLLM -> Qwen
+load generator -> wrapper proxy -> vLLM custom scheduler -> Qwen
+```
+
+## Current Code
+
+- `remote/ch10_vllm/controlled_scheduler.py`
+  Experimental vLLM scheduler hook. This is the lowest-layer controller
+  insertion point for Chapter 10.
+- `remote/vllm_modal_wrapper.py`
+  Public Modal endpoint. Proxies normal top-level `/v1/completions` calls to
+  the local vLLM server, exposes target-control and power/metrics endpoints.
+- `python/run_queue_wait_sweep.py`
+  Top-level query benchmark. Sends ordinary streaming completion requests,
+  scrapes metrics, computes latency/throughput/power summaries, and writes
+  CSV/JSON results.
+
+Example benchmark command after deploying Modal:
+
+```bash
+python chapter_10/python/run_queue_wait_sweep.py \
+  --url https://YOUR-MODAL-URL.modal.run \
+  --target-wait-ms 0 50 100 200 400 \
+  --offered-rate-qps 4 \
+  --duration-s 90 \
+  --warmup-s 15
+```
+
+The key validation checks for the first run:
+
+```text
+1. Modal logs show "CH10 ControlledScheduler loaded".
+2. POST /control/queue_wait_target updates the scheduler control file.
+3. /metrics includes gpu_power_w on NVIDIA/Modal.
+4. requests.csv has finite TTFT and total latency values.
+5. sweep_summary.csv shows achieved vLLM queue wait moving with target.
 ```
 
 ## Later Demo Idea
@@ -173,4 +235,3 @@ queue-wait target -> throughput
 queue-wait target -> mean GPU power
 queue-wait target -> energy/request
 ```
-
