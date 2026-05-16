@@ -10,6 +10,18 @@ Intent:
   - adjust the scheduler's admission capacity from a queue-wait setpoint,
   - leave Qwen execution, KV-cache management, and token generation to vLLM.
 
+Actuator strategy (session 2 fix):
+  The v1 scheduler's schedule() reads self.max_num_scheduled_tokens (token
+  budget) and self.max_num_running_reqs (sequence count ceiling) each call.
+  These are the real admission gates. We temporarily cap both before calling
+  super().schedule(), then restore. This makes the parent's own admission
+  logic respect our budget without reaching into its internals.
+
+  The old approach (mutating scheduler_config.max_num_seqs via
+  _write_scheduler_attr) failed because: (a) the config value is copied to
+  self.max_num_running_reqs at init and not re-read, and (b) the token
+  budget, not the sequence count, is the binding constraint for small models.
+
 Important:
   vLLM's scheduler class is a private/unstable extension point. This module is
   written defensively and logs what it can observe. If a future vLLM version
@@ -48,7 +60,15 @@ DefaultScheduler = _import_default_scheduler()
 
 
 class ControlledScheduler(DefaultScheduler):
-    """A thin queue-wait controller around vLLM's default scheduler."""
+    """A thin queue-wait controller around vLLM's default scheduler.
+
+    The controller computes an admission_fraction in [0, 1] that scales the
+    token budget and sequence ceiling before each schedule() call. When
+    target_queue_ms=0 and the queue is empty, admission_fraction=1 (full
+    capacity). When the controller wants to build queue wait toward a nonzero
+    target, it reduces the fraction, causing requests to accumulate in the
+    waiting queue.
+    """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -57,41 +77,94 @@ class ControlledScheduler(DefaultScheduler):
         self.kp = float(os.getenv("CH10_QUEUE_KP", "0.02"))
         self.ki = float(os.getenv("CH10_QUEUE_KI", "0.002"))
         self.control_period_s = float(os.getenv("CH10_CONTROL_PERIOD_S", "0.25"))
-        self.min_num_seqs = int(os.getenv("CH10_MIN_NUM_SEQS", "1"))
-        self.max_num_seqs_override = _env_int_or_none("CH10_MAX_NUM_SEQS")
         self.enabled = os.getenv("CH10_SCHEDULER_ENABLED", "1") not in {"0", "false", "False"}
+
+        # minimum tokens to always allow (keeps decode alive for running reqs)
+        self.min_token_budget = int(os.getenv("CH10_MIN_TOKEN_BUDGET", "1"))
+        self.min_running_reqs = int(os.getenv("CH10_MIN_RUNNING_REQS", "1"))
 
         self._last_control_t = 0.0
         self._last_control_file_mtime = 0.0
-        self._xi = 0.0
+        self._xi = 0.0  # integrator state
+        self._admission_fraction = 1.0  # 0..1, computed by PI controller
         self._request_first_seen: dict[str, float] = {}
-        self._nominal_max_num_seqs = self._read_scheduler_attr("max_num_seqs")
-        self._nominal_max_num_batched_tokens = self._read_scheduler_attr("max_num_batched_tokens")
-        self._last_budget = self._nominal_max_num_seqs or self.max_num_seqs_override
+
+        # capture nominal capacities set by vLLM at init
+        self._nominal_max_tokens = getattr(self, "max_num_scheduled_tokens", None)
+        self._nominal_max_running = getattr(self, "max_num_running_reqs", None)
 
         LOG.warning(
             "CH10 ControlledScheduler loaded: enabled=%s target_queue_ms=%.2f "
-            "kp=%.5f ki=%.5f nominal_max_num_seqs=%s nominal_max_num_batched_tokens=%s",
+            "kp=%.5f ki=%.5f nominal_max_tokens=%s nominal_max_running=%s",
             self.enabled,
             self.target_queue_ms,
             self.kp,
             self.ki,
-            self._nominal_max_num_seqs,
-            self._nominal_max_num_batched_tokens,
+            self._nominal_max_tokens,
+            self._nominal_max_running,
         )
 
+    # ------------------------------------------------------------------
+    # schedule() override: the core actuator
+    # ------------------------------------------------------------------
     def schedule(self, *args: Any, **kwargs: Any) -> Any:
         if self.enabled:
-            self._control_admission_budget()
-        return super().schedule(*args, **kwargs)
+            self._update_controller()
 
-    def _control_admission_budget(self) -> None:
+        # apply the admission fraction by temporarily capping both gates
+        saved_tokens = None
+        saved_running = None
+        if self.enabled and self._admission_fraction < 1.0:
+            if self._nominal_max_tokens is not None:
+                saved_tokens = getattr(self, "max_num_scheduled_tokens", None)
+                capped_tokens = max(
+                    self.min_token_budget,
+                    int(round(self._nominal_max_tokens * self._admission_fraction)),
+                )
+                try:
+                    self.max_num_scheduled_tokens = capped_tokens
+                except Exception:
+                    saved_tokens = None  # attribute is read-only; skip
+
+            if self._nominal_max_running is not None:
+                saved_running = getattr(self, "max_num_running_reqs", None)
+                capped_running = max(
+                    self.min_running_reqs,
+                    int(round(self._nominal_max_running * self._admission_fraction)),
+                )
+                try:
+                    self.max_num_running_reqs = capped_running
+                except Exception:
+                    saved_running = None
+
+        try:
+            result = super().schedule(*args, **kwargs)
+        finally:
+            # always restore nominal capacities
+            if saved_tokens is not None:
+                self.max_num_scheduled_tokens = saved_tokens
+            if saved_running is not None:
+                self.max_num_running_reqs = saved_running
+
+        return result
+
+    # ------------------------------------------------------------------
+    # PI controller: updates admission_fraction at control_period_s
+    # ------------------------------------------------------------------
+    def _update_controller(self) -> None:
         now = time.monotonic()
         if now - self._last_control_t < self.control_period_s:
             return
         self._last_control_t = now
         self._load_control_file()
 
+        # if target is 0 ms, run at full capacity (no queue desired)
+        if self.target_queue_ms <= 0.0:
+            self._admission_fraction = 1.0
+            self._xi = 0.0
+            return
+
+        # measure current waiting queue
         waiting = list(self._waiting_requests())
         waiting_ids = [_request_id(req) for req in waiting]
         waiting_ids = [rid for rid in waiting_ids if rid]
@@ -107,34 +180,44 @@ class ControlledScheduler(DefaultScheduler):
         mean_wait_ms = sum(waits_ms) / len(waits_ms) if waits_ms else 0.0
         oldest_wait_ms = max(waits_ms) if waits_ms else 0.0
 
-        nominal = self.max_num_seqs_override or self._nominal_max_num_seqs
-        if not nominal:
-            LOG.debug("CH10 no max_num_seqs-like field found; skipping control")
-            return
-
-        # Positive error means the queue is waiting less than requested, so we
-        # admit more slowly. Negative error means waiting is too high, so we
-        # open the scheduler back up.
+        # pi control law
+        # positive error = queue waiting less than target -> reduce fraction
+        # negative error = queue waiting more than target -> increase fraction
         error_ms = self.target_queue_ms - mean_wait_ms
-        self._xi = _clamp(self._xi + error_ms * self.control_period_s, -20_000.0, 20_000.0)
-        reduction = self.kp * error_ms + self.ki * self._xi
-        budget = int(round(_clamp(nominal - reduction, self.min_num_seqs, nominal)))
+        dt = self.control_period_s
+        self._xi = _clamp(self._xi + error_ms * dt, -50_000.0, 50_000.0)
 
-        self._write_scheduler_attr("max_num_seqs", budget)
-        self._last_budget = budget
+        # controller output: how much to reduce from full capacity
+        # when error is positive (under-waiting), we want to slow admission
+        # so reduction > 0 -> fraction < 1
+        reduction = self.kp * error_ms + self.ki * self._xi
+        # reduction is in "units of target_ms" roughly; normalize to a fraction
+        # scale factor: reduction of target_queue_ms corresponds to ~50% cut
+        scale = 2.0 / max(self.target_queue_ms, 1.0)
+        self._admission_fraction = _clamp(1.0 - reduction * scale, 0.01, 1.0)
 
         LOG.info(
-            "CH10 scheduler control waiting=%d mean_wait_ms=%.2f oldest_wait_ms=%.2f "
-            "target_ms=%.2f budget=%d nominal=%s xi=%.2f",
+            "CH10 control waiting=%d mean_wait=%.1fms oldest=%.1fms "
+            "target=%.1fms err=%.1f xi=%.1f frac=%.3f "
+            "tok_cap=%s run_cap=%s",
             len(waiting_ids),
             mean_wait_ms,
             oldest_wait_ms,
             self.target_queue_ms,
-            budget,
-            nominal,
+            error_ms,
             self._xi,
+            self._admission_fraction,
+            int(round(self._nominal_max_tokens * self._admission_fraction))
+            if self._nominal_max_tokens
+            else "?",
+            int(round(self._nominal_max_running * self._admission_fraction))
+            if self._nominal_max_running
+            else "?",
         )
 
+    # ------------------------------------------------------------------
+    # control file hot-reload
+    # ------------------------------------------------------------------
     def _load_control_file(self) -> None:
         try:
             stat = os.stat(self.control_file)
@@ -157,8 +240,12 @@ class ControlledScheduler(DefaultScheduler):
                 self.kp = float(payload["kp"])
             if "ki" in payload:
                 self.ki = float(payload["ki"])
+            # reset integrator on target change to avoid windup carryover
+            self._xi = 0.0
+            self._admission_fraction = 1.0
             LOG.warning(
-                "CH10 scheduler control updated from file: enabled=%s target_queue_ms=%.2f kp=%.5f ki=%.5f",
+                "CH10 scheduler control updated from file: enabled=%s "
+                "target_queue_ms=%.2f kp=%.5f ki=%.5f",
                 self.enabled,
                 self.target_queue_ms,
                 self.kp,
@@ -167,7 +254,11 @@ class ControlledScheduler(DefaultScheduler):
         except Exception as exc:
             LOG.warning("CH10 failed to load control file %s: %r", self.control_file, exc)
 
+    # ------------------------------------------------------------------
+    # defensive introspection of vLLM internals
+    # ------------------------------------------------------------------
     def _waiting_requests(self) -> Iterable[Any]:
+        # v1 scheduler: self.waiting is a RequestQueue
         for name in ("waiting", "waiting_queue", "waiting_requests", "waiting_req_queue"):
             value = getattr(self, name, None)
             if value is not None:
@@ -181,36 +272,6 @@ class ControlledScheduler(DefaultScheduler):
                     return _iter_collection(value)
 
         return []
-
-    def _read_scheduler_attr(self, name: str) -> int | None:
-        for holder_name in ("scheduler_config", "config"):
-            holder = getattr(self, holder_name, None)
-            if holder is not None and hasattr(holder, name):
-                try:
-                    return int(getattr(holder, name))
-                except Exception:
-                    return None
-        if hasattr(self, name):
-            try:
-                return int(getattr(self, name))
-            except Exception:
-                return None
-        return None
-
-    def _write_scheduler_attr(self, name: str, value: int) -> None:
-        for holder_name in ("scheduler_config", "config"):
-            holder = getattr(self, holder_name, None)
-            if holder is not None and hasattr(holder, name):
-                try:
-                    setattr(holder, name, int(value))
-                    return
-                except Exception as exc:
-                    LOG.debug("CH10 could not set %s.%s: %r", holder_name, name, exc)
-        if hasattr(self, name):
-            try:
-                setattr(self, name, int(value))
-            except Exception as exc:
-                LOG.debug("CH10 could not set self.%s: %r", name, exc)
 
 
 def _env_int_or_none(name: str) -> int | None:

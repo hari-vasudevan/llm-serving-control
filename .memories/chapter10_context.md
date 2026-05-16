@@ -925,3 +925,187 @@ chapter_10/python/results/*.jsonl
 !chapter_10/python/results/
 !chapter_10/python/results/internal_*.json
 *.egg-info/
+
+## Framework Analysis and Actuator Fix Plan (May 16 2026, session 2)
+
+### Why max_num_seqs Mutation Failed
+
+The v1 scheduler schedule() reads self.max_num_running_reqs (copied from
+scheduler_config.max_num_seqs) once at __init__ and uses it as a ceiling
+on how many requests can be in the running list. But the actual admission
+gate inside schedule() is the token budget (max_num_scheduled_tokens), not
+the sequence count. The scheduler iterates waiting requests, tries to
+allocate KV cache blocks via kv_cache_manager.allocate_slots(), and admits
+them until the token budget is exhausted.
+
+Mutating max_num_seqs on the config object after construction does not
+propagate to self.max_num_running_reqs (it is copied, not referenced).
+Even if it did, the token budget is typically the binding constraint for a
+small model like Qwen-0.5B on a T4 where KV cache memory is abundant
+relative to the model.
+
+So the actuator was writing to a field that was not being re-read, and
+even if it were, it was not the binding constraint.
+
+### vLLM v1 Scheduler Internal Structure
+
+From the DeepWiki analysis and GitHub source (vllm/v1/core/sched/scheduler.py):
+
+```text
+schedule() has a two-phase structure:
+  Phase 1 (lines ~223-389): Schedule already-running requests.
+    Iterates self.running, allocates decode tokens, handles preemption.
+  Phase 2 (lines ~404-640): Admit waiting requests into the batch.
+    Pops from self.waiting (RequestQueue), checks KV cache, allocates
+    blocks, adds to scheduled_new_reqs until token budget exhausted.
+```
+
+Key attributes set at init:
+```text
+self.max_num_running_reqs = scheduler_config.max_num_seqs
+self.max_num_scheduled_tokens = scheduler_config.max_num_batched_tokens
+```
+
+The token budget for Phase 2 is whatever remains after Phase 1 consumes
+running-request decode tokens. This remaining budget is the real actuator
+for admission control.
+
+The schedule() return type is SchedulerOutput, which contains:
+```text
+scheduled_new_reqs: list[NewRequestData]
+scheduled_cached_reqs: CachedRequestData
+num_scheduled_tokens: dict[str, int]
+total_num_scheduled_tokens: int
+preempted_req_ids: set[str]
+finished_req_ids: set[str]
+```
+
+### Correct Actuator Strategy
+
+Override schedule() in ControlledScheduler. Instead of mutating config
+fields, cap the token budget available for Phase 2 (new request admission).
+
+Approach A (pre-schedule budget cap): Before calling super().schedule(),
+temporarily reduce self.max_num_scheduled_tokens to limit how many new
+tokens can enter. Restore after. This is the cleanest if the parent
+schedule() re-reads the attribute each call.
+
+Approach B (post-schedule trim): Call super().schedule(), then inspect the
+returned SchedulerOutput and remove newly-admitted requests if the
+controller says to hold them back. Risk: KV cache blocks may already be
+allocated for those requests, requiring manual free via kv_cache_manager.
+
+Approach A is preferred because it works with the scheduler's own logic
+rather than undoing it after the fact.
+
+Also cap self.max_num_running_reqs (the sequence count ceiling) in tandem.
+While the token budget is the primary binding constraint, the sequence
+count can also gate admission when many short-prompt requests arrive.
+Capping both ensures the controller has authority regardless of prompt
+length distribution.
+
+### Framework Comparison (why vLLM over alternatives)
+
+SGLang: Cleaner scheduler architecture (SchedulePolicy + PrefillAdder
+separation), but no --scheduler-cls plugin point. Would require forking.
+Scheduler is being actively refactored in Q2 2026. No drop-in hook.
+
+Triton Inference Server: Has first-class max_queue_delay_microseconds
+knob in dynamic batcher config. But this controls at request-batch level,
+not continuous-batching token level. When backed by vLLM/TRT-LLM, there
+are two scheduling layers and the controller would only touch the outer
+one. Static config, not live-tunable without model reload.
+
+vLLM (chosen): --scheduler-cls is a first-class extension point.
+The token budget is the real binding constraint and can be controlled by
+temporarily capping self.max_num_scheduled_tokens in a schedule()
+override. This is genuinely lowest-layer -- inside the per-step scheduling
+decision, controlling how many tokens enter the GPU batch each iteration.
+
+### Next Steps
+
+1. Inspect the actual vLLM 0.16 v1 scheduler source on the deployed Modal
+   container to confirm exact attribute names and method signatures.
+
+2. Rewrite ControlledScheduler.schedule() to:
+   - Read control file / update PI state (existing logic)
+   - Compute a max_new_tokens_this_step from the controller
+   - Temporarily cap self.max_num_scheduled_tokens before calling super
+   - Restore after
+   - Log the actual number of new requests admitted vs held back
+
+3. Redeploy to Modal, run in-container sweep at qps=8 and qps=30 with
+   target_wait_ms=[0, 50, 100, 200].
+
+4. Validate that measured vLLM queue wait actually tracks the setpoint.
+
+5. If token budget cap works, run full sweep for the metrics:
+   target_wait_ms -> total latency p95
+   target_wait_ms -> TTFT p95
+   target_wait_ms -> throughput (req/s)
+   target_wait_ms -> mean GPU power
+   target_wait_ms -> energy/request
+
+6. Later: video demo of query/response behavior under native vs controlled.
+
+### User Goals Restated
+
+- Use vLLM as the top layer with the cascade controller at the lowest
+  GPU batching layer.
+- Set mean wait time via test queries going into Qwen.
+- Measure metrics when setting a limit on batching time: power and
+  queries/per time unit.
+- Later: video of LLM queries and responses vs controller mean queue
+  time to visually show the effect of the cascade controller.
+
+### Important Platform Notes from Session 1
+
+- max_containers=1 on Modal is necessary to prevent load splitting.
+- Modal public web ingress serializes requests (max_inputs=1 effective),
+  so client-side latency is dominated by Modal queueing, not vLLM.
+- /run_internal_sweep endpoint runs benchmark inside the GPU container
+  against local vLLM, bypassing Modal ingress. This is the correct
+  measurement path.
+- The wrapper (vllm_modal_wrapper.py) proxies /v1/completions to
+  local vLLM and exposes /control/queue_wait_target, /metrics,
+  /run_internal_sweep.
+- NVML power telemetry works: gpu_power_w, energy-per-request, etc.
+
+### Deployed vLLM Version and Scheduler Path
+
+The Modal image pins vllm>=0.16,<0.17. The v1 engine is the default
+in 0.16. The scheduler class import path tried by controlled_scheduler.py:
+```text
+vllm.v1.core.sched.scheduler.Scheduler  (tried first)
+vllm.core.scheduler.Scheduler            (fallback)
+```
+
+The --scheduler-cls CLI flag is documented and works. Modal logs confirm
+the custom class loads and its schedule() method is called per-step.
+
+### Controller Design Continuity
+
+The PI controller logic in _control_admission_budget() is correct in
+structure -- it computes error, integrates, and produces a budget. The
+only change needed is what that budget actuates:
+
+Old (broken): self._write_scheduler_attr("max_num_seqs", budget)
+New (correct): temporarily cap self.max_num_scheduled_tokens before
+calling super().schedule(), then restore.
+
+The control law itself (kp, ki, xi clamping, error sign convention) can
+stay as-is. The gains may need retuning once the actuator actually works,
+because the plant dynamics will be different when the token budget is the
+real lever.
+
+### Working Directory for MCP Access
+
+The iCloud repo path is not accessible via filesystem MCP. A clone was
+pulled to:
+```text
+/Users/hvasudevan/Documents/MATLAB/llm-serving-control-ch10
+```
+on branch chapter-10-experimental-not-for-merge-yet.
+
+All code edits should happen here. Push back to origin when ready to
+deploy via Modal from either checkout.
