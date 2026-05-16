@@ -6,12 +6,12 @@ import modal
 
 app = modal.App("chapter-10-vllm-admission")
 
-MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL = "Qwen/Qwen2.5-3B-Instruct"
 VLLM_PORT = 8001
 WRAPPER_PORT = 8000
-MAX_NUM_SEQS = 192
-MAX_MODEL_LEN = 4096
-DEFAULT_B_MAX = 160
+MAX_NUM_SEQS = 64
+MAX_MODEL_LEN = 2048
+DEFAULT_B_MAX = 60
 DEFAULT_DT = 1.0
 DEFAULT_QUEUE_TARGET_MS = 0
 
@@ -86,7 +86,7 @@ def serve():
         "--model",
         MODEL,
         "--B-init",
-        "32",
+        "16",
         "--B-min",
         "1",
         "--B-max",
@@ -103,7 +103,7 @@ def serve():
 
     print(f"[modal] launching vLLM on :{VLLM_PORT} model={MODEL}", flush=True)
     subprocess.Popen(vllm_cmd)
-    time.sleep(35)
+    time.sleep(60)
 
     print(f"[modal] launching wrapper on :{WRAPPER_PORT}", flush=True)
     subprocess.Popen(wrapper_cmd)

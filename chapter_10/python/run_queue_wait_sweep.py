@@ -63,7 +63,7 @@ class MetricRecord:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True, help="Base URL for vLLM or Chapter 10 wrapper")
-    ap.add_argument("--model", default=os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"))
+    ap.add_argument("--model", default=os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-3B-Instruct"))
     ap.add_argument("--api-key", default=os.getenv("VLLM_API_KEY", ""))
     ap.add_argument("--target-wait-ms", type=float, nargs="+", default=[0, 50, 100, 200, 400])
     ap.add_argument("--offered-rate-qps", type=float, default=4.0)
