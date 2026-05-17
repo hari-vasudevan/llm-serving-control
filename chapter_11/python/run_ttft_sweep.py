@@ -58,6 +58,10 @@ def main() -> None:
     ap.add_argument("--ki", type=float, default=0.02)
     ap.add_argument("--fraction-min", type=float, default=0.25)
     ap.add_argument("--fraction-max", type=float, default=1.0)
+    ap.add_argument("--actuator", default="dispatch_delay", choices=["dispatch_delay", "token_budget"],
+                    help="Actuator mode: dispatch_delay (default) or token_budget")
+    ap.add_argument("--max-delay-ms", type=float, default=5000.0,
+                    help="Maximum dispatch delay in ms (dispatch_delay mode only)")
     ap.add_argument("--max-outstanding", type=int, default=256)
     ap.add_argument("--metric-period-s", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=10)
@@ -103,6 +107,8 @@ def run(args: argparse.Namespace, out_dir: Path, plots_dir: Path) -> None:
         "ki": args.ki,
         "fraction_min": args.fraction_min,
         "fraction_max": args.fraction_max,
+        "actuator": args.actuator,
+        "max_delay_ms": args.max_delay_ms,
         "max_outstanding": args.max_outstanding,
         "metric_period_s": args.metric_period_s,
         "seed": args.seed,

@@ -375,14 +375,27 @@ def run_internal_budget_sweep(body):
     return {"status": "ok", "summaries": summaries}
 
 
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
 def run_internal_ttft_sweep(body):
     """Closed-loop TTFT controller sweep (Phase 2).
 
-    For each target TTFT, runs load while the wrapper writes the rolling
-    measured TTFT into the scheduler control file every feedback_period_s.
-    The scheduler PI loop adjusts admission_fraction to regulate TTFT.
-    Returns per-target summaries and a time-series of controller state.
+    Supports two actuator modes selected by the 'actuator' field:
+
+    'token_budget' (original): writes measured TTFT to the scheduler control
+    file; the vLLM ControlledScheduler PI adjusts admission_fraction.
+    Limitation: the queue must already be loaded for the actuator to raise
+    TTFT above natural; not suitable for stable set-point tracking at light
+    load.
+
+    'dispatch_delay' (default): the wrapper sleeps for dispatch_delay_ms
+    before sending each request to vLLM, then updates the delay via PI.
+    Plant gain is positive (delay↑ → TTFT↑), so TTFT = natural + delay.
+    This gives direct, stable set-point tracking independent of queue state.
     """
+    actuator = str(body.get("actuator", "dispatch_delay"))
     targets = [float(x) for x in body.get("target_ttft_ms", [200.0, 300.0])]
     offered_rate = float(body.get("offered_rate_qps", 4.0))
     duration_s = float(body.get("duration_s", 60.0))
@@ -396,26 +409,42 @@ def run_internal_ttft_sweep(body):
     ki = float(body.get("ki", 0.02))
     fraction_min = float(body.get("fraction_min", 0.25))
     fraction_max = float(body.get("fraction_max", 1.0))
+    max_delay_ms = float(body.get("max_delay_ms", 5000.0))
     seed = int(body.get("seed", 10))
     random.seed(seed)
 
     all_results = []
     for target_ttft in targets:
-        initial_ctrl = {
-            "mode": "ttft",
-            "target_ttft_ms": target_ttft,
-            "measured_ttft_ms": None,
-            "enabled": True,
-            "kp": kp,
-            "ki": ki,
-            "fraction_min": fraction_min,
-            "fraction_max": fraction_max,
-            "admission_fraction": fraction_max,
-            "source": "run_internal_ttft_sweep",
-            "timestamp": datetime.now().isoformat(),
-        }
+        # Dispatch-delay state (shared via list for closure mutability).
+        dispatch_delay_ms = [0.0]
+        delay_xi = [0.0]
+
+        if actuator == "dispatch_delay":
+            # Scheduler runs open-loop at full budget; all TTFT shaping is
+            # done by the explicit per-request delay inserted in one_request().
+            initial_ctrl = {
+                "mode": "open_loop",
+                "admission_fraction": 1.0,
+                "enabled": True,
+                "source": "run_internal_ttft_sweep_delay",
+                "timestamp": datetime.now().isoformat(),
+            }
+        else:
+            initial_ctrl = {
+                "mode": "ttft",
+                "target_ttft_ms": target_ttft,
+                "measured_ttft_ms": None,
+                "enabled": True,
+                "kp": kp,
+                "ki": ki,
+                "fraction_min": fraction_min,
+                "fraction_max": fraction_max,
+                "admission_fraction": fraction_max,
+                "source": "run_internal_ttft_sweep",
+                "timestamp": datetime.now().isoformat(),
+            }
         write_scheduler_control(initial_ctrl)
-        log(f"ttft_sweep: target={target_ttft} ms kp={kp} ki={ki} settle={settle_s}s")
+        log(f"ttft_sweep: actuator={actuator} target={target_ttft} ms kp={kp} ki={ki} settle={settle_s}s")
         time.sleep(settle_s)
 
         before = fetch_backend_metrics()
@@ -448,32 +477,61 @@ def run_internal_ttft_sweep(body):
                 with lock:
                     window = list(recent_ttfts)
                 measured = statistics.mean(window) if window else None
-                ctrl = {
-                    "mode": "ttft",
-                    "target_ttft_ms": target_ttft,
-                    "measured_ttft_ms": measured,
-                    "enabled": True,
-                    "kp": kp,
-                    "ki": ki,
-                    "fraction_min": fraction_min,
-                    "fraction_max": fraction_max,
-                    "source": "feedback_loop",
-                    "timestamp": datetime.now().isoformat(),
-                }
-                write_scheduler_control(ctrl)
-                sched = scheduler_status()
+
+                if actuator == "dispatch_delay" and measured is not None:
+                    # Positive-gain plant: delay↑ → TTFT↑.
+                    # Standard PI: e > 0 when measured < target → increase delay.
+                    e_norm = (target_ttft - measured) / max(target_ttft, 1.0)
+                    dt = feedback_period_s
+                    at_floor = dispatch_delay_ms[0] <= 1e-6
+                    at_ceil = dispatch_delay_ms[0] >= max_delay_ms - 1e-6
+                    should_integrate = not (at_floor and e_norm < 0) and not (at_ceil and e_norm > 0)
+                    if should_integrate:
+                        delay_xi[0] = _clamp(delay_xi[0] + e_norm * dt, -20.0, 20.0)
+                    # Scale by target so kp/ki are dimensionless and comparable
+                    # to the token-budget mode: delta in ms.
+                    delta_ms = (kp * e_norm + ki * delay_xi[0]) * target_ttft
+                    dispatch_delay_ms[0] = _clamp(dispatch_delay_ms[0] + delta_ms, 0.0, max_delay_ms)
+                    log(
+                        "ttft_sweep delay_pi target=%.1f measured=%.1f e=%.3f xi=%.3f delay=%.1fms delta=%.2f",
+                        target_ttft,
+                        measured,
+                        e_norm,
+                        delay_xi[0],
+                        dispatch_delay_ms[0],
+                        delta_ms,
+                    ) if False else None  # verbose only; remove 'if False' to enable
+
+                sched = scheduler_status() if actuator != "dispatch_delay" else {}
                 gpu = gpu_snapshot()
                 now = time.perf_counter()
                 timeseries.append({
                     "t": round(now - t_start, 3),
                     "target_ttft_ms": target_ttft,
                     "measured_ttft_ms": round(measured, 2) if measured is not None else None,
+                    "actuator": actuator,
+                    "dispatch_delay_ms": round(dispatch_delay_ms[0], 2),
+                    "delay_xi": round(delay_xi[0], 4),
                     "admission_fraction": sched.get("scheduler_admission_fraction"),
                     "token_cap": sched.get("scheduler_token_cap"),
-                    "running_cap": sched.get("scheduler_running_cap"),
                     "xi": sched.get("scheduler_xi"),
                     "gpu_power_w": gpu.get("gpu_power_w"),
                 })
+
+                if actuator != "dispatch_delay":
+                    ctrl = {
+                        "mode": "ttft",
+                        "target_ttft_ms": target_ttft,
+                        "measured_ttft_ms": measured,
+                        "enabled": True,
+                        "kp": kp,
+                        "ki": ki,
+                        "fraction_min": fraction_min,
+                        "fraction_max": fraction_max,
+                        "source": "feedback_loop",
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    write_scheduler_control(ctrl)
                 time.sleep(feedback_period_s)
 
         def power_loop():
@@ -485,7 +543,13 @@ def run_internal_ttft_sweep(body):
 
         def one_request(i, measure):
             prompt = make_benchmark_prompt(i, prompt_repeat)
+            # t_send is captured BEFORE the dispatch delay so the delay is
+            # included in measured TTFT (client experiences delay + prefill).
             t_send = time.perf_counter()
+            with lock:
+                delay_s = dispatch_delay_ms[0] / 1000.0
+            if delay_s > 0:
+                time.sleep(delay_s)
             t_first = None
             status = "ok"
             try:
