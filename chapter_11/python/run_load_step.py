@@ -116,68 +116,75 @@ def _run(args: argparse.Namespace, load_steps: list[dict], out_dir: Path) -> Non
 
     wait_for_health(args.url)
 
-    payload = {
-        "target_ttft_ms": targets if len(targets) > 1 else targets[0],
-        "actuator": args.actuator,
-        "warmup_qps": args.warmup_qps,
-        "warmup_s": args.warmup_s,
-        "warmup_fraction": args.warmup_fraction,
-        "load_steps": load_steps,
-        "kp": args.kp,
-        "ki": args.ki,
-        "fraction_min": args.fraction_min,
-        "fraction_max": args.fraction_max,
-        "max_delay_ms": args.max_delay_ms,
-        "ttft_window": args.ttft_window,
-        "feedback_period_s": args.feedback_period_s,
-        "max_tokens": args.max_tokens,
-        "prompt_repeat": args.prompt_repeat,
-        "max_outstanding": args.max_outstanding,
-        "metric_period_s": args.metric_period_s,
-        "seed": args.seed,
-    }
-    _write_json(out_dir / "request.json", payload)
-    print("[request]", json.dumps(payload, indent=2), flush=True)
-
     endpoint = f"{args.url.rstrip('/')}/run_internal_load_step"
-    t0 = time.perf_counter()
-    print(f"[post] {endpoint}", flush=True)
-    status, text = _post_json(endpoint, payload, timeout_s=args.timeout_s)
-    elapsed = time.perf_counter() - t0
-    print(f"[response] status={status} elapsed_s={elapsed:.1f}", flush=True)
 
-    if status < 200 or status >= 300:
-        raise RuntimeError(f"POST {endpoint} failed HTTP {status}: {text[:2000]}")
-
-    raw = json.loads(text)
-    raw["client_elapsed_s"] = elapsed
-    raw["client_timestamp"] = datetime.now().isoformat()
-    _write_json(out_dir / "response.json", raw)
-
-    # Normalise to a flat list of per-target results.
-    if raw.get("multi_target"):
-        results_list: list[dict] = raw["results"]
-    else:
-        results_list = [raw]
-
+    # Loop targets on the client side — one HTTP request per target (~5 min each).
+    # Results are written to disk immediately so a failure on a later target
+    # doesn't lose data from already-completed targets.
+    # A health wait before each target handles container cold-starts gracefully.
+    results_list: list[dict] = []
     all_plot_paths: list[Path] = []
-    for res in results_list:
-        target = int(res.get("target_ttft_ms", 0))
-        tdir = out_dir / f"target_{target}ms"
+    for i, target in enumerate(targets):
+        # Re-confirm container is up before each target (may cold-start between runs)
+        if i > 0:
+            print(f"\n[health] waiting for container before target {i+1}...", flush=True)
+            wait_for_health(args.url)
+
+        payload = {
+            "target_ttft_ms": float(target),
+            "actuator": args.actuator,
+            "warmup_qps": args.warmup_qps,
+            "warmup_s": args.warmup_s,
+            "warmup_fraction": args.warmup_fraction,
+            "load_steps": load_steps,
+            "kp": args.kp,
+            "ki": args.ki,
+            "fraction_min": args.fraction_min,
+            "fraction_max": args.fraction_max,
+            "max_delay_ms": args.max_delay_ms,
+            "ttft_window": args.ttft_window,
+            "feedback_period_s": args.feedback_period_s,
+            "max_tokens": args.max_tokens,
+            "prompt_repeat": args.prompt_repeat,
+            "max_outstanding": args.max_outstanding,
+            "metric_period_s": args.metric_period_s,
+            "seed": args.seed,
+        }
+        _write_json(out_dir / f"request_target{int(target)}ms.json", payload)
+        print(f"\n[target {i+1}/{len(targets)}] {target}ms  POST {endpoint}", flush=True)
+
+        t0 = time.perf_counter()
+        status, text = _post_json(endpoint, payload, timeout_s=args.timeout_s)
+        elapsed = time.perf_counter() - t0
+        print(f"[response] status={status} elapsed_s={elapsed:.1f}", flush=True)
+
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"POST {endpoint} failed HTTP {status}: {text[:2000]}")
+
+        raw = json.loads(text)
+        raw["client_elapsed_s"] = elapsed
+        raw["client_timestamp"] = datetime.now().isoformat()
+        results_list.append(raw)
+
+        # Write per-target data to disk immediately
+        tgt_key = int(raw.get("target_ttft_ms", target))
+        tdir = out_dir / f"target_{tgt_key}ms"
         tdir.mkdir(exist_ok=True)
 
-        ts = res.get("timeseries", [])
+        ts = raw.get("timeseries", [])
         _write_json(tdir / "timeseries.json", ts)
-        _write_json(tdir / "step_summaries.json", res.get("step_summaries", []))
-        _write_json(tdir / "summary.json", {k: v for k, v in res.items() if k != "timeseries"})
+        _write_json(tdir / "step_summaries.json", raw.get("step_summaries", []))
+        _write_json(tdir / "qa_log.json", raw.get("qa_log", []))
+        _write_json(tdir / "summary.json", {k: v for k, v in raw.items()
+                                             if k not in ("timeseries", "qa_log")})
 
         plots_dir = tdir / "plots"
         plots_dir.mkdir(exist_ok=True)
-        paths = plot_result(ts, res, plots_dir)
+        paths = plot_result(ts, raw, plots_dir)
         all_plot_paths.extend(paths)
 
-        print(f"\n[target={target}ms] step_summaries:", flush=True)
-        for ss in res.get("step_summaries", []):
+        print(f"\n[target={tgt_key}ms] step_summaries:", flush=True)
+        for ss in raw.get("step_summaries", []):
             print(f"  qps={ss['qps']}  mean={ss.get('ttft_mean_ms', 'N/A')}ms  "
                   f"p95={ss.get('ttft_p95_ms', 'N/A')}ms  "
                   f"std={ss.get('ttft_stdev_ms', 'N/A')}ms", flush=True)

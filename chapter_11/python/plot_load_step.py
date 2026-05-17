@@ -76,23 +76,25 @@ def _hline(y: float, x0: float, x1: float,
 # ── subplot figure ─────────────────────────────────────────────────────────────
 
 def _subplot_figure(ts: list[dict], result: dict) -> str:
-    """Three vertically stacked panels sharing the same x-axis."""
+    """Four vertically stacked panels sharing the same x-axis."""
     target = float(result.get("target_ttft_ms", 300.0))
     actuator = str(result.get("actuator", "token_budget"))
     act_key = "dispatch_delay_ms" if actuator == "dispatch_delay" else "admission_fraction"
+    ctrl_label = "Dispatch Delay (ms)" if actuator == "dispatch_delay" else "Adm. Fraction"
 
     PANELS = [
         ("offered_qps",      "Load (req/s)",      None),
         ("measured_ttft_ms", "TTFT (ms)",          target),
+        (act_key,            ctrl_label,           None),
         ("gpu_power_w",      "GPU Power (W)",      None),
     ]
 
     # Layout constants
-    W, H = 940, 600
+    W, H = 940, 740
     ML, MR = 75, 25          # left / right margin (pixels)
     MT = 42                   # top margin (title space)
     MB = 52                   # bottom margin (x-axis labels)
-    PG = 18                   # gap between panels (pixels)
+    PG = 14                   # gap between panels (pixels)
     N = len(PANELS)
     PH = (H - MT - MB - (N - 1) * PG) // N   # plot-area height per panel
 
@@ -283,8 +285,8 @@ step_times    = t(phase_changes);
 
 %% Figure
 fig = figure('Name', sprintf('Load Step — target=%dms', round(target_ttft_val)), ...
-    'Position', [80 80 1050 720]);
-tl = tiledlayout(3, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+    'Position', [80 80 1050 860]);
+tl = tiledlayout(4, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
 title(tl, sprintf('Chapter 11  Load-Step Disturbance Rejection  (target TTFT = %d ms)', ...
     round(target_ttft_val)), 'FontSize', 13, 'FontWeight', 'bold');
 
@@ -311,8 +313,23 @@ for k = 1:numel(step_times)
     xline(step_times(k), '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
 end
 
-%% Panel 3 — GPU power
+%% Panel 3 — Control input (dispatch delay or admission fraction)
 ax3 = nexttile;
+% Use whichever signal was recorded
+if any(~isnan(dispatch_delay))
+    plot(t, dispatch_delay, 'Color', [0.13 0.63 0.13], 'LineWidth', 1.4);
+    ylabel('Dispatch Delay (ms)', 'FontWeight', 'bold');
+else
+    plot(t, admission_frac, 'Color', [0.13 0.63 0.13], 'LineWidth', 1.4);
+    ylabel('Adm. Fraction', 'FontWeight', 'bold');
+end
+grid on; box on; xlim([min(t), max(t)]);
+for k = 1:numel(step_times)
+    xline(step_times(k), '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
+end
+
+%% Panel 4 — GPU power
+ax4 = nexttile;
 plot(t, gpu_power, 'Color', [0.8 0.4 0.1], 'LineWidth', 1.4);
 ylabel('GPU Power (W)', 'FontWeight', 'bold');
 xlabel('Elapsed time (s)', 'FontWeight', 'bold');
@@ -322,7 +339,7 @@ for k = 1:numel(step_times)
 end
 
 %% Link x-axes so zoom/pan is synchronised
-linkaxes([ax1, ax2, ax3], 'x');
+linkaxes([ax1, ax2, ax3, ax4], 'x');
 
 %% Save
 savefig(fig, fig_path);
@@ -362,8 +379,10 @@ fig_path = fullfile(base_dir, 'comparison.fig');
 all_t       = cell(1, n);
 all_qps     = cell(1, n);
 all_ttft    = cell(1, n);
+all_ctrl    = cell(1, n);
 all_power   = cell(1, n);
 all_stimes  = cell(1, n);
+all_ctrlabel = cell(1, n);
 
 for col = 1:n
     raw = jsondecode(fileread(load_entry(col).ts_path));
@@ -371,30 +390,40 @@ for col = 1:n
     tv  = zeros(1, ni);
     qv  = zeros(1, ni);
     fv  = NaN(1, ni);
+    cv  = NaN(1, ni);
     pv  = NaN(1, ni);
     phc = cell(1, ni);
     for i = 1:ni
         tv(i) = raw(i).t;
         if isfield(raw(i),'offered_qps') && ~isempty(raw(i).offered_qps), qv(i)=raw(i).offered_qps; end
         if isfield(raw(i),'measured_ttft_ms') && ~isempty(raw(i).measured_ttft_ms), fv(i)=raw(i).measured_ttft_ms; end
+        if isfield(raw(i),'dispatch_delay_ms') && ~isempty(raw(i).dispatch_delay_ms), cv(i)=raw(i).dispatch_delay_ms; end
+        if isfield(raw(i),'admission_fraction') && ~isempty(raw(i).admission_fraction) && isnan(cv(i)), cv(i)=raw(i).admission_fraction; end
         if isfield(raw(i),'gpu_power_w') && ~isempty(raw(i).gpu_power_w), pv(i)=raw(i).gpu_power_w; end
         if isfield(raw(i),'phase'), phc{{i}}=raw(i).phase; else phc{{i}}=''; end
     end
     all_t{{col}}      = tv;
     all_qps{{col}}    = qv;
     all_ttft{{col}}   = fv;
+    all_ctrl{{col}}   = cv;
     all_power{{col}}  = pv;
     chg = [true, ~strcmp(phc(1:end-1), phc(2:end))];
     all_stimes{{col}} = tv(chg);
+    % Label based on which field was populated
+    if isfield(raw(1),'dispatch_delay_ms')
+        all_ctrlabel{{col}} = 'Delay (ms)';
+    else
+        all_ctrlabel{{col}} = 'Adm. Fraction';
+    end
 end
 
-%% Figure: 3 rows (Load / TTFT / Power), N columns (one per target)
-fig = figure('Name', 'Load-Step Multi-Target', 'Position', [60 60 {min(400*n, 1600)} 720]);
-tl  = tiledlayout(3, n, 'TileSpacing', 'compact', 'Padding', 'compact');
+%% Figure: 4 rows (Load / TTFT / Control / Power), N columns (one per target)
+fig = figure('Name', 'Load-Step Multi-Target', 'Position', [60 60 {min(400*n, 1600)} 860]);
+tl  = tiledlayout(4, n, 'TileSpacing', 'compact', 'Padding', 'compact');
 title(tl, 'Chapter 11  Load-Step Disturbance Rejection — Multi-Target', ...
     'FontSize', 13, 'FontWeight', 'bold');
 
-ax_all = gobjects(3, n);
+ax_all = gobjects(4, n);
 colors = lines(n);
 
 for col = 1:n
@@ -402,6 +431,7 @@ for col = 1:n
     tv   = all_t{{col}};
     qv   = all_qps{{col}};
     fv   = all_ttft{{col}};
+    cv   = all_ctrl{{col}};
     pv   = all_power{{col}};
     stv  = all_stimes{{col}};
 
@@ -422,8 +452,15 @@ for col = 1:n
     if col==1, ylabel('TTFT (ms)','FontWeight','bold'); end
     for k=1:numel(stv), xline(stv(k),'--','Color',[.5 .5 .5],'LineWidth',1); end
 
-    %% Row 3: Power
+    %% Row 3: Control input
     ax_all(3,col) = nexttile(2*n+col);
+    plot(tv, cv, 'Color',[0.13 0.63 0.13],'LineWidth',1.5);
+    grid on; box on;
+    if col==1, ylabel(all_ctrlabel{{col}},'FontWeight','bold'); end
+    for k=1:numel(stv), xline(stv(k),'--','Color',[.5 .5 .5],'LineWidth',1); end
+
+    %% Row 4: Power
+    ax_all(4,col) = nexttile(3*n+col);
     plot(tv, pv, 'Color',[0.8 0.4 0.1],'LineWidth',1.5);
     grid on; box on;
     xlabel('Time (s)');
@@ -432,7 +469,7 @@ for col = 1:n
 end
 
 %% Link axes: all panels in the same row share x-axis
-for row = 1:3
+for row = 1:4
     linkaxes(ax_all(row,:), 'x');
 end
 

@@ -225,6 +225,90 @@ def integrate_power(samples):
     return total
 
 
+QUESTION_BANK = [
+    "What is the speed of light in a vacuum?",
+    "How does a transistor work?",
+    "What causes the northern lights?",
+    "Explain how GPS determines your location.",
+    "What is the difference between RAM and ROM?",
+    "How does a jet engine produce thrust?",
+    "What is quantum entanglement?",
+    "Explain how vaccines create immunity.",
+    "What causes earthquakes?",
+    "How do black holes form?",
+    "What is the greenhouse effect?",
+    "How does Wi-Fi transmit data wirelessly?",
+    "What is DNA and what does it do?",
+    "Explain how a battery stores energy.",
+    "What is the Doppler effect?",
+    "How do noise-cancelling headphones work?",
+    "What is machine learning in simple terms?",
+    "How does the internet route data packets?",
+    "What is nuclear fusion and why is it hard?",
+    "How do muscles contract?",
+    "What is the difference between a virus and a bacterium?",
+    "How does a laser produce light?",
+    "What is entropy in thermodynamics?",
+    "How do plants convert sunlight to energy?",
+    "What is the ozone layer and why does it matter?",
+    "How does a touchscreen detect your finger?",
+    "What is dark matter?",
+    "How does the human immune system fight infection?",
+    "What causes tides?",
+    "How does Bluetooth work?",
+    "What is a neural network?",
+    "How do aeroplanes generate lift?",
+    "What is CRISPR gene editing?",
+    "How does an MRI scanner work?",
+    "What is the difference between AC and DC current?",
+    "How does a solar panel convert sunlight to electricity?",
+    "What is the Turing test?",
+    "How do optical fibres carry data?",
+    "What is general relativity in simple terms?",
+    "How does the stock market determine prices?",
+    "What is inflation and what causes it?",
+    "How do vaccines differ from antibiotics?",
+    "What is a superconductor?",
+    "How does the brain store memories?",
+    "What is the difference between weather and climate?",
+    "How does a nuclear reactor generate electricity?",
+    "What is the Higgs boson?",
+    "How do tectonic plates move?",
+    "What is the difference between deep learning and machine learning?",
+    "How do satellites stay in orbit?",
+    "What is photosynthesis?",
+    "How does sonar detect objects underwater?",
+    "What is a quasar?",
+    "How does encryption protect data?",
+    "What is the water cycle?",
+    "How do electric cars differ from petrol cars?",
+    "What is a semiconductor?",
+    "How does the kidney filter blood?",
+    "What is climate tipping point?",
+    "How do CPUs execute instructions?",
+    "What is mitosis?",
+    "How do radio waves carry information?",
+    "What is the difference between speed and velocity?",
+    "How does a heat pump work?",
+    "What is CRISPR and what can it treat?",
+    "How does the liver detoxify the body?",
+    "What is quantum computing?",
+    "How does a wind turbine generate electricity?",
+    "What is the difference between fission and fusion?",
+    "How do search engines index the web?",
+    "What is a mRNA vaccine?",
+    "How does carbon capture work?",
+    "What is a binary star system?",
+    "How does the cochlea convert sound to nerve signals?",
+    "What is the difference between a meteor and a meteorite?",
+    "How do OLED displays produce colour?",
+    "What is the multiverse hypothesis?",
+    "How does a gyroscope maintain orientation?",
+    "What is antibiotic resistance and why is it dangerous?",
+    "How do fuel cells generate electricity?",
+]
+
+
 def make_benchmark_prompt(index, repeat):
     seeds = [
         "Explain queueing delay and model service time in one concise paragraph.",
@@ -717,6 +801,7 @@ def run_internal_load_step(body):
     records = []
     power_samples = []
     timeseries = []
+    qa_log = []
     recent_ttfts = collections.deque(maxlen=ttft_window)
     sample_errors = []
 
@@ -758,7 +843,6 @@ def run_internal_load_step(body):
                     delta_ms = (kp * e_norm + ki * delay_xi[0]) * target_ttft
                     dispatch_delay_ms[0] = _clamp(dispatch_delay_ms[0] + delta_ms, 0.0, max_delay_ms)
                 else:
-                    # Token-budget: wrapper feeds measured TTFT; scheduler runs PI.
                     write_scheduler_control({
                         "mode": "ttft",
                         "target_ttft_ms": target_ttft,
@@ -792,21 +876,25 @@ def run_internal_load_step(body):
             time.sleep(feedback_period_s)
 
     def one_request(i, measure):
-        prompt = make_benchmark_prompt(i, prompt_repeat)
+        question = QUESTION_BANK[i % len(QUESTION_BANK)]
+        # t_send captured BEFORE delay so TTFT includes dispatch delay.
         t_send = time.perf_counter()
+        sent_at_s = t_send - t_start
         with lock:
             delay_s = dispatch_delay_ms[0] / 1000.0
             cur_phase = phase_label[0]
+            cur_qps = offered_qps[0]
         if delay_s > 0:
             time.sleep(delay_s)
         t_first = None
+        answer_parts: list[str] = []
         status = "ok"
         try:
             payload = {
                 "model": MODEL,
-                "prompt": prompt,
+                "prompt": question,
                 "max_tokens": max_tokens,
-                "temperature": 0.0,
+                "temperature": 0.7,
                 "stream": True,
             }
             with requests.post(
@@ -818,8 +906,18 @@ def run_internal_load_step(body):
             ) as resp:
                 resp.raise_for_status()
                 for chunk in resp.iter_lines():
-                    if chunk and chunk != b"data: [DONE]" and t_first is None:
+                    if not chunk or chunk == b"data: [DONE]":
+                        continue
+                    if t_first is None:
                         t_first = time.perf_counter()
+                    try:
+                        raw = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                        if raw.startswith("data: "):
+                            raw = raw[6:]
+                        token_text = json.loads(raw)["choices"][0].get("text", "")
+                        answer_parts.append(token_text)
+                    except Exception:
+                        pass
         except Exception as exc:
             status = f"error:{exc!r}"
             with lock:
@@ -827,17 +925,28 @@ def run_internal_load_step(body):
                     sample_errors.append(repr(exc))
         finally:
             t_done = time.perf_counter()
-            if t_first is not None:
-                ttft_ms = 1000.0 * (t_first - t_send)
+            ttft_ms = 1000.0 * (t_first - t_send) if t_first else None
+            recv_at_s = t_done - t_start
+            if ttft_ms is not None:
                 with lock:
                     recent_ttfts.append(ttft_ms)
             if measure:
                 with lock:
                     records.append({
                         "status": status,
-                        "ttft_ms": 1000.0 * (t_first - t_send) if t_first else None,
+                        "ttft_ms": ttft_ms,
                         "total_ms": 1000.0 * (t_done - t_send),
                         "phase": cur_phase,
+                    })
+                    qa_log.append({
+                        "question": question,
+                        "answer": "".join(answer_parts).strip(),
+                        "sent_at_s": round(sent_at_s, 3),
+                        "recv_at_s": round(recv_at_s, 3),
+                        "ttft_ms": round(ttft_ms, 1) if ttft_ms else None,
+                        "total_ms": round(1000.0 * (t_done - t_send), 1),
+                        "phase": cur_phase,
+                        "offered_qps": cur_qps,
                     })
             sem.release()
 
@@ -959,6 +1068,7 @@ def run_internal_load_step(body):
         "sample_errors": sample_errors[:5],
         "step_summaries": step_summaries,
         "timeseries": timeseries,
+        "qa_log": qa_log,
     }
 
 
