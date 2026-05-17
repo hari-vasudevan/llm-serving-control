@@ -1,237 +1,151 @@
-# Chapter 10 -- vLLM Admission, Power, and Top-Level Latency
+# Chapter 10 — vLLM Admission Control: What We Found
 
-Chapter 10 brings the project back up from the clean Chapter 9 GPU batching
-plant to real LLM serving.
+## Intent
 
-Chapter 9 answered the control-theory question: a cascade controller can work
-when the plant has an exact batch actuator, a real carry-over queue, and
-measured queue-plus-service latency. Chapter 10 is deliberately more
-experimental. The goal is not to prove the Chapter 2 equations again. The goal
-is to measure what happens when a Chapter 9-style admission layer sits in
-front of vLLM/Qwen.
+Chapter 10 returned to real vLLM serving after the Chapter 9 success with
+a low-level GPU batch plant. The goal was to insert a queue-wait controller
+*inside* vLLM's scheduler — one level above Chapter 9's explicit batch plant
+but one level below the full top-level LLM API measured in Chapters 7 and 8.
 
-## Experiment Question
+The hypothesis: capping how many tokens vLLM schedules per step would create
+a meaningful internal queue, and a PI controller could regulate queue-wait
+time to a target.
 
-For a real Qwen model served by vLLM on a GPU:
+---
 
-```text
-If we hold the external admission queue near different mean queue-wait targets,
-what happens to:
-
-  - top-level query latency,
-  - TTFT,
-  - throughput,
-  - vLLM internal queueing,
-  - GPU power,
-  - energy per request?
-```
-
-The first version of this chapter should be a measurement study, not a full
-new controller proof.
-
-## Starting Point
-
-This chapter was initially copied from Chapter 8 because Chapter 8 already has
-the useful vLLM wrapper shape:
+## Architecture
 
 ```text
-Modal web endpoint
-  -> wrapper queue
-  -> local vLLM server
-  -> Qwen model on NVIDIA GPU
+load generator (run_queue_wait_sweep.py)
+  │
+  ▼ HTTPS
+Modal wrapper endpoint (vllm_modal_wrapper.py)
+  │
+  ├── POST /v1/completions     → proxied to local vLLM
+  ├── GET  /metrics            → wrapper + vLLM + GPU snapshot
+  ├── GET  /power              → NVML power/utilization
+  └── POST /control/queue_wait_target → writes /tmp/ch10_scheduler_control.json
+                                          ↓ read by ControlledScheduler
+                                     vLLM (Qwen/Qwen2.5-3B-Instruct, T4 GPU)
+                                       └── --scheduler-cls ControlledScheduler
+                                              caps max_num_scheduled_tokens
+                                              and max_num_running_reqs
 ```
 
-The copied files are intentionally not trusted as final Chapter 10 code yet.
-They are scaffolding to be reshaped.
+The `ControlledScheduler` (in `remote/ch10_vllm/controlled_scheduler.py`)
+subclasses vLLM's default scheduler via the `--scheduler-cls` hook. It reads
+a target fraction from a control file every scheduling step and caps
+`max_num_scheduled_tokens = int(frac × max_model_len)`.
 
-Chapter 9 remains the conceptual reference for:
+---
 
-- defining queue wait explicitly,
-- using a ticked admission decision,
-- separating queue wait from service time,
-- logging `q`, `B`, latency, and completion behavior.
+## What Was Measured
 
-## Proposed Architecture
+An admission fraction sweep: hold the fraction fixed at each of
+`[1.0, 0.75, 0.5, 0.25, 0.1, 0.05]` and run a fixed arrival process.
 
 ```text
-load generator
-  -> Chapter 10 public wrapper endpoint
-  -> vLLM /v1/completions
-      -> experimental custom scheduler class
-      -> queue-wait target control file
-      -> Qwen execution
-  -> Qwen on GPU
+offered_rate_qps = 2
+duration_s = 45 per fraction
+max_tokens = 32, prompt_repeat = 64
+model = Qwen/Qwen2.5-3B-Instruct, T4 GPU
 ```
 
-The first implementation inserts the controller at the lowest practical vLLM
-layer by starting vLLM with:
+The sweep was run from the Chapter 11 runner (`run_budget_sweep.py`) after
+the Chapter 11 infrastructure was built, because the Chapter 10 Python runner
+was not yet complete. The results below are therefore recorded in the
+Chapter 11 Phase 1 section, but they were the direct motivation for Chapter 11.
+
+---
+
+## Findings
+
+### 1. Queue wait is always ~0ms
+
+vLLM's continuous batching scheduler runs at GPU step frequency — roughly
+once per token generation step, which at these load levels is hundreds of
+times per second. Requests enter, are immediately batched into the next step,
+and are never queued for any measurable duration. The target control variable
+(external queue wait) did not exist.
+
+The `ControlledScheduler` correctly capped tokens-per-step, but reducing the
+token budget does not create queue wait — it increases per-request TTFT by
+slowing down the prefill, while the scheduler still dispatches requests
+immediately.
+
+### 2. Token budget directly controls TTFT, not queue wait
+
+| Fraction | TTFT mean | TTFT p95 | Throughput  | Power mean | Energy/req |
+|----------|-----------|----------|-------------|------------|------------|
+| 1.00     | 103 ms    | 148 ms   | 2.31 req/s  | 64.2 W     | 34.5 J     |
+| 0.75     | 117 ms    | 167 ms   | 1.80 req/s  | 64.0 W     | 43.6 J     |
+| 0.50     | 122 ms    | 173 ms   | 1.89 req/s  | 65.1 W     | 42.3 J     |
+| 0.25     | 118 ms    | 178 ms   | 2.20 req/s  | 66.0 W     | 37.1 J     |
+| 0.10     | 310 ms    | 1244 ms  | 2.07 req/s  | 65.3 W     | 39.9 J     |
+| 0.05     | 617 ms    | 3434 ms  | 1.73 req/s  | 66.3 W     | 51.2 J     |
+
+Key observations:
+- TTFT is flat from fraction=1.0 down to fraction=0.25 (~100–120ms).
+  Token budget in this range does not meaningfully limit the prefill.
+- Below fraction=0.10, TTFT rises sharply (310ms at 0.10, 617ms at 0.05).
+  The prefill is now genuinely token-starved across multiple steps.
+- **GPU power is essentially flat** (~64–66W) across all fractions.
+  The T4 reads Qwen2.5-3B's ~6GB weights from HBM every token step regardless;
+  this is a memory-bandwidth floor, not a compute-limited workload.
+  Dispatch delay (the Chapter 11 actuator) also does not move this floor —
+  the GPU is at ~95–100% utilization whenever a token is being generated.
+- Energy per request rises at low fractions because more GPU time is spent
+  per request (slower prefill), not because the GPU draws more power.
+
+### 3. The token budget has limited upside authority
+
+At fraction=0.10, TTFT=310ms is a **transient artifact** (queue accumulated
+during the step-down), not a steady-state setpoint. Once requests drain, the
+scheduler dispatches the next request immediately and TTFT falls back toward
+~130ms natural prefill. Targets above ~200ms are not achievable in steady
+state via the token budget alone at these load levels.
+
+---
+
+## What This Led To
+
+Chapter 10's failure defined Chapter 11's design:
+
+1. **Wrong controlled variable**: queue wait cannot be regulated because it
+   is always ~0ms in continuous batching. Switch to TTFT as the controlled
+   variable — it responds monotonically to the actuator.
+
+2. **Wrong actuator for wide range**: token budget has limited upside (TTFT
+   floor ~130ms, ceiling ~200ms at reasonable fractions). Switch to
+   dispatch delay — `sleep(d_ms/1000)` before the HTTP send — which has
+   unlimited upside and a positive, linear plant gain.
+
+3. **Right abstraction level**: the controller does not need to be *inside*
+   vLLM's scheduler at all. Metering the arrival process externally gives a
+   clean, decoupled plant. The scheduler stays in open-loop at fraction=1.0.
+
+---
+
+## Files
 
 ```text
---scheduler-cls ch10_vllm.controlled_scheduler.ControlledScheduler
+remote/vllm_modal_wrapper.py          Modal endpoint + /control + /power + /metrics
+remote/ch10_vllm/controlled_scheduler.py   vLLM scheduler subclass (token-budget actuator)
+python/run_queue_wait_sweep.py        Queue-wait target sweep runner (incomplete)
+modal_vllm_wrapper.py                 Modal deployment entrypoint
+matlab/                               Scaffold (unused — Python runner replaced MATLAB)
 ```
 
-The scheduler hook is intentionally experimental because vLLM's scheduler
-class is a private extension point. The hook:
+The `ControlledScheduler` scheduler hook is functional and correctly
+subclasses vLLM's scheduler via `--scheduler-cls`. It is preserved as a
+reference implementation for anyone wanting to cap token throughput at the
+scheduler level.
 
-- subclasses vLLM's default scheduler,
-- observes the internal waiting queue when the private fields are available,
-- estimates internal waiting time,
-- adjusts the scheduler's active sequence budget from a queue-wait target,
-- rereads `/tmp/ch10_scheduler_control.json` so target changes do not require a
-  vLLM restart.
+---
 
-The Modal image pins vLLM to `vllm>=0.16,<0.17` for this first experiment so
-the scheduler configuration surface is not floating underneath the code.
+## Model & Hardware
 
-The public wrapper still matters. It exposes:
-
-```text
-/v1/completions              proxy to local vLLM, so clients send normal queries
-/metrics                     combined wrapper, vLLM, and GPU power snapshot
-/power                       current NVML power/utilization snapshot
-/control/queue_wait_target   update scheduler target wait in ms
-```
-
-The client/runner should measure:
-
-```text
-ttft_client         = t_first_token - t_client_send
-total_query_latency = t_done - t_client_send
-```
-
-When vLLM metrics are available, it should also record:
-
-```text
-vllm_num_requests_waiting
-vllm_num_requests_running
-vllm_request_queue_time_seconds
-vllm_time_to_first_token_seconds
-vllm_e2e_request_latency_seconds
-```
-
-For power, the first NVIDIA path should sample `nvidia-smi` or NVML inside the
-Modal container if available:
-
-```text
-gpu_power_w
-gpu_util_percent
-gpu_memory_used_mb
-energy_joules ~= integral(power_w dt)
-energy_per_request = energy_joules / completed_requests
-```
-
-## First Experimental Sweep
-
-Hold the load trace fixed and sweep the admission queue-wait target:
-
-```text
-target mean external queue wait:
-  0 ms      baseline-like eager release
-  50 ms
-  100 ms
-  200 ms
-  400 ms
-```
-
-For each point:
-
-```text
-1. warm up vLLM/Qwen,
-2. replay the same arrival process,
-3. run for a fixed measurement window,
-4. record latency, queue, throughput, and power,
-5. summarize mean, p50, p95, and p99.
-```
-
-The baseline should be direct native vLLM with no external admission queue:
-
-```text
-load generator -> vLLM -> Qwen
-```
-
-The controlled/admission experiment should be:
-
-```text
-load generator -> wrapper proxy -> vLLM custom scheduler -> Qwen
-```
-
-## Current Code
-
-- `remote/ch10_vllm/controlled_scheduler.py`
-  Experimental vLLM scheduler hook. This is the lowest-layer controller
-  insertion point for Chapter 10.
-- `remote/vllm_modal_wrapper.py`
-  Public Modal endpoint. Proxies normal top-level `/v1/completions` calls to
-  the local vLLM server, exposes target-control and power/metrics endpoints.
-- `python/run_queue_wait_sweep.py`
-  Top-level query benchmark. Sends ordinary streaming completion requests,
-  scrapes metrics, computes latency/throughput/power summaries, and writes
-  CSV/JSON results.
-
-Example benchmark command after deploying Modal:
-
-```bash
-python chapter_10/python/run_queue_wait_sweep.py \
-  --url https://YOUR-MODAL-URL.modal.run \
-  --target-wait-ms 0 50 100 200 400 \
-  --offered-rate-qps 4 \
-  --duration-s 90 \
-  --warmup-s 15
-```
-
-The key validation checks for the first run:
-
-```text
-1. Modal logs show "CH10 ControlledScheduler loaded".
-2. POST /control/queue_wait_target updates the scheduler control file.
-3. /metrics includes gpu_power_w on NVIDIA/Modal.
-4. requests.csv has finite TTFT and total latency values.
-5. sweep_summary.csv shows achieved vLLM queue wait moving with target.
-```
-
-## Later Demo Idea
-
-Later, a visual demo can show side-by-side query/response behavior:
-
-```text
-native vLLM under bursty load
-vs.
-admission-controlled vLLM under the same load
-```
-
-That video should not be part of the first implementation. The first goal is
-to produce trustworthy measurements.
-
-## Current Files
-
-The initial `chapter_10/` folder was copied from Chapter 8:
-
-- `modal_vllm_wrapper.py`
-  Modal deployment entrypoint. This should become the Chapter 10 vLLM
-  measurement service entrypoint.
-- `remote/vllm_modal_wrapper.py`
-  HTTP wrapper server. This should become the admission/measurement wrapper.
-- `matlab/`
-  Copied MATLAB scripts. These may be kept for controller continuity, but the
-  first Chapter 10 experiment will likely be easier to drive from Python
-  because power sampling, vLLM metrics, and arrival replay all live near the
-  server process.
-
-## Near-Term Implementation Plan
-
-1. Rename the copied Chapter 8 service identity to Chapter 10.
-2. Add a Python experiment runner that can run baseline and wrapper-admission
-   sweeps.
-3. Add wrapper metrics for external queue wait, TTFT, total query latency,
-   throughput, and vLLM internal metrics.
-4. Add GPU power sampling.
-5. Produce one CSV/JSON result bundle per queue-wait target.
-6. Generate summary plots:
-
-```text
-queue-wait target -> total latency p95
-queue-wait target -> TTFT p95
-queue-wait target -> throughput
-queue-wait target -> mean GPU power
-queue-wait target -> energy/request
-```
+- **Model**: Qwen/Qwen2.5-3B-Instruct
+- **GPU**: NVIDIA T4 (16GB) on Modal
+- **vLLM**: 0.16.x, v1 engine
+- **Scheduler**: `ControlledScheduler` via `--scheduler-cls`

@@ -1,6 +1,6 @@
 # LLM Inference Control
 
-A learning project applying classical control theory to LLM inference serving systems. Nine completed chapters, two successes, seven increasingly educational failures, and one new experimental chapter.
+A learning project applying classical control theory to LLM inference serving systems. Eleven chapters: three working controllers, eight educational failures, and an end-to-end closed-loop TTFT regulator running on a real GPU.
 
 The recurring lesson: characterising the plant is the most important step in control design. The control law was never wrong — it was being applied at the wrong layer of the stack. I did not know the right abstraction until I measured.
 
@@ -22,7 +22,8 @@ The recurring lesson: characterising the plant is the most important step in con
 | [7](chapter_7/) | Modal + native vLLM on NVIDIA T4 | Remote single-loop / characterization | **Partial** — remote GPU path works, but serverless overhead hides clean queue signal; vLLM queue stays near zero |
 | [8](chapter_8/) | Modal wrapper queue + vLLM on NVIDIA T4 | MATLAB cascade attempt | **Broke** — outer fit gives negative slope `l_mean = -4.92·q + 649`, physically impossible; top-level LLM latency is too entangled to expose the cascade plant |
 | [9](chapter_9/) | Modal lower-level GPU batching plant | Chapter 2 cascade (inner: B→q, outer: q_ref→L_mean) | **Works** — exact batch-size actuator, real carry-over backlog, measured GPU service time; cascade regulates latency |
-| [10](chapter_10/) | Modal vLLM/Qwen admission experiment | Queue-wait targets + latency/power measurement | **Starting** — measure how external admission queue wait affects top-level latency, throughput, GPU power, and energy/request |
+| [10](chapter_10/) | Modal vLLM/Qwen + ControlledScheduler (T4) | Queue-wait target sweep via token-budget actuator | **Partial** — scheduler hook works, but queue wait is always ~0ms in continuous batching; token budget directly controls TTFT (not queue wait); GPU power flat across all fractions (~65W memory-bandwidth floor) |
+| [11](chapter_11/) | Modal vLLM/Qwen + dispatch-delay actuator (T4) | Velocity-form PI on TTFT; load-step disturbance rejection | **Works** — metering arrival rate externally gives a positive-gain, unlimited-authority plant; means within 5ms of setpoint at 200/350/500ms targets under qps=4→8→4 load steps; PM analysis guides gain selection |
 
 ### What broke and why
 
@@ -33,6 +34,8 @@ The recurring lesson: characterising the plant is the most important step in con
 **Chapter 5 — broken metrics and useless queue.** Two independent failures on vLLM's Apple Metal backend. The Prometheus `num_requests_waiting` gauge has a bug: it increments on arrival but never decrements on dispatch. And a software FIFO workaround was pointless because vLLM dispatches requests in the same tick they arrive — queue wait is always near-zero.
 
 **Chapter 8 — wrong layer of the stack.** Even with a real wrapper FIFO and explicit per-tick batch dispatch on a GPU, the top-level LLM latency signal is too aggregated. The outer-loop identification gave `l_mean(q) = -4.9228·q + 648.76` — a negative slope, meaning more queue implies less latency. That is not a credible queueing law. The latency signal was contaminated by vLLM's internal scheduler, request streaming, KV-cache management, and per-request variability. The Chapter 2 equations are lower-level scheduling equations, not whole-LLM-API equations.
+
+**Chapter 10 — wrong controlled variable.** The `ControlledScheduler` correctly caps `max_num_scheduled_tokens` per step, and TTFT does rise below fraction=0.10. But the intended controlled variable — external queue wait — is always ~0ms because vLLM's continuous batching dispatches every request in the same scheduling step it arrives. There is no queue to regulate. Additionally, GPU power is flat at ~65W across all fractions (memory-bandwidth floor: the T4 must stream the full 3B parameter weights through HBM every token step regardless of how many tokens are scheduled). The right controlled variable is TTFT; the right actuator for wide operating range is arrival-rate metering, not token budget.
 
 ---
 
@@ -58,9 +61,15 @@ Chapter 7–9: Remote GPU experiments on Modal
     Chapter 8: wrapper queue + MATLAB cascade attempt  [failed — wrong layer]
     Chapter 9: lower-level GPU batching plant with exact B actuator  [success]
 
-Chapter 10: Return to vLLM serving as an experimental measurement study
-    load generator ──► admission wrapper ──► vLLM/Qwen ──► NVIDIA GPU
-    measure queue-wait targets, top-level latency, throughput, power, energy/request
+Chapter 10: vLLM token-budget scheduler hook — measurement study
+    load generator ──► admission wrapper ──► vLLM/Qwen (ControlledScheduler) ──► NVIDIA T4
+    finding: queue wait = 0ms in continuous batching; token budget → TTFT, not queue wait
+
+Chapter 11: Closed-loop TTFT controller — dispatch-delay actuator
+    run_load_step.py ──► Modal wrapper ──► vLLM/Qwen ──► NVIDIA T4
+    controller: velocity-form PI, 0.1s period, kp=0.03 ki=0.002
+    plant: sleep(delay_ms/1000) before send → TTFT = delay + vLLM_prefill
+    result: ±5ms of setpoint at 200/350/500ms targets; load-step rejection demonstrated
 ```
 
 ---
@@ -85,6 +94,10 @@ Chapter 10: Return to vLLM serving as an experimental measurement study
 
 **Ch9:** Moving one level down to a fixed GPU tensor workload exposes the Chapter 2 plant directly. Batch size `B` is an exact actuator, `q` is the carry-over FIFO backlog after dispatch, and service time is measured per batch. The cascade regulates latency. Caveats: the quadratic service-time coefficient was negligible at this scale (nearly linear in B), and total latency contains a service-time component that the pure `β·q` model does not capture.
 
+**Ch10:** vLLM's continuous batching scheduler dispatches requests at GPU step frequency — there is no external queue wait to regulate. The `ControlledScheduler` hook (via `--scheduler-cls`) correctly caps tokens per step, which raises TTFT at very low fractions, but GPU power stays flat at ~65W regardless of the fraction setting. This is a memory-bandwidth floor: the T4 must stream the full model weights through HBM every token step. The right feedback variable is TTFT; the right actuator for a wide operating range is arrival-rate metering rather than token budget.
+
+**Ch11:** Moving the actuator entirely outside vLLM (sleep before the HTTP send) creates a clean, decoupled plant: TTFT = dispatch_delay + vLLM_natural_prefill. The plant gain is positive, linear, and not load-dependent. A velocity-form PI controller with gain analysis (phase margin formula) achieves steady-state TTFT within 5ms of the setpoint at 200/350/500ms targets under load steps from qps=4 to qps=8. Reducing the MA feedback window from 10 to 3 cuts τ_total from 2.375s to 0.625s, making QPS-step transients visible in the data while maintaining PM≈80°. Question bank of 491 unique questions prevents repeated prompts at qps=8 over a 60s window.
+
 ---
 
 ## Results
@@ -100,6 +113,14 @@ Chapter 10: Return to vLLM serving as an experimental measurement study
 ### Chapter 9 closed-loop cascade
 
 ![Chapter 9 closed-loop cascade](chapter_9/matlab/ch9_closed_loop.png)
+
+### Chapter 11 load-step disturbance rejection (window=3, kp=0.03)
+
+Three-target chained experiment: 200ms → 350ms → 500ms TTFT setpoints,
+each with qps=4 (60s) → qps=8 (60s) → qps=4 (60s) load steps.
+Rows: load (req/s) · TTFT with setpoint reference · dispatch delay.
+
+![Chapter 11 Phase 3b subplot](chapter_11/python/results/load_step_20260517_223115/plots/subplot_200_350_500ms.svg)
 
 ---
 
@@ -153,9 +174,24 @@ chapter_9/          Modal lower-level GPU batching cascade (success)
   matlab/
   README.md
 
-chapter_10/         Modal vLLM/Qwen admission + power/latency experiment
+chapter_10/         Modal vLLM/Qwen token-budget scheduler experiment (partial)
   modal_vllm_wrapper.py
   remote/
-  matlab/           copied scaffold; may be reduced once Python runner exists
+    vllm_modal_wrapper.py
+    ch10_vllm/controlled_scheduler.py   vLLM --scheduler-cls hook
+  python/run_queue_wait_sweep.py
+  README.md
+
+chapter_11/         Modal vLLM/Qwen dispatch-delay PI controller (works)
+  modal_vllm_wrapper.py
+  remote/vllm_modal_wrapper.py          load generator + PI controller + QA logging
+  python/
+    run_load_step.py                    load-step experiment runner
+    plot_load_step.py                   SVG subplots + MATLAB script generator
+    make_video.py                       scrolling QA replay MP4 generator
+    run_budget_sweep.py                 open-loop fraction sweep (Phase 1)
+    results/
+      load_step_20260517_212627/        Phase 3 canonical (window=10)
+      load_step_20260517_223115/        Phase 3b (window=3, transient visible)
   README.md
 ```

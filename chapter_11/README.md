@@ -105,8 +105,8 @@ The **dispatch-delay actuator** works as follows:
               │  ttft = recv - t_send   │
               └─────────────────────────┘
                             │ measured_ttft_ms
-                            └──────────────────▶ rolling mean (window=10)
-                                                   ↑
+                            └──────────────────▶ rolling mean (window=W)
+                                                   ↑      W=3 default
                                               fed back to e
 ```
 
@@ -283,7 +283,7 @@ python3 chapter_11/python/run_load_step.py \
   --warmup-qps 4 --warmup-s 20
 ```
 
-#### Phase 3 results
+#### Phase 3 results — window=10
 
 Run: `python/results/load_step_20260517_212627`
 Gains: kp=0.03, ki=0.002, window=10, feedback_period=0.1s
@@ -305,26 +305,97 @@ Means are within 2ms of the setpoint across all load levels and targets.
 Std drops 3–4× when load doubles (qps=4→8) because more completions per
 MA window give a tighter rolling estimate.
 
-#### Phase 3 subplot (MATLAB-generated)
+The QPS-step transient is **not visible** in the TTFT trace with window=10:
+the MA filter smears the disturbance over τ_total = 2.375s, and the PI
+actively cancels the residual within that window. The trace looks flat
+even while the controller is re-settling internally.
 
-Three-panel subplot (one column per target, three load steps per column).
-Rows: load (req/s) · TTFT with step-function setpoint reference ·
-dispatch delay.
+![Phase 3 subplot (window=10)](python/results/load_step_20260517_212627/plots/subplot_200_350_500ms.svg)
 
-![Phase 3 subplot](python/results/load_step_20260517_212627/plots/subplot_200_350_500ms.svg)
+---
 
-#### Phase 3 QA replay video
+#### Phase 3b: Reduced window — transient visibility (window=3)
 
-The video replays the scrolling chat at 5× speed alongside live TTFT,
-QPS, and dispatch-delay traces with a real-time cursor.
+**Why reduce the window?**
 
-[qa_video.mp4](python/results/load_step_20260517_212627/qa_video.mp4) — 5× speed, 30 fps, ~2 min
+With window=10, the effective feedback lag is:
 
-To regenerate:
+```
+τ_dead  = 10 / (2×4) = 1.25s
+τ_MA    = (10-1)/2 × (1/4) = 1.125s
+τ_total = 2.375s
+```
+
+Three effects combine to suppress QPS-step transients:
+1. The 2.375s MA smoothing window absorbs the disturbance before it registers.
+2. The PI controller is already acting (dispatch delay rising/falling) within
+   that same window, pre-cancelling the residual error.
+3. At 200ms natural prefill, a ±50ms load disturbance is close to the sample
+   noise floor.
+
+Reducing the window to 3 drops τ_total from 2.375s to 0.625s:
+
+```
+τ_dead  = 3 / (2×4)  = 0.375s
+τ_MA    = (3-1)/2 × (1/4) = 0.25s
+τ_total = 0.625s
+Phase margin (kp=0.03): PM = 180° - 90° - 0.03 × 10 × 0.625 × (180/π) ≈ 80°
+```
+
+The controller remains well-damped (PM=80°) and transients now survive the
+filter long enough to be visible.
+
+**Run:**
+
+```bash
+python3 chapter_11/python/run_load_step.py \
+  --url https://hvasudevan--chapter-11-token-budget-serve.modal.run \
+  --target-ttft-ms 200 350 500 \
+  --kp 0.03 --ki 0.002 \
+  --ttft-window 3 --feedback-period-s 0.1 \
+  --warmup-qps 4 --warmup-s 20
+```
+
+Run: `python/results/load_step_20260517_223115`
+Gains: kp=0.03, ki=0.002, window=3, feedback_period=0.1s
+Load steps: qps=4 (60s) → qps=8 (60s) → qps=4 (60s) per target
+
+| Target | QPS | Mean    | p95     | Std     | Note                           |
+|--------|-----|---------|---------|---------|--------------------------------|
+| 200ms  | 4   | 198.6ms | 247.4ms | 39.2ms  | Baseline, settling in          |
+| 200ms  | 8   | 210.6ms | 235.4ms | 99.7ms  | **Transient visible** (8.3× ↑) |
+| 200ms  | 4   | 202.7ms | 276.6ms | 41.6ms  | Re-settled                     |
+| 350ms  | 4   | 349.6ms | 405.0ms | 49.8ms  |                                |
+| 350ms  | 8   | 351.3ms | 392.7ms | 28.7ms  |                                |
+| 350ms  | 4   | 349.0ms | 378.5ms | 19.2ms  |                                |
+| 500ms  | 4   | 500.0ms | 543.4ms | 41.8ms  |                                |
+| 500ms  | 8   | 503.2ms | 592.9ms | 43.6ms  |                                |
+| 500ms  | 4   | 504.2ms | 534.5ms | 20.2ms  |                                |
+
+All means are within 5ms of the setpoint. The std spike at 200ms/qps=8
+(39ms→99ms) is the QPS-step transient now surfacing through the shorter
+MA window — the controller is re-settling, not losing regulation.
+
+At higher setpoints (350/500ms) the transient is relatively smaller (same
+absolute disturbance, larger base delay) so std stays lower.
+
+![Phase 3b subplot (window=3)](python/results/load_step_20260517_223115/plots/subplot_200_350_500ms.svg)
+
+**QA replay video (window=3 run):**
+
+The video shows the scrolling chat at 5× speed with four right panels:
+TTFT, QPS, dispatch delay, and effective GPU power (raw × duty cycle).
+Smooth scrolling: row-scroll speed is proportional to current QPS, making
+the traffic doubling visually apparent. Answers fire at first-token time
+(sent\_at + ttft\_ms/1000) rather than full-completion time.
+
+[qa_video.mp4](python/results/load_step_20260517_223115/qa_video.mp4) — 5× speed, 30 fps, ~2 min
+
+To regenerate either video:
 
 ```bash
 python3 chapter_11/python/make_video.py \
-  python/results/load_step_20260517_212627 --speed 5
+  python/results/load_step_20260517_223115 --speed 5
 ```
 
 ---
