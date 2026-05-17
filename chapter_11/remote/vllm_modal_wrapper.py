@@ -375,6 +375,233 @@ def run_internal_budget_sweep(body):
     return {"status": "ok", "summaries": summaries}
 
 
+def run_internal_ttft_sweep(body):
+    """Closed-loop TTFT controller sweep (Phase 2).
+
+    For each target TTFT, runs load while the wrapper writes the rolling
+    measured TTFT into the scheduler control file every feedback_period_s.
+    The scheduler PI loop adjusts admission_fraction to regulate TTFT.
+    Returns per-target summaries and a time-series of controller state.
+    """
+    targets = [float(x) for x in body.get("target_ttft_ms", [200.0, 300.0])]
+    offered_rate = float(body.get("offered_rate_qps", 4.0))
+    duration_s = float(body.get("duration_s", 60.0))
+    warmup_s = float(body.get("warmup_s", 10.0))
+    settle_s = float(body.get("settle_s", 3.0))
+    max_tokens = int(body.get("max_tokens", MAX_TOKENS_DEFAULT))
+    prompt_repeat = int(body.get("prompt_repeat", 64))
+    feedback_period_s = float(body.get("feedback_period_s", 0.5))
+    ttft_window = int(body.get("ttft_window", 20))
+    kp = float(body.get("kp", 0.15))
+    ki = float(body.get("ki", 0.02))
+    fraction_min = float(body.get("fraction_min", 0.25))
+    fraction_max = float(body.get("fraction_max", 1.0))
+    seed = int(body.get("seed", 10))
+    random.seed(seed)
+
+    all_results = []
+    for target_ttft in targets:
+        initial_ctrl = {
+            "mode": "ttft",
+            "target_ttft_ms": target_ttft,
+            "measured_ttft_ms": None,
+            "enabled": True,
+            "kp": kp,
+            "ki": ki,
+            "fraction_min": fraction_min,
+            "fraction_max": fraction_max,
+            "admission_fraction": fraction_max,
+            "source": "run_internal_ttft_sweep",
+            "timestamp": datetime.now().isoformat(),
+        }
+        write_scheduler_control(initial_ctrl)
+        log(f"ttft_sweep: target={target_ttft} ms kp={kp} ki={ki} settle={settle_s}s")
+        time.sleep(settle_s)
+
+        before = fetch_backend_metrics()
+        stop = threading.Event()
+        sem = threading.Semaphore(int(body.get("max_outstanding", 256)))
+        lock = threading.Lock()
+        records = []
+        power_samples = []
+        timeseries = []
+        recent_ttfts = collections.deque(maxlen=ttft_window)
+        sample_errors: list[str] = []
+
+        t_start = time.perf_counter()
+        t_measure_start = t_start + warmup_s
+        t_end = t_measure_start + duration_s
+
+        def check_backend_alive():
+            try:
+                resp = requests.get(HEALTH_URL, timeout=3.0)
+                return resp.ok
+            except Exception:
+                return False
+
+        def feedback_loop():
+            while not stop.is_set():
+                if not check_backend_alive():
+                    log(f"ttft_sweep: vLLM backend at {HEALTH_URL} is DOWN — stopping sweep")
+                    stop.set()
+                    return
+                with lock:
+                    window = list(recent_ttfts)
+                measured = statistics.mean(window) if window else None
+                ctrl = {
+                    "mode": "ttft",
+                    "target_ttft_ms": target_ttft,
+                    "measured_ttft_ms": measured,
+                    "enabled": True,
+                    "kp": kp,
+                    "ki": ki,
+                    "fraction_min": fraction_min,
+                    "fraction_max": fraction_max,
+                    "source": "feedback_loop",
+                    "timestamp": datetime.now().isoformat(),
+                }
+                write_scheduler_control(ctrl)
+                sched = scheduler_status()
+                gpu = gpu_snapshot()
+                now = time.perf_counter()
+                timeseries.append({
+                    "t": round(now - t_start, 3),
+                    "target_ttft_ms": target_ttft,
+                    "measured_ttft_ms": round(measured, 2) if measured is not None else None,
+                    "admission_fraction": sched.get("scheduler_admission_fraction"),
+                    "token_cap": sched.get("scheduler_token_cap"),
+                    "running_cap": sched.get("scheduler_running_cap"),
+                    "xi": sched.get("scheduler_xi"),
+                    "gpu_power_w": gpu.get("gpu_power_w"),
+                })
+                time.sleep(feedback_period_s)
+
+        def power_loop():
+            while not stop.is_set():
+                sample = gpu_snapshot()
+                sample["t"] = time.perf_counter()
+                power_samples.append(sample)
+                time.sleep(float(body.get("metric_period_s", 0.5)))
+
+        def one_request(i, measure):
+            prompt = make_benchmark_prompt(i, prompt_repeat)
+            t_send = time.perf_counter()
+            t_first = None
+            status = "ok"
+            try:
+                payload = {
+                    "model": MODEL,
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,
+                    "stream": True,
+                }
+                with requests.post(
+                    f"{BACKEND_URL}/v1/completions",
+                    data=json.dumps(payload),
+                    headers=headers(),
+                    stream=True,
+                    timeout=TIMEOUT,
+                ) as resp:
+                    resp.raise_for_status()
+                    for chunk in resp.iter_lines():
+                        if chunk and chunk != b"data: [DONE]" and t_first is None:
+                            t_first = time.perf_counter()
+            except Exception as exc:
+                status = f"error:{exc!r}"
+                with lock:
+                    if len(sample_errors) < 5:
+                        sample_errors.append(repr(exc))
+            finally:
+                t_done = time.perf_counter()
+                if t_first is not None:
+                    ttft_ms = 1000.0 * (t_first - t_send)
+                    with lock:
+                        recent_ttfts.append(ttft_ms)
+                if measure:
+                    with lock:
+                        records.append({
+                            "status": status,
+                            "ttft_ms": 1000.0 * (t_first - t_send) if t_first else None,
+                            "total_ms": 1000.0 * (t_done - t_send),
+                        })
+                sem.release()
+
+        feedback_thread = threading.Thread(target=feedback_loop, daemon=True)
+        power_thread = threading.Thread(target=power_loop, daemon=True)
+        feedback_thread.start()
+        power_thread.start()
+
+        threads = []
+        next_arrival = t_start
+        req_id = 0
+        while time.perf_counter() < t_end:
+            now = time.perf_counter()
+            if now < next_arrival:
+                time.sleep(min(0.01, next_arrival - now))
+                continue
+            if sem.acquire(timeout=0.1):
+                req_id += 1
+                measure = now >= t_measure_start
+                thread = threading.Thread(target=one_request, args=(req_id, measure), daemon=True)
+                thread.start()
+                threads.append(thread)
+            next_arrival += random.expovariate(offered_rate) if offered_rate > 0 else 1.0
+
+        for thread in threads:
+            thread.join(timeout=TIMEOUT)
+        stop.set()
+        feedback_thread.join(timeout=5)
+        power_thread.join(timeout=5)
+        after = fetch_backend_metrics()
+
+        ok = [r for r in records if r["status"] == "ok"]
+        ttfts = [r["ttft_ms"] for r in ok if r["ttft_ms"] is not None]
+        totals = [r["total_ms"] for r in ok]
+        energy = integrate_power(power_samples)
+
+        all_results.append({
+            "target_ttft_ms": target_ttft,
+            "offered_rate_qps": offered_rate,
+            "kp": kp,
+            "ki": ki,
+            "fraction_min": fraction_min,
+            "fraction_max": fraction_max,
+            "requests_measured": len(records),
+            "requests_ok": len(ok),
+            "error_rate": 1.0 - len(ok) / max(len(records), 1),
+            "throughput_req_s": len(ok) / max(duration_s, 1e-9),
+            "ttft_mean_ms": statistics.mean(ttfts) if ttfts else None,
+            "ttft_p95_ms": percentile(ttfts, 95),
+            "total_mean_ms": statistics.mean(totals) if totals else None,
+            "total_p95_ms": percentile(totals, 95),
+            "vllm_queue_wait_mean_ms": metric_delta_mean_ms(before, after, "vllm:request_queue_time_seconds"),
+            "vllm_ttft_mean_ms": metric_delta_mean_ms(before, after, "vllm:time_to_first_token_seconds"),
+            "vllm_e2e_mean_ms": metric_delta_mean_ms(before, after, "vllm:e2e_request_latency_seconds"),
+            "gpu_power_mean_w": statistics.mean(
+                [float(x["gpu_power_w"]) for x in power_samples if "gpu_power_w" in x]
+            ) if any("gpu_power_w" in x for x in power_samples) else None,
+            "gpu_power_peak_w": max(
+                [float(x["gpu_power_w"]) for x in power_samples if "gpu_power_w" in x],
+                default=None,
+            ),
+            "energy_j": energy,
+            "energy_per_request_j": energy / len(ok) if energy is not None and ok else None,
+            "sample_errors": sample_errors[:5],
+            "timeseries": timeseries,
+        })
+
+    write_scheduler_control({
+        "mode": "open_loop",
+        "admission_fraction": 1.0,
+        "enabled": True,
+        "source": "ttft_sweep_done",
+        "timestamp": datetime.now().isoformat(),
+    })
+
+    return {"status": "ok", "results": all_results}
+
+
 def recent_arrival_rate():
     now = time.perf_counter()
     recent = [t for t in ARRIVAL_TS if now - t <= 10.0]
@@ -880,6 +1107,30 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/run_internal_budget_sweep":
             result = run_internal_budget_sweep(body)
+            self._send_json(200, result)
+            return
+
+        if parsed.path == "/control/ttft_target":
+            payload = {
+                "mode": "ttft",
+                "target_ttft_ms": float(body.get("target_ttft_ms", 200.0)),
+                "measured_ttft_ms": None,
+                "enabled": bool(body.get("enabled", True)),
+                "kp": float(body.get("kp", 0.15)),
+                "ki": float(body.get("ki", 0.02)),
+                "fraction_min": float(body.get("fraction_min", 0.25)),
+                "fraction_max": float(body.get("fraction_max", 1.0)),
+                "admission_fraction": float(body.get("fraction_max", 1.0)),
+                "source": "http_control",
+                "timestamp": datetime.now().isoformat(),
+            }
+            write_scheduler_control(payload)
+            log(f"set scheduler to ttft mode {CONTROL_FILE}: {payload}")
+            self._send_json(200, {"status": "ok", "control": payload})
+            return
+
+        if parsed.path == "/run_internal_ttft_sweep":
+            result = run_internal_ttft_sweep(body)
             self._send_json(200, result)
             return
 

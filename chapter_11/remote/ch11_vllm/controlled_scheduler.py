@@ -92,6 +92,11 @@ class ControlledScheduler(DefaultScheduler):
         saved_tokens = None
         saved_running = None
         should_cap = self.enabled and self.mode in {"open_loop", "ttft"} and self._admission_fraction < 1.0
+        # In ttft mode, only cap scheduled_tokens — never cap running_reqs.
+        # Capping running_reqs forces preemption of mid-prefill requests which
+        # crashes vLLM under load. Token-budget capping alone is sufficient
+        # to regulate TTFT because it throttles batch size and prefill throughput.
+        should_cap_running = should_cap and self.mode == "open_loop"
         if should_cap:
             if self._nominal_max_tokens is not None:
                 saved_tokens = getattr(self, "max_num_scheduled_tokens", None)
@@ -100,6 +105,7 @@ class ControlledScheduler(DefaultScheduler):
                 except Exception:
                     saved_tokens = None
 
+        if should_cap_running:
             if self._nominal_max_running is not None:
                 saved_running = getattr(self, "max_num_running_reqs", None)
                 try:
@@ -110,11 +116,31 @@ class ControlledScheduler(DefaultScheduler):
         self._periodic_log()
         try:
             return super().schedule(*args, **kwargs)
+        except Exception as exc:
+            LOG.error("CH11 super().schedule() raised %r — disabling cap for this call", exc)
+            # Restore and retry without cap so vLLM stays alive.
+            if saved_tokens is not None:
+                try:
+                    self.max_num_scheduled_tokens = saved_tokens
+                except Exception:
+                    pass
+            if saved_running is not None:
+                try:
+                    self.max_num_running_reqs = saved_running
+                except Exception:
+                    pass
+            return super().schedule(*args, **kwargs)
         finally:
             if saved_tokens is not None:
-                self.max_num_scheduled_tokens = saved_tokens
+                try:
+                    self.max_num_scheduled_tokens = saved_tokens
+                except Exception:
+                    pass
             if saved_running is not None:
-                self.max_num_running_reqs = saved_running
+                try:
+                    self.max_num_running_reqs = saved_running
+                except Exception:
+                    pass
 
     def _maybe_load_control_file(self) -> None:
         now = time.monotonic()
@@ -212,7 +238,10 @@ class ControlledScheduler(DefaultScheduler):
         if self.target_ttft_ms <= 0.0 or self.measured_ttft_ms is None:
             return
 
-        e_norm = (self.target_ttft_ms - self.measured_ttft_ms) / max(self.target_ttft_ms, 1.0)
+        # Plant has negative gain: fraction↑ → TTFT↓ (more throughput → less queue wait).
+        # Flip sign so the PI drives fraction DOWN when TTFT is below target, which
+        # throttles prefill bandwidth and raises TTFT toward the setpoint.
+        e_norm = (self.measured_ttft_ms - self.target_ttft_ms) / max(self.target_ttft_ms, 1.0)
         dt = self.control_period_s
         at_floor = self._admission_fraction <= self.fraction_min + 1e-9
         at_ceiling = self._admission_fraction >= self.fraction_max - 1e-9
