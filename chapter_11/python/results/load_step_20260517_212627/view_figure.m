@@ -49,6 +49,16 @@ for i = 1:n
     end
 end
 
+%% Derived duty-cycle metrics
+% active_ms = actual vLLM processing time (TTFT minus the artificial dispatch delay)
+% duty_cycle = fraction of wall-clock time vLLM is active for this offered load
+% eff_power  = raw_power * duty_cycle  (power attributed to serving this traffic)
+% energy_req = raw_power * active_ms/1000  (Joules per request)
+active_ms  = max(measured_ttft - dispatch_delay, 0);
+duty_cycle = min(offered_qps .* active_ms / 1000, 1.0);
+eff_power  = gpu_power .* duty_cycle;
+energy_req = gpu_power .* active_ms / 1000;
+
 %% Phase-change times (QPS steps + target transitions)
 phase_changes = [true, ~strcmp(phase_cell(1:end-1), phase_cell(2:end))];
 step_times    = t(phase_changes);
@@ -58,8 +68,8 @@ tgt_changes   = [false, diff(target_ref) ~= 0];
 tgt_times     = t(tgt_changes);
 
 %% Figure
-fig = figure('Name', 'Load Step — Chained Targets', 'Position', [80 80 1100 860]);
-tl = tiledlayout(4, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+fig = figure('Name', 'Load Step — Chained Targets', 'Position', [80 80 1100 1060]);
+tl = tiledlayout(6, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
 title(tl, 'Chapter 11  Load-Step Disturbance Rejection — Chained Targets', ...
     'FontSize', 13, 'FontWeight', 'bold');
 
@@ -68,12 +78,8 @@ ax1 = nexttile;
 stairs(t, offered_qps, 'b-', 'LineWidth', 2);
 ylabel('Load (req/s)', 'FontWeight', 'bold');
 grid on; box on; xlim([min(t), max(t)]);
-for k = 1:numel(step_times)
-    xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1);
-end
-for k = 1:numel(tgt_times)
-    xline(tgt_times(k), '-', 'Color', [0.15 0.15 0.15], 'LineWidth', 2);
-end
+for k = 1:numel(step_times), xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1); end
+for k = 1:numel(tgt_times),  xline(tgt_times(k),  '-',  'Color', [0.15 0.15 0.15], 'LineWidth', 2); end
 
 %% Panel 2 — TTFT with step-function target reference
 ax2 = nexttile;
@@ -83,12 +89,8 @@ stairs(t, target_ref, 'r--', 'LineWidth', 1.8);
 ylabel('TTFT (ms)', 'FontWeight', 'bold');
 grid on; box on; xlim([min(t), max(t)]);
 yl = ylim; ylim([0, max(yl(2), nanmax(target_ref) * 1.3)]);
-for k = 1:numel(step_times)
-    xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1);
-end
-for k = 1:numel(tgt_times)
-    xline(tgt_times(k), '-', 'Color', [0.15 0.15 0.15], 'LineWidth', 2);
-end
+for k = 1:numel(step_times), xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1); end
+for k = 1:numel(tgt_times),  xline(tgt_times(k),  '-',  'Color', [0.15 0.15 0.15], 'LineWidth', 2); end
 legend('Measured TTFT', 'Target', 'Location', 'northwest');
 
 %% Panel 3 — Control input
@@ -101,34 +103,39 @@ else
     ylabel('Adm. Fraction', 'FontWeight', 'bold');
 end
 grid on; box on; xlim([min(t), max(t)]);
-for k = 1:numel(step_times)
-    xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1);
-end
-for k = 1:numel(tgt_times)
-    xline(tgt_times(k), '-', 'Color', [0.15 0.15 0.15], 'LineWidth', 2);
-end
+for k = 1:numel(step_times), xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1); end
+for k = 1:numel(tgt_times),  xline(tgt_times(k),  '-',  'Color', [0.15 0.15 0.15], 'LineWidth', 2); end
 
-%% Panel 4 — GPU utilization
+%% Panel 4 — GPU power: raw (grey) vs duty-cycle-corrected (orange)
 ax4 = nexttile;
-if any(~isnan(gpu_util))
-    plot(t, gpu_util, 'Color', [0.8 0.4 0.1], 'LineWidth', 1.4);
-    ylabel('GPU Util (%)', 'FontWeight', 'bold');
-    ylim([0, 105]);
-else
-    plot(t, gpu_power, 'Color', [0.8 0.4 0.1], 'LineWidth', 1.4);
-    ylabel('GPU Power (W)', 'FontWeight', 'bold');
-end
+plot(t, gpu_power, 'Color', [0.75 0.75 0.75], 'LineWidth', 1.2, 'DisplayName', 'Raw power');
+hold on;
+plot(t, eff_power, 'Color', [0.8 0.35 0.0], 'LineWidth', 1.6, 'DisplayName', 'Eff. power (raw 	imes duty cycle)');
+ylabel('GPU Power (W)', 'FontWeight', 'bold');
+grid on; box on; xlim([min(t), max(t)]); ylim([0, nanmax(gpu_power) * 1.15]);
+for k = 1:numel(step_times), xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1); end
+for k = 1:numel(tgt_times),  xline(tgt_times(k),  '-',  'Color', [0.15 0.15 0.15], 'LineWidth', 2); end
+legend('Location', 'northwest');
+
+%% Panel 5 — Duty cycle
+ax5 = nexttile;
+plot(t, duty_cycle * 100, 'Color', [0.4 0.2 0.7], 'LineWidth', 1.4);
+ylabel('Duty Cycle (%)', 'FontWeight', 'bold');
+grid on; box on; xlim([min(t), max(t)]); ylim([0, 110]);
+for k = 1:numel(step_times), xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1); end
+for k = 1:numel(tgt_times),  xline(tgt_times(k),  '-',  'Color', [0.15 0.15 0.15], 'LineWidth', 2); end
+
+%% Panel 6 — Energy per request
+ax6 = nexttile;
+plot(t, energy_req, 'Color', [0.1 0.6 0.6], 'LineWidth', 1.4);
+ylabel('Energy/Req (J)', 'FontWeight', 'bold');
 xlabel('Elapsed time (s)', 'FontWeight', 'bold');
 grid on; box on; xlim([min(t), max(t)]);
-for k = 1:numel(step_times)
-    xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1);
-end
-for k = 1:numel(tgt_times)
-    xline(tgt_times(k), '-', 'Color', [0.15 0.15 0.15], 'LineWidth', 2);
-end
+for k = 1:numel(step_times), xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1); end
+for k = 1:numel(tgt_times),  xline(tgt_times(k),  '-',  'Color', [0.15 0.15 0.15], 'LineWidth', 2); end
 
 %% Link x-axes
-linkaxes([ax1, ax2, ax3, ax4], 'x');
+linkaxes([ax1, ax2, ax3, ax4, ax5, ax6], 'x');
 
 %% Save
 savefig(fig, fig_path);
