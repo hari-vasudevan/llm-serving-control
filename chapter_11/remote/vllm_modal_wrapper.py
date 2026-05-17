@@ -666,6 +666,298 @@ def run_internal_ttft_sweep(body):
     return {"status": "ok", "results": all_results}
 
 
+def run_internal_load_step(body):
+    """Disturbance rejection: fixed TTFT target with stepping offered load.
+
+    Experiment phases:
+      1. Warmup (open-loop, fixed fraction): builds queue steady-state so the
+         token-budget actuator has authority before the PI takes over.
+      2. Closed-loop load steps: PI adjusts admission_fraction (token_budget)
+         or dispatch_delay_ms (dispatch_delay) as QPS changes at step boundaries.
+
+    This demonstrates the same reconvergence story as Chapters 2b-9:
+      load↑ → TTFT spikes → controller increases throughput (raises fraction)
+              → queue drains → TTFT returns to target.
+    """
+    actuator = str(body.get("actuator", "token_budget"))
+    target_ttft = float(body.get("target_ttft_ms", 300.0))
+    load_steps = list(body.get("load_steps", [
+        {"qps": 2.0, "duration_s": 90.0},
+        {"qps": 4.0, "duration_s": 90.0},
+        {"qps": 2.0, "duration_s": 90.0},
+    ]))
+    warmup_qps = float(body.get("warmup_qps", 2.0))
+    warmup_s = float(body.get("warmup_s", 90.0))
+    warmup_fraction = float(body.get("warmup_fraction", 0.08))
+    kp = float(body.get("kp", 0.05))
+    ki = float(body.get("ki", 0.01))
+    fraction_min = float(body.get("fraction_min", 0.05))
+    fraction_max = float(body.get("fraction_max", 1.0))
+    max_delay_ms = float(body.get("max_delay_ms", 2000.0))
+    ttft_window = int(body.get("ttft_window", 20))
+    feedback_period_s = float(body.get("feedback_period_s", 0.5))
+    max_tokens = int(body.get("max_tokens", MAX_TOKENS_DEFAULT))
+    prompt_repeat = int(body.get("prompt_repeat", 64))
+    seed = int(body.get("seed", 10))
+    random.seed(seed)
+
+    # Mutable shared state (lists for closure capture).
+    phase_label = ["warmup"]
+    offered_qps = [warmup_qps]
+    dispatch_delay_ms = [0.0]
+    delay_xi = [0.0]
+
+    stop = threading.Event()
+    sem = threading.Semaphore(int(body.get("max_outstanding", 256)))
+    lock = threading.Lock()
+    records = []
+    power_samples = []
+    timeseries = []
+    recent_ttfts = collections.deque(maxlen=ttft_window)
+    sample_errors = []
+
+    t_start = time.perf_counter()
+
+    def check_alive():
+        try:
+            return requests.get(HEALTH_URL, timeout=3.0).ok
+        except Exception:
+            return False
+
+    def power_loop():
+        while not stop.is_set():
+            sample = gpu_snapshot()
+            sample["t"] = time.perf_counter()
+            power_samples.append(sample)
+            time.sleep(float(body.get("metric_period_s", 0.5)))
+
+    def feedback_loop():
+        while not stop.is_set():
+            if not check_alive():
+                log("load_step: vLLM backend down — stopping")
+                stop.set()
+                return
+            with lock:
+                window = list(recent_ttfts)
+                cur_phase = phase_label[0]
+                cur_qps = offered_qps[0]
+            measured = statistics.mean(window) if window else None
+
+            if cur_phase != "warmup" and measured is not None:
+                if actuator == "dispatch_delay":
+                    e_norm = (target_ttft - measured) / max(target_ttft, 1.0)
+                    at_floor = dispatch_delay_ms[0] <= 1e-6
+                    at_ceil = dispatch_delay_ms[0] >= max_delay_ms - 1e-6
+                    should_integrate = not (at_floor and e_norm < 0) and not (at_ceil and e_norm > 0)
+                    if should_integrate:
+                        delay_xi[0] = _clamp(delay_xi[0] + e_norm * feedback_period_s, -20.0, 20.0)
+                    delta_ms = (kp * e_norm + ki * delay_xi[0]) * target_ttft
+                    dispatch_delay_ms[0] = _clamp(dispatch_delay_ms[0] + delta_ms, 0.0, max_delay_ms)
+                else:
+                    # Token-budget: wrapper feeds measured TTFT; scheduler runs PI.
+                    write_scheduler_control({
+                        "mode": "ttft",
+                        "target_ttft_ms": target_ttft,
+                        "measured_ttft_ms": measured,
+                        "enabled": True,
+                        "kp": kp,
+                        "ki": ki,
+                        "fraction_min": fraction_min,
+                        "fraction_max": fraction_max,
+                        "source": "load_step_feedback",
+                        "timestamp": datetime.now().isoformat(),
+                    })
+
+            sched = scheduler_status() if actuator != "dispatch_delay" else {}
+            gpu = gpu_snapshot()
+            now = time.perf_counter()
+            timeseries.append({
+                "t": round(now - t_start, 3),
+                "phase": cur_phase,
+                "offered_qps": cur_qps,
+                "target_ttft_ms": target_ttft,
+                "measured_ttft_ms": round(measured, 2) if measured is not None else None,
+                "actuator": actuator,
+                "dispatch_delay_ms": round(dispatch_delay_ms[0], 2),
+                "delay_xi": round(delay_xi[0], 4),
+                "admission_fraction": sched.get("scheduler_admission_fraction"),
+                "token_cap": sched.get("scheduler_token_cap"),
+                "xi": sched.get("scheduler_xi"),
+                "gpu_power_w": gpu.get("gpu_power_w"),
+            })
+            time.sleep(feedback_period_s)
+
+    def one_request(i, measure):
+        prompt = make_benchmark_prompt(i, prompt_repeat)
+        t_send = time.perf_counter()
+        with lock:
+            delay_s = dispatch_delay_ms[0] / 1000.0
+            cur_phase = phase_label[0]
+        if delay_s > 0:
+            time.sleep(delay_s)
+        t_first = None
+        status = "ok"
+        try:
+            payload = {
+                "model": MODEL,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "stream": True,
+            }
+            with requests.post(
+                f"{BACKEND_URL}/v1/completions",
+                data=json.dumps(payload),
+                headers=headers(),
+                stream=True,
+                timeout=TIMEOUT,
+            ) as resp:
+                resp.raise_for_status()
+                for chunk in resp.iter_lines():
+                    if chunk and chunk != b"data: [DONE]" and t_first is None:
+                        t_first = time.perf_counter()
+        except Exception as exc:
+            status = f"error:{exc!r}"
+            with lock:
+                if len(sample_errors) < 5:
+                    sample_errors.append(repr(exc))
+        finally:
+            t_done = time.perf_counter()
+            if t_first is not None:
+                ttft_ms = 1000.0 * (t_first - t_send)
+                with lock:
+                    recent_ttfts.append(ttft_ms)
+            if measure:
+                with lock:
+                    records.append({
+                        "status": status,
+                        "ttft_ms": 1000.0 * (t_first - t_send) if t_first else None,
+                        "total_ms": 1000.0 * (t_done - t_send),
+                        "phase": cur_phase,
+                    })
+            sem.release()
+
+    # Set initial scheduler state for warmup phase.
+    write_scheduler_control({
+        "mode": "open_loop",
+        "admission_fraction": warmup_fraction if actuator == "token_budget" else 1.0,
+        "enabled": True,
+        "source": "load_step_warmup",
+        "timestamp": datetime.now().isoformat(),
+    })
+
+    power_thread = threading.Thread(target=power_loop, daemon=True)
+    feedback_thread = threading.Thread(target=feedback_loop, daemon=True)
+    power_thread.start()
+    feedback_thread.start()
+
+    def dispatch_phase(qps, duration_s, measure):
+        t_end = time.perf_counter() + duration_s
+        next_arrival = time.perf_counter()
+        idx = 0
+        threads = []
+        while time.perf_counter() < t_end and not stop.is_set():
+            now = time.perf_counter()
+            if now < next_arrival:
+                time.sleep(min(0.01, next_arrival - now))
+                continue
+            if sem.acquire(timeout=0.1):
+                idx += 1
+                t = threading.Thread(target=one_request, args=(idx, measure), daemon=True)
+                t.start()
+                threads.append(t)
+            next_arrival += random.expovariate(qps) if qps > 0 else 1.0
+        for t in threads:
+            t.join(timeout=TIMEOUT)
+
+    # Phase 1: warmup (open-loop, not measured).
+    log(f"load_step: warmup qps={warmup_qps} dur={warmup_s}s actuator={actuator} "
+        f"fraction={warmup_fraction if actuator == 'token_budget' else 1.0}")
+    with lock:
+        phase_label[0] = "warmup"
+        offered_qps[0] = warmup_qps
+    dispatch_phase(warmup_qps, warmup_s, measure=False)
+    log("load_step: warmup complete — switching to closed-loop")
+
+    # Switch to closed-loop. For token_budget, scheduler starts PI from the
+    # warmup equilibrium fraction (not reset to 1.0) so the transition is smooth.
+    # The scheduler resets _xi on mode change but preserves _admission_fraction.
+    if actuator == "token_budget":
+        write_scheduler_control({
+            "mode": "ttft",
+            "target_ttft_ms": target_ttft,
+            "measured_ttft_ms": None,
+            "enabled": True,
+            "kp": kp,
+            "ki": ki,
+            "fraction_min": fraction_min,
+            "fraction_max": fraction_max,
+            "source": "load_step_cl_start",
+            "timestamp": datetime.now().isoformat(),
+        })
+
+    # Phase 2: closed-loop load steps (measured).
+    for i, step in enumerate(load_steps):
+        qps = float(step["qps"])
+        dur = float(step["duration_s"])
+        label = f"step_{i}_qps{qps:.0f}"
+        log(f"load_step: {label} qps={qps} dur={dur}s")
+        with lock:
+            phase_label[0] = label
+            offered_qps[0] = qps
+        dispatch_phase(qps, dur, measure=True)
+
+    stop.set()
+    feedback_thread.join(timeout=5)
+    power_thread.join(timeout=5)
+
+    write_scheduler_control({
+        "mode": "open_loop",
+        "admission_fraction": 1.0,
+        "enabled": True,
+        "source": "load_step_done",
+        "timestamp": datetime.now().isoformat(),
+    })
+
+    ok = [r for r in records if r["status"] == "ok"]
+    ttfts = [r["ttft_ms"] for r in ok if r["ttft_ms"] is not None]
+    energy = integrate_power(power_samples)
+
+    step_summaries = []
+    for i, step in enumerate(load_steps):
+        label = f"step_{i}_qps{float(step['qps']):.0f}"
+        step_ok = [r for r in records if r.get("phase") == label and r["status"] == "ok"]
+        step_ttfts = [r["ttft_ms"] for r in step_ok if r["ttft_ms"] is not None]
+        step_summaries.append({
+            "step": i,
+            "qps": step["qps"],
+            "duration_s": step["duration_s"],
+            "requests_ok": len(step_ok),
+            "ttft_mean_ms": statistics.mean(step_ttfts) if step_ttfts else None,
+            "ttft_p95_ms": percentile(step_ttfts, 95),
+            "ttft_stdev_ms": statistics.stdev(step_ttfts) if len(step_ttfts) > 1 else None,
+        })
+
+    return {
+        "status": "ok",
+        "target_ttft_ms": target_ttft,
+        "actuator": actuator,
+        "warmup_qps": warmup_qps,
+        "warmup_s": warmup_s,
+        "warmup_fraction": warmup_fraction,
+        "load_steps": load_steps,
+        "requests_measured": len(records),
+        "requests_ok": len(ok),
+        "error_rate": 1.0 - len(ok) / max(len(records), 1),
+        "ttft_mean_ms": statistics.mean(ttfts) if ttfts else None,
+        "ttft_p95_ms": percentile(ttfts, 95),
+        "energy_j": energy,
+        "sample_errors": sample_errors[:5],
+        "step_summaries": step_summaries,
+        "timeseries": timeseries,
+    }
+
+
 def recent_arrival_rate():
     now = time.perf_counter()
     recent = [t for t in ARRIVAL_TS if now - t <= 10.0]
@@ -1195,6 +1487,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/run_internal_ttft_sweep":
             result = run_internal_ttft_sweep(body)
+            self._send_json(200, result)
+            return
+
+        if parsed.path == "/run_internal_load_step":
+            result = run_internal_load_step(body)
             self._send_json(200, result)
             return
 
