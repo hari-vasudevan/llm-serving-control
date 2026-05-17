@@ -33,6 +33,94 @@ gives a positive-gain, high-authority plant with no vLLM scheduler coupling.
 
 ---
 
+## Quickstart
+
+Five commands to go from a fresh clone to a running load-step experiment.
+
+### Prerequisites
+
+- Python 3.11+
+- A Modal account — sign up at [modal.com](https://modal.com) (free tier works)
+- No GPU, no local model download — everything runs inside Modal's T4 container
+
+### One-time setup
+
+```bash
+# From the repo root
+python3 -m venv .modal-venv
+source .modal-venv/bin/activate
+pip install modal
+modal setup          # opens browser to authenticate; paste the token
+```
+
+### Deploy the Modal app
+
+```bash
+source .modal-venv/bin/activate
+modal deploy chapter_11/modal_vllm_wrapper.py
+```
+
+Modal prints a URL like `https://hvasudevan--chapter-11-token-budget-serve.modal.run`.
+The first deploy downloads Qwen/Qwen2.5-3B-Instruct (~6GB) into the container
+image — this takes a few minutes once and is cached for all future deploys.
+
+Wait until the container is ready:
+
+```bash
+curl https://YOUR-ENDPOINT.modal.run/health
+# expect: {"status":"ok","model":"Qwen/Qwen2.5-3B-Instruct","q_sw":0,"B":16}
+```
+
+### Run a load-step experiment
+
+```bash
+python3 chapter_11/python/run_load_step.py \
+  --url https://YOUR-ENDPOINT.modal.run \
+  --target-ttft-ms 200 350 500 \
+  --kp 0.03 --ki 0.002 \
+  --ttft-window 3 --feedback-period-s 0.1 \
+  --warmup-qps 4 --warmup-s 20
+```
+
+This runs for about 10 minutes. When it finishes:
+- `chapter_11/python/results/load_step_TIMESTAMP/plots/subplot_200_350_500ms.svg`
+  — five-panel subplot (load · TTFT · delay · eff. power · energy/req)
+- `chapter_11/python/results/load_step_TIMESTAMP/step_summaries.json`
+  — mean/p95/std per target × per QPS level
+- `chapter_11/python/results/load_step_TIMESTAMP/timeseries.json`
+  — full 0.5s-resolution timeseries
+
+### Generate the QA replay video
+
+```bash
+python3 chapter_11/python/make_video.py \
+  chapter_11/python/results/load_step_TIMESTAMP --speed 5
+```
+
+Requires `matplotlib`, `Pillow`, and `ffmpeg` (install via Homebrew:
+`brew install ffmpeg`). Writes `qa_video.mp4` alongside the timeseries.
+
+### Open the MATLAB figure
+
+```matlab
+cd chapter_11/python/results/load_step_TIMESTAMP
+view_figure    % opens results.fig with linked axes
+```
+
+### Tail logs
+
+```bash
+modal app logs chapter-11-token-budget
+```
+
+### Tear down
+
+```bash
+modal app stop chapter-11-token-budget
+```
+
+---
+
 ## System Architecture
 
 ```

@@ -126,6 +126,67 @@ Chapter 10's failure defined Chapter 11's design:
 
 ---
 
+## Reproducing the Experiment
+
+The admission fraction sweep that produced the table above was run using the
+Chapter 11 infrastructure (the Ch10 Python runner was incomplete at the time).
+To reproduce it with the Chapter 10 Modal wrapper:
+
+### 1. Prerequisites
+
+- Python 3.11+ with Modal account
+- Modal CLI installed and authenticated (see root README for one-time setup)
+
+### 2. Deploy to Modal
+
+```bash
+source .modal-venv/bin/activate
+modal deploy chapter_10/modal_vllm_wrapper.py
+```
+
+Wait for the health check:
+
+```bash
+curl https://YOUR-ENDPOINT.modal.run/health
+# expect: {"status":"ok","model":"Qwen/Qwen2.5-3B-Instruct",...}
+```
+
+### 3. Run a fraction sweep
+
+The Chapter 10 runner accepts a sequence of queue-wait targets, but since
+queue wait is always ~0ms in continuous batching, the meaningful parameter
+to sweep is admission fraction via the `/control/queue_wait_target` endpoint.
+
+Use the Chapter 11 budget sweep runner against the Chapter 10 endpoint:
+
+```bash
+python3 chapter_11/python/run_budget_sweep.py \
+  --url https://YOUR-ENDPOINT.modal.run \
+  --admission-fractions 1.0 0.75 0.5 0.25 0.1 0.05 \
+  --offered-rate-qps 2 \
+  --duration-s 45 \
+  --warmup-s 10
+```
+
+Results are written to `chapter_11/python/results/budget_sweep_TIMESTAMP/`.
+
+### 4. Observe the ControlledScheduler
+
+The scheduler logs appear in Modal:
+
+```bash
+modal app logs chapter-10-vllm-admission
+```
+
+Look for lines like `CH10 ControlledScheduler loaded` and
+`max_num_scheduled_tokens capped` to confirm the hook is active.
+
+### 5. Tear down
+
+```bash
+modal app stop chapter-10-vllm-admission
+```
+
 ## Files
 
 ```text

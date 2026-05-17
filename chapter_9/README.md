@@ -104,34 +104,76 @@ This removes:
 - `matlab/ch9_closed_loop_1.png`
   Earlier closed-loop reference run retained for comparison.
 
-## Run Flow
+## Prerequisites
 
-The real Chapter 9 GPU experiment runs on Modal, not on the local Mac.
+- MATLAB R2024b or newer with Control System Toolbox
+- Python 3.11+ with a Modal account
+- Modal CLI installed and authenticated (see root README for one-time setup)
+
+## How to Run
+
+### 1. Deploy to Modal
 
 From the repository root:
 
 ```bash
-python3 -m venv .modal-venv
 source .modal-venv/bin/activate
-pip install modal
-modal setup
 modal deploy chapter_9/modal_gpu_batch_server.py
 ```
 
-Modal prints a web URL.  Put that URL in `CH9_SERVER` before running MATLAB.
-For example:
+Modal prints a URL. Wait for the container to be ready:
+
+```bash
+curl https://YOUR-ENDPOINT.modal.run/health
+# expect: {"status": "ok", ...}
+```
+
+### 2. Set the URL in MATLAB
 
 ```matlab
-setenv('CH9_SERVER', 'https://YOUR-MODAL-URL.modal.run')
+setenv('CH9_SERVER', 'https://YOUR-ENDPOINT.modal.run')
+```
+
+### 3. Run the MATLAB experiment
+
+```matlab
+cd chapter_9/matlab
+characterise_plant        % runs in-container open-loop sweeps, fits plant
+design_controller         % computes cascade gains from identified params
+run_cascade_controller    % closed-loop run with load steps + L_mean reference changes
+```
+
+`characterise_plant` calls `POST /characterise` so the arrival generator runs
+inside the Modal GPU container — MATLAB only receives the fitted summary.
+
+`design_controller` writes `controller_config.xml` locally and uploads it to
+the container via `POST /controller_config`.
+
+`run_cascade_controller` asks Modal to execute the timed experiment.
+MATLAB receives per-tick traces and produces `ch9_closed_loop.png`.
+
+### 4. Local CPU smoke test (no GPU, no Modal)
+
+```bash
+cd chapter_9/python
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python gpu_batch_server.py --device cpu --port 8019 --initial-B 8 --dim 256 --layers 2
 ```
 
 Then in MATLAB:
 
 ```matlab
+setenv('CH9_SERVER', 'http://127.0.0.1:8019')
 cd chapter_9/matlab
-characterise_plant
-design_controller
-run_cascade_controller
+characterise_plant     % runs against the local CPU server
+```
+
+### 5. Tear down
+
+```bash
+modal app stop chapter-9-gpu-batch-server
 ```
 
 `characterise_plant` calls:

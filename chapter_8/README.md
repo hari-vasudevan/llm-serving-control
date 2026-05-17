@@ -143,36 +143,68 @@ That is the current preferred Hugging Face fast-transfer path. If a future
 stack still logs the legacy `hf_transfer` message, install
 `huggingface_hub[hf_transfer]` and set `HF_HUB_ENABLE_HF_TRANSFER=1`.
 
-## High-level run flow
+## Prerequisites
 
-1. Deploy the Modal service:
+- MATLAB R2024b or newer with Control System Toolbox
+- Python 3.11+ with a Modal account
+- Modal CLI installed and authenticated (see root README for one-time setup)
 
-   ```bash
-   python3 -m venv .modal-venv
-   source .modal-venv/bin/activate
-   pip install modal
-   modal setup
-   modal deploy chapter_8/modal_vllm_wrapper.py
-   ```
+## How to Run
 
-2. Set the resulting endpoint URL inside the MATLAB scripts.
+### 1. Deploy to Modal
 
-3. In MATLAB:
+From the repository root:
 
-   ```matlab
-   cd chapter_8/matlab
-   characterise_plant
-   design_controller
-   run_cascade_controller
-   ```
+```bash
+source .modal-venv/bin/activate     # activate the shared Modal venv
+modal deploy chapter_8/modal_vllm_wrapper.py
+```
 
-4. Tail Modal logs:
+Modal prints a URL like `https://hvasudevan--chapter-8-vllm-wrapper.modal.run`.
 
-   ```bash
-   modal app logs chapter-8-vllm-wrapper
-   ```
+Wait for the health check:
 
-5. Review MATLAB logs and `.mat` outputs in `chapter_8/matlab`.
+```bash
+curl https://YOUR-ENDPOINT/health
+```
+
+### 2. Set the URL in MATLAB
+
+```matlab
+setenv('CH8_SERVER', 'https://YOUR-ENDPOINT.modal.run')
+```
+
+### 3. Run the MATLAB experiment
+
+```matlab
+cd chapter_8/matlab
+characterise_plant        % sweeps B, identifies q_mean(B) and l_mean(q)
+design_controller         % fits slopes, computes cascade gains
+run_cascade_controller    % closed-loop run with steady + spiky load
+```
+
+Each script reads `CH8_SERVER` from the environment. Results are saved as
+`.mat` files and plots (`ch8_characterise.png`, `ch8_closed_loop.png`) in
+`chapter_8/matlab/`.
+
+### 4. Tail logs
+
+```bash
+modal app logs chapter-8-vllm-wrapper
+```
+
+### 5. Tear down
+
+```bash
+modal app stop chapter-8-vllm-wrapper
+```
+
+## Expected Outcome
+
+`characterise_plant` produces a negative outer slope (`l_mean = -4.9·q + 649`).
+That is the failure indicator — a negative `q → l_mean` relationship is not a
+credible queueing law. The cascade cannot regulate latency at the top-level
+LLM API layer.
 
 ## Chapter 9 handoff
 

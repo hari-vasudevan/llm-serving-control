@@ -8,6 +8,54 @@ The recurring lesson: characterising the plant is the most important step in con
 
 ---
 
+## Getting Started
+
+### What you need
+
+| Tool | Used in | Install |
+|------|---------|---------|
+| MATLAB R2024b+ with Control System Toolbox | Ch 1–9 | mathworks.com |
+| Simulink | Ch 1–6 (visual models, optional) | included with MATLAB |
+| Python 3.11+ | Ch 5, 7–11 | python.org |
+| Modal account | Ch 7–11 (remote GPU) | [modal.com](https://modal.com) — free tier works |
+| Ollama | Ch 3–4 (local M-Mac) | `brew install ollama` |
+| ffmpeg | Ch 11 (video generation) | `brew install ffmpeg` |
+
+Chapters 1–2a are pure MATLAB simulation — no network, no model download,
+no GPU required.
+
+### One-time Modal setup (needed for Ch 7–11)
+
+```bash
+# From the repository root
+python3 -m venv .modal-venv
+source .modal-venv/bin/activate
+pip install modal
+modal setup          # opens browser login; paste the token back
+```
+
+This `.modal-venv` is reused by all chapters. Activate it with
+`source .modal-venv/bin/activate` before any `modal` command.
+
+### How the chapters are structured
+
+Each chapter directory follows the same rough shape:
+
+```text
+chapter_N/
+  README.md                     ← start here
+  modal_vllm_wrapper.py         ← Modal entrypoint (if remote GPU chapter)
+  remote/vllm_modal_wrapper.py  ← HTTP server running inside Modal container
+  python/                       ← local experiment runners and plotters
+  matlab/                       ← MATLAB controller and identification scripts
+  simulink_model/               ← Simulink model (if MATLAB chapter)
+```
+
+For chapters with Modal: deploy first, wait for `/health`, then run the
+local Python or MATLAB scripts against the live URL.
+
+---
+
 ## Chapter map
 
 | # | Plant | Architecture | Outcome |
