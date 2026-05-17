@@ -1,0 +1,37 @@
+{
+  "target_ttft_ms": [
+    200.0,
+    350.0,
+    500.0
+  ],
+  "actuator": "dispatch_delay",
+  "warmup_qps": 4.0,
+  "warmup_s": 20.0,
+  "warmup_fraction": 0.08,
+  "load_steps": [
+    {
+      "qps": 4.0,
+      "duration_s": 60.0
+    },
+    {
+      "qps": 8.0,
+      "duration_s": 60.0
+    },
+    {
+      "qps": 4.0,
+      "duration_s": 60.0
+    }
+  ],
+  "kp": 0.03,
+  "ki": 0.002,
+  "fraction_min": 0.05,
+  "fraction_max": 1.0,
+  "max_delay_ms": 2000.0,
+  "ttft_window": 10,
+  "feedback_period_s": 0.1,
+  "max_tokens": 32,
+  "prompt_repeat": 64,
+  "max_outstanding": 256,
+  "metric_period_s": 0.5,
+  "seed": 10
+}

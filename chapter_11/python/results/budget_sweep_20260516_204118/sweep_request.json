@@ -1,0 +1,19 @@
+{
+  "admission_fractions": [
+    1.0,
+    0.75,
+    0.5,
+    0.25,
+    0.1,
+    0.05
+  ],
+  "offered_rate_qps": 2.0,
+  "duration_s": 45.0,
+  "warmup_s": 10.0,
+  "settle_s": 2.0,
+  "max_tokens": 32,
+  "prompt_repeat": 64,
+  "max_outstanding": 256,
+  "metric_period_s": 0.5,
+  "seed": 10
+}
