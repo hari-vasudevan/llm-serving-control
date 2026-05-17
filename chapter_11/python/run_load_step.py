@@ -34,9 +34,9 @@ from plot_load_step import plot_result, write_matlab_scripts
 
 
 DEFAULT_LOAD_STEPS = [
-    {"qps": 4.0, "duration_s": 90.0},
-    {"qps": 8.0, "duration_s": 90.0},
-    {"qps": 4.0, "duration_s": 90.0},
+    {"qps": 4.0, "duration_s": 60.0},
+    {"qps": 8.0, "duration_s": 60.0},
+    {"qps": 4.0, "duration_s": 60.0},
 ]
 DEFAULT_TARGETS = [200.0, 350.0, 500.0]
 
@@ -63,20 +63,20 @@ def main() -> None:
                     choices=["dispatch_delay", "token_budget"])
     # Warmup
     ap.add_argument("--warmup-qps", type=float, default=4.0)
-    ap.add_argument("--warmup-s", type=float, default=30.0)
+    ap.add_argument("--warmup-s", type=float, default=20.0)
     ap.add_argument("--warmup-fraction", type=float, default=0.08,
                     help="Open-loop fraction during warmup (token_budget only)")
     # Load steps
     ap.add_argument("--load-steps-json", default=None,
-                    help='JSON array e.g. \'[{"qps":4,"duration_s":90},{"qps":8,"duration_s":90}]\'')
+                    help='JSON array e.g. \'[{"qps":4,"duration_s":60},{"qps":8,"duration_s":60}]\'')
     # Controller
-    ap.add_argument("--kp", type=float, default=0.05)
-    ap.add_argument("--ki", type=float, default=0.005)
+    ap.add_argument("--kp", type=float, default=0.03)
+    ap.add_argument("--ki", type=float, default=0.002)
     ap.add_argument("--fraction-min", type=float, default=0.05)
     ap.add_argument("--fraction-max", type=float, default=1.0)
     ap.add_argument("--max-delay-ms", type=float, default=2000.0)
     ap.add_argument("--ttft-window", type=int, default=10)
-    ap.add_argument("--feedback-period-s", type=float, default=0.5)
+    ap.add_argument("--feedback-period-s", type=float, default=0.1)
     # Request shape
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--prompt-repeat", type=int, default=64)
@@ -113,84 +113,74 @@ def _run(args: argparse.Namespace, load_steps: list[dict], out_dir: Path) -> Non
     targets = args.target_ttft_ms
     print(f"[targets] {targets}", flush=True)
     print(f"[load_steps] {load_steps}", flush=True)
+    print(f"[gains] kp={args.kp} ki={args.ki} window={args.ttft_window} "
+          f"feedback_period={args.feedback_period_s}s", flush=True)
 
     wait_for_health(args.url)
 
     endpoint = f"{args.url.rstrip('/')}/run_internal_load_step"
 
-    # Loop targets on the client side — one HTTP request per target (~5 min each).
-    # Results are written to disk immediately so a failure on a later target
-    # doesn't lose data from already-completed targets.
-    # A health wait before each target handles container cold-starts gracefully.
-    results_list: list[dict] = []
-    all_plot_paths: list[Path] = []
-    for i, target in enumerate(targets):
-        # Re-confirm container is up before each target (may cold-start between runs)
-        if i > 0:
-            print(f"\n[health] waiting for container before target {i+1}...", flush=True)
-            wait_for_health(args.url)
+    # All targets are sent in a single HTTP call so the server chains them with
+    # shared controller state — you see the live re-settling transient between
+    # setpoints in one continuous timeseries.
+    payload = {
+        "target_ttft_ms": [float(t) for t in targets],
+        "actuator": args.actuator,
+        "warmup_qps": args.warmup_qps,
+        "warmup_s": args.warmup_s,
+        "warmup_fraction": args.warmup_fraction,
+        "load_steps": load_steps,
+        "kp": args.kp,
+        "ki": args.ki,
+        "fraction_min": args.fraction_min,
+        "fraction_max": args.fraction_max,
+        "max_delay_ms": args.max_delay_ms,
+        "ttft_window": args.ttft_window,
+        "feedback_period_s": args.feedback_period_s,
+        "max_tokens": args.max_tokens,
+        "prompt_repeat": args.prompt_repeat,
+        "max_outstanding": args.max_outstanding,
+        "metric_period_s": args.metric_period_s,
+        "seed": args.seed,
+    }
+    _write_json(out_dir / "request.json", payload)
+    print(f"\n[POST] {endpoint}", flush=True)
 
-        payload = {
-            "target_ttft_ms": float(target),
-            "actuator": args.actuator,
-            "warmup_qps": args.warmup_qps,
-            "warmup_s": args.warmup_s,
-            "warmup_fraction": args.warmup_fraction,
-            "load_steps": load_steps,
-            "kp": args.kp,
-            "ki": args.ki,
-            "fraction_min": args.fraction_min,
-            "fraction_max": args.fraction_max,
-            "max_delay_ms": args.max_delay_ms,
-            "ttft_window": args.ttft_window,
-            "feedback_period_s": args.feedback_period_s,
-            "max_tokens": args.max_tokens,
-            "prompt_repeat": args.prompt_repeat,
-            "max_outstanding": args.max_outstanding,
-            "metric_period_s": args.metric_period_s,
-            "seed": args.seed,
-        }
-        _write_json(out_dir / f"request_target{int(target)}ms.json", payload)
-        print(f"\n[target {i+1}/{len(targets)}] {target}ms  POST {endpoint}", flush=True)
+    t0 = time.perf_counter()
+    status, text = _post_json(endpoint, payload, timeout_s=args.timeout_s)
+    elapsed = time.perf_counter() - t0
+    print(f"[response] status={status} elapsed_s={elapsed:.1f}", flush=True)
 
-        t0 = time.perf_counter()
-        status, text = _post_json(endpoint, payload, timeout_s=args.timeout_s)
-        elapsed = time.perf_counter() - t0
-        print(f"[response] status={status} elapsed_s={elapsed:.1f}", flush=True)
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"POST {endpoint} failed HTTP {status}: {text[:2000]}")
 
-        if status < 200 or status >= 300:
-            raise RuntimeError(f"POST {endpoint} failed HTTP {status}: {text[:2000]}")
+    raw = json.loads(text)
+    raw["client_elapsed_s"] = elapsed
+    raw["client_timestamp"] = datetime.now().isoformat()
 
-        raw = json.loads(text)
-        raw["client_elapsed_s"] = elapsed
-        raw["client_timestamp"] = datetime.now().isoformat()
-        results_list.append(raw)
+    ts = raw.get("timeseries", [])
+    _write_json(out_dir / "timeseries.json", ts)
+    _write_json(out_dir / "step_summaries.json", raw.get("step_summaries", []))
+    _write_json(out_dir / "qa_log.json", raw.get("qa_log", []))
+    _write_json(out_dir / "summary.json", {k: v for k, v in raw.items()
+                                           if k not in ("timeseries", "qa_log")})
 
-        # Write per-target data to disk immediately
-        tgt_key = int(raw.get("target_ttft_ms", target))
-        tdir = out_dir / f"target_{tgt_key}ms"
-        tdir.mkdir(exist_ok=True)
+    print(f"\n[step_summaries]", flush=True)
+    prev_tgt = None
+    for ss in raw.get("step_summaries", []):
+        tgt = ss.get("target_ttft_ms")
+        if tgt != prev_tgt:
+            print(f"  target={tgt}ms", flush=True)
+            prev_tgt = tgt
+        print(f"    qps={ss['qps']}  mean={ss.get('ttft_mean_ms', 'N/A')}ms  "
+              f"p95={ss.get('ttft_p95_ms', 'N/A')}ms  "
+              f"std={ss.get('ttft_stdev_ms', 'N/A')}ms", flush=True)
 
-        ts = raw.get("timeseries", [])
-        _write_json(tdir / "timeseries.json", ts)
-        _write_json(tdir / "step_summaries.json", raw.get("step_summaries", []))
-        _write_json(tdir / "qa_log.json", raw.get("qa_log", []))
-        _write_json(tdir / "summary.json", {k: v for k, v in raw.items()
-                                             if k not in ("timeseries", "qa_log")})
+    plots_dir = out_dir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+    all_plot_paths = plot_result(ts, raw, plots_dir)
 
-        plots_dir = tdir / "plots"
-        plots_dir.mkdir(exist_ok=True)
-        paths = plot_result(ts, raw, plots_dir)
-        all_plot_paths.extend(paths)
-
-        print(f"\n[target={tgt_key}ms] step_summaries:", flush=True)
-        for ss in raw.get("step_summaries", []):
-            print(f"  qps={ss['qps']}  mean={ss.get('ttft_mean_ms', 'N/A')}ms  "
-                  f"p95={ss.get('ttft_p95_ms', 'N/A')}ms  "
-                  f"std={ss.get('ttft_stdev_ms', 'N/A')}ms", flush=True)
-
-    # Generate MATLAB scripts (single + combined)
-    matlab_paths = write_matlab_scripts(results_list, out_dir)
+    matlab_paths = write_matlab_scripts([raw], out_dir)
     all_plot_paths.extend(matlab_paths)
 
     _write_json(out_dir / "plot_manifest.json", [str(p) for p in all_plot_paths])
@@ -199,7 +189,7 @@ def _run(args: argparse.Namespace, load_steps: list[dict], out_dir: Path) -> Non
         print(f"[output] {p}", flush=True)
     print(f"\n[done] {out_dir}", flush=True)
 
-    return out_dir, results_list
+    return out_dir, raw
 
 
 # ── network helpers ────────────────────────────────────────────────────────────

@@ -1,0 +1,92 @@
+[
+  {
+    "target_ttft_ms": 200.0,
+    "step": 0,
+    "qps": 4.0,
+    "duration_s": 60.0,
+    "requests_ok": 223,
+    "ttft_mean_ms": 198.3954111883373,
+    "ttft_p95_ms": 268.48087600001236,
+    "ttft_stdev_ms": 41.35597180039195
+  },
+  {
+    "target_ttft_ms": 200.0,
+    "step": 1,
+    "qps": 8.0,
+    "duration_s": 60.0,
+    "requests_ok": 494,
+    "ttft_mean_ms": 200.6384923562677,
+    "ttft_p95_ms": 220.2442099999189,
+    "ttft_stdev_ms": 12.045526884222687
+  },
+  {
+    "target_ttft_ms": 200.0,
+    "step": 2,
+    "qps": 4.0,
+    "duration_s": 60.0,
+    "requests_ok": 251,
+    "ttft_mean_ms": 200.92265303187324,
+    "ttft_p95_ms": 230.83354900018094,
+    "ttft_stdev_ms": 16.893045417499692
+  },
+  {
+    "target_ttft_ms": 350.0,
+    "step": 0,
+    "qps": 4.0,
+    "duration_s": 60.0,
+    "requests_ok": 248,
+    "ttft_mean_ms": 351.7617211814559,
+    "ttft_p95_ms": 437.31484599993564,
+    "ttft_stdev_ms": 49.563942514223704
+  },
+  {
+    "target_ttft_ms": 350.0,
+    "step": 1,
+    "qps": 8.0,
+    "duration_s": 60.0,
+    "requests_ok": 452,
+    "ttft_mean_ms": 348.8645288694697,
+    "ttft_p95_ms": 364.83694799994737,
+    "ttft_stdev_ms": 10.696578053935283
+  },
+  {
+    "target_ttft_ms": 350.0,
+    "step": 2,
+    "qps": 4.0,
+    "duration_s": 60.0,
+    "requests_ok": 254,
+    "ttft_mean_ms": 351.0482425551173,
+    "ttft_p95_ms": 375.79559400001017,
+    "ttft_stdev_ms": 17.86954845144751
+  },
+  {
+    "target_ttft_ms": 500.0,
+    "step": 0,
+    "qps": 4.0,
+    "duration_s": 60.0,
+    "requests_ok": 245,
+    "ttft_mean_ms": 502.14161544488667,
+    "ttft_p95_ms": 597.9965740000353,
+    "ttft_stdev_ms": 49.87585194642249
+  },
+  {
+    "target_ttft_ms": 500.0,
+    "step": 1,
+    "qps": 8.0,
+    "duration_s": 60.0,
+    "requests_ok": 489,
+    "ttft_mean_ms": 499.91717603680956,
+    "ttft_p95_ms": 520.4282679999324,
+    "ttft_stdev_ms": 13.313947200248434
+  },
+  {
+    "target_ttft_ms": 500.0,
+    "step": 2,
+    "qps": 4.0,
+    "duration_s": 60.0,
+    "requests_ok": 235,
+    "ttft_mean_ms": 499.4888912383063,
+    "ttft_p95_ms": 528.602009999986,
+    "ttft_stdev_ms": 20.00326469267957
+  }
+]

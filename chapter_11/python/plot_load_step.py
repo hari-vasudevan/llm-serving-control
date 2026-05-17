@@ -77,16 +77,17 @@ def _hline(y: float, x0: float, x1: float,
 
 def _subplot_figure(ts: list[dict], result: dict) -> str:
     """Four vertically stacked panels sharing the same x-axis."""
-    target = float(result.get("target_ttft_ms", 300.0))
+    targets_raw = result.get("target_ttft_ms", 300.0)
+    all_targets = targets_raw if isinstance(targets_raw, list) else [float(targets_raw)]
     actuator = str(result.get("actuator", "token_budget"))
     act_key = "dispatch_delay_ms" if actuator == "dispatch_delay" else "admission_fraction"
     ctrl_label = "Dispatch Delay (ms)" if actuator == "dispatch_delay" else "Adm. Fraction"
 
     PANELS = [
-        ("offered_qps",      "Load (req/s)",      None),
-        ("measured_ttft_ms", "TTFT (ms)",          target),
-        (act_key,            ctrl_label,           None),
-        ("gpu_power_w",      "GPU Power (W)",      None),
+        ("offered_qps",       "Load (req/s)",      None),
+        ("measured_ttft_ms",  "TTFT (ms)",         "step"),   # "step" signals step-function target
+        (act_key,             ctrl_label,           None),
+        ("gpu_util_percent",  "GPU Util (%)",       None),
     ]
 
     # Layout constants
@@ -118,9 +119,20 @@ def _subplot_figure(ts: list[dict], result: dict) -> str:
     svg = _open(W, H)
     svg += _rect(0, 0, W, H, "#f8f8f8")
 
+    # Target step values from timeseries (used for step-function reference line)
+    ts_targets = [r.get("target_ttft_ms") for r in ts]
+
+    # Detect target-transition x-positions (where target_ttft_ms changes between non-warmup samples)
+    target_xs: list[float] = []
+    for i in range(1, len(ts)):
+        if (ts_targets[i] is not None and ts_targets[i - 1] is not None
+                and ts_targets[i] != ts_targets[i - 1]):
+            target_xs.append(tx(times[i]))
+
     # Title
+    tgt_str = "/".join(f"{t:.0f}" for t in all_targets)
     svg += _txt(W // 2, 26,
-                f"TTFT Load-Step  |  target={target:.0f} ms  |  actuator={actuator}",
+                f"TTFT Load-Step  |  targets={tgt_str} ms  |  actuator={actuator}",
                 size=13, bold=True)
 
     for pi, (key, ylabel, target_val) in enumerate(PANELS):
@@ -135,7 +147,12 @@ def _subplot_figure(ts: list[dict], result: dict) -> str:
             continue
 
         v_min, v_max = min(finite), max(finite)
-        if target_val is not None:
+        if target_val == "step":
+            # TTFT panel: account for all target setpoints in y-scale
+            for tgt in all_targets:
+                v_min = min(v_min, tgt * 0.8)
+                v_max = max(v_max, tgt * 1.25)
+        elif target_val is not None:
             v_min = min(v_min, target_val * 0.8)
             v_max = max(v_max, target_val * 1.25)
         pad = (v_max - v_min) * 0.08 or 5.0
@@ -155,12 +172,38 @@ def _subplot_figure(ts: list[dict], result: dict) -> str:
             svg += (f'<line x1="{ML}" y1="{gy:.1f}" x2="{ML + PW}" y2="{gy:.1f}" '
                     f'stroke="#eeeeee" stroke-width="1"/>\n')
 
-        # Step boundary vertical lines
+        # QPS step boundary vertical lines
         for sx in step_xs:
             svg += _vline(sx, y_top, y_bot, "#888", "5,4", 1.3)
 
-        # Target horizontal line
-        if target_val is not None:
+        # Target-transition vertical lines (thicker, dark)
+        for tx_ in target_xs:
+            svg += _vline(tx_, y_top, y_bot, "#333", "8,3", 2.0)
+
+        # Target reference line(s)
+        if target_val == "step":
+            # Step-function reference: connect per-sample target_ttft_ms values
+            seg_pts: list[tuple[float, float]] = []
+            prev_tgt_v = None
+            for i, (t_i, tgt_v) in enumerate(zip(times, ts_targets)):
+                if tgt_v is None:
+                    continue
+                if prev_tgt_v is not None and tgt_v != prev_tgt_v:
+                    # Vertical jump: close previous segment, start new
+                    svg += _poly(seg_pts, "#dd3333", width=1.8)
+                    seg_pts = []
+                seg_pts.append((tx(t_i), ty(tgt_v)))
+                prev_tgt_v = tgt_v
+            if seg_pts:
+                svg += _poly(seg_pts, "#dd3333", width=1.8)
+            # Label each unique target at the right edge
+            seen: set = set()
+            for tgt_v in reversed(ts_targets):
+                if tgt_v is not None and tgt_v not in seen:
+                    seen.add(tgt_v)
+                    svg += _txt(ML + PW - 3, ty(tgt_v) - 5,
+                                f"{tgt_v:.0f}ms", anchor="end", size=9, color="#dd3333")
+        elif target_val is not None:
             ty_target = ty(target_val)
             svg += _hline(ty_target, ML, ML + PW)
             svg += _txt(ML + PW - 3, ty_target - 5,
@@ -233,15 +276,14 @@ def _subplot_figure(ts: list[dict], result: dict) -> str:
 # ── MATLAB script generation ───────────────────────────────────────────────────
 
 def _matlab_single(ts_path: str, target_ttft: float, out_dir: str) -> str:
-    """Return MATLAB code for a single-target load-step figure."""
+    """Return MATLAB code for a (single or chained) load-step figure."""
     return f"""%% Chapter 11 — Load Step Disturbance Rejection
-%  target TTFT = {target_ttft:.0f} ms
 %  Auto-generated by plot_load_step.py — do not edit by hand.
 
 clear; close all;
 
-ts_path   = fullfile('{out_dir}', 'timeseries.json');
-fig_path  = fullfile('{out_dir}', 'results_{target_ttft:.0f}ms.fig');
+ts_path  = '{ts_path}';
+fig_path = fullfile('{out_dir}', 'results.fig');
 
 %% Load timeseries
 raw = jsondecode(fileread(ts_path));
@@ -252,7 +294,8 @@ measured_ttft   = NaN(1, n);
 admission_frac  = NaN(1, n);
 dispatch_delay  = NaN(1, n);
 gpu_power       = NaN(1, n);
-target_ttft_val = {target_ttft:.1f};
+gpu_util        = NaN(1, n);
+target_ref      = NaN(1, n);   % per-sample setpoint (steps when target changes)
 phase_cell      = cell(1, n);
 
 for i = 1:n
@@ -272,6 +315,12 @@ for i = 1:n
     if isfield(raw(i), 'gpu_power_w') && ~isempty(raw(i).gpu_power_w)
         gpu_power(i) = raw(i).gpu_power_w;
     end
+    if isfield(raw(i), 'gpu_util_percent') && ~isempty(raw(i).gpu_util_percent)
+        gpu_util(i) = raw(i).gpu_util_percent;
+    end
+    if isfield(raw(i), 'target_ttft_ms') && ~isempty(raw(i).target_ttft_ms)
+        target_ref(i) = raw(i).target_ttft_ms;
+    end
     if isfield(raw(i), 'phase')
         phase_cell{{i}} = raw(i).phase;
     else
@@ -279,16 +328,19 @@ for i = 1:n
     end
 end
 
-%% Step boundary times
+%% Phase-change times (QPS steps + target transitions)
 phase_changes = [true, ~strcmp(phase_cell(1:end-1), phase_cell(2:end))];
 step_times    = t(phase_changes);
 
+%% Target-transition times (where setpoint value changes)
+tgt_changes   = [false, diff(target_ref) ~= 0];
+tgt_times     = t(tgt_changes);
+
 %% Figure
-fig = figure('Name', sprintf('Load Step — target=%dms', round(target_ttft_val)), ...
-    'Position', [80 80 1050 860]);
+fig = figure('Name', 'Load Step — Chained Targets', 'Position', [80 80 1100 860]);
 tl = tiledlayout(4, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
-title(tl, sprintf('Chapter 11  Load-Step Disturbance Rejection  (target TTFT = %d ms)', ...
-    round(target_ttft_val)), 'FontSize', 13, 'FontWeight', 'bold');
+title(tl, 'Chapter 11  Load-Step Disturbance Rejection — Chained Targets', ...
+    'FontSize', 13, 'FontWeight', 'bold');
 
 %% Panel 1 — Offered load
 ax1 = nexttile;
@@ -296,26 +348,30 @@ stairs(t, offered_qps, 'b-', 'LineWidth', 2);
 ylabel('Load (req/s)', 'FontWeight', 'bold');
 grid on; box on; xlim([min(t), max(t)]);
 for k = 1:numel(step_times)
-    xline(step_times(k), '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
+    xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1);
+end
+for k = 1:numel(tgt_times)
+    xline(tgt_times(k), '-', 'Color', [0.15 0.15 0.15], 'LineWidth', 2);
 end
 
-%% Panel 2 — TTFT
+%% Panel 2 — TTFT with step-function target reference
 ax2 = nexttile;
 plot(t, measured_ttft, 'Color', [0.22 0.51 0.77], 'LineWidth', 1.4);
 hold on;
-yline(target_ttft_val, 'r--', 'LineWidth', 1.8, ...
-    'Label', sprintf('target = %d ms', round(target_ttft_val)), ...
-    'LabelHorizontalAlignment', 'right');
+stairs(t, target_ref, 'r--', 'LineWidth', 1.8);
 ylabel('TTFT (ms)', 'FontWeight', 'bold');
 grid on; box on; xlim([min(t), max(t)]);
-yl = ylim; ylim([0, max(yl(2), target_ttft_val * 1.3)]);
+yl = ylim; ylim([0, max(yl(2), nanmax(target_ref) * 1.3)]);
 for k = 1:numel(step_times)
-    xline(step_times(k), '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
+    xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1);
 end
+for k = 1:numel(tgt_times)
+    xline(tgt_times(k), '-', 'Color', [0.15 0.15 0.15], 'LineWidth', 2);
+end
+legend('Measured TTFT', 'Target', 'Location', 'northwest');
 
-%% Panel 3 — Control input (dispatch delay or admission fraction)
+%% Panel 3 — Control input
 ax3 = nexttile;
-% Use whichever signal was recorded
 if any(~isnan(dispatch_delay))
     plot(t, dispatch_delay, 'Color', [0.13 0.63 0.13], 'LineWidth', 1.4);
     ylabel('Dispatch Delay (ms)', 'FontWeight', 'bold');
@@ -325,20 +381,32 @@ else
 end
 grid on; box on; xlim([min(t), max(t)]);
 for k = 1:numel(step_times)
-    xline(step_times(k), '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
+    xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1);
+end
+for k = 1:numel(tgt_times)
+    xline(tgt_times(k), '-', 'Color', [0.15 0.15 0.15], 'LineWidth', 2);
 end
 
-%% Panel 4 — GPU power
+%% Panel 4 — GPU utilization
 ax4 = nexttile;
-plot(t, gpu_power, 'Color', [0.8 0.4 0.1], 'LineWidth', 1.4);
-ylabel('GPU Power (W)', 'FontWeight', 'bold');
+if any(~isnan(gpu_util))
+    plot(t, gpu_util, 'Color', [0.8 0.4 0.1], 'LineWidth', 1.4);
+    ylabel('GPU Util (%)', 'FontWeight', 'bold');
+    ylim([0, 105]);
+else
+    plot(t, gpu_power, 'Color', [0.8 0.4 0.1], 'LineWidth', 1.4);
+    ylabel('GPU Power (W)', 'FontWeight', 'bold');
+end
 xlabel('Elapsed time (s)', 'FontWeight', 'bold');
 grid on; box on; xlim([min(t), max(t)]);
 for k = 1:numel(step_times)
-    xline(step_times(k), '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
+    xline(step_times(k), '--', 'Color', [0.6 0.6 0.6], 'LineWidth', 1);
+end
+for k = 1:numel(tgt_times)
+    xline(tgt_times(k), '-', 'Color', [0.15 0.15 0.15], 'LineWidth', 2);
 end
 
-%% Link x-axes so zoom/pan is synchronised
+%% Link x-axes
 linkaxes([ax1, ax2, ax3, ax4], 'x');
 
 %% Save
@@ -399,7 +467,8 @@ for col = 1:n
         if isfield(raw(i),'measured_ttft_ms') && ~isempty(raw(i).measured_ttft_ms), fv(i)=raw(i).measured_ttft_ms; end
         if isfield(raw(i),'dispatch_delay_ms') && ~isempty(raw(i).dispatch_delay_ms), cv(i)=raw(i).dispatch_delay_ms; end
         if isfield(raw(i),'admission_fraction') && ~isempty(raw(i).admission_fraction) && isnan(cv(i)), cv(i)=raw(i).admission_fraction; end
-        if isfield(raw(i),'gpu_power_w') && ~isempty(raw(i).gpu_power_w), pv(i)=raw(i).gpu_power_w; end
+        if isfield(raw(i),'gpu_util_percent') && ~isempty(raw(i).gpu_util_percent), pv(i)=raw(i).gpu_util_percent;
+        elseif isfield(raw(i),'gpu_power_w') && ~isempty(raw(i).gpu_power_w), pv(i)=raw(i).gpu_power_w; end
         if isfield(raw(i),'phase'), phc{{i}}=raw(i).phase; else phc{{i}}=''; end
     end
     all_t{{col}}      = tv;
@@ -459,12 +528,12 @@ for col = 1:n
     if col==1, ylabel(all_ctrlabel{{col}},'FontWeight','bold'); end
     for k=1:numel(stv), xline(stv(k),'--','Color',[.5 .5 .5],'LineWidth',1); end
 
-    %% Row 4: Power
+    %% Row 4: GPU utilization %
     ax_all(4,col) = nexttile(3*n+col);
     plot(tv, pv, 'Color',[0.8 0.4 0.1],'LineWidth',1.5);
-    grid on; box on;
+    grid on; box on; ylim([0 105]);
     xlabel('Time (s)');
-    if col==1, ylabel('GPU Power (W)','FontWeight','bold'); end
+    if col==1, ylabel('GPU Util (%)','FontWeight','bold'); end
     for k=1:numel(stv), xline(stv(k),'--','Color',[.5 .5 .5],'LineWidth',1); end
 end
 
@@ -481,43 +550,42 @@ fprintf('Saved comparison figure: %s\\n', fig_path);
 # ── public API ─────────────────────────────────────────────────────────────────
 
 def plot_result(ts: list[dict], result: dict, plots_dir: Path) -> list[Path]:
-    """Write the 3-panel subplot SVG for one target; return list of written paths."""
+    """Write the 4-panel subplot SVG (single or chained targets); return written paths."""
     plots_dir = Path(plots_dir)
     svg = _subplot_figure(ts, result)
-    target = int(result.get("target_ttft_ms", 0))
-    p = plots_dir / f"subplot_target_{target}ms.svg"
+    targets_raw = result.get("target_ttft_ms", 0)
+    if isinstance(targets_raw, list):
+        label = "_".join(str(int(t)) for t in targets_raw) + "ms"
+    else:
+        label = f"{int(targets_raw)}ms"
+    p = plots_dir / f"subplot_{label}.svg"
     p.write_text(svg)
     return [p]
 
 
 def write_matlab_scripts(results_list: list[dict], out_dir: Path) -> list[Path]:
-    """Write per-target and combined MATLAB .m scripts; return written paths."""
+    """Write MATLAB .m script for the merged timeseries; return written paths."""
     out_dir = Path(out_dir)
     paths: list[Path] = []
 
-    entries: list[dict] = []
-    for res in results_list:
-        target = float(res.get("target_ttft_ms", 0))
-        # Each result was saved in a sub-directory named by target
-        ts_rel = f"target_{int(target)}ms/timeseries.json"
-        entries.append({"target_ttft_ms": target, "ts_rel": ts_rel})
+    if not results_list:
+        return paths
 
-        # Per-target script
-        m_code = _matlab_single(
-            ts_path=str(out_dir / ts_rel),
-            target_ttft=target,
-            out_dir=str(out_dir / f"target_{int(target)}ms"),
-        )
-        p = out_dir / f"target_{int(target)}ms" / "view_figure.m"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(m_code)
-        paths.append(p)
+    # With the chained-target design there is exactly one result with a merged
+    # timeseries saved at out_dir/timeseries.json.
+    res = results_list[0]
+    targets_raw = res.get("target_ttft_ms", 300.0)
+    all_targets = targets_raw if isinstance(targets_raw, list) else [float(targets_raw)]
+    first_target = all_targets[0]
 
-    if len(results_list) > 1:
-        m_code = _matlab_multi(entries, str(out_dir))
-        p = out_dir / "view_comparison.m"
-        p.write_text(m_code)
-        paths.append(p)
+    m_code = _matlab_single(
+        ts_path=str(out_dir / "timeseries.json"),
+        target_ttft=first_target,
+        out_dir=str(out_dir),
+    )
+    p = out_dir / "view_figure.m"
+    p.write_text(m_code)
+    paths.append(p)
 
     return paths
 

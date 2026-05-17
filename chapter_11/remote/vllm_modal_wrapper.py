@@ -757,18 +757,12 @@ def run_internal_load_step(body):
     results are returned together so the client makes only one HTTP call.
     """
     targets_raw = body.get("target_ttft_ms", 300.0)
-    if isinstance(targets_raw, list) and len(targets_raw) > 1:
-        results = []
-        for t in targets_raw:
-            b = dict(body)
-            b["target_ttft_ms"] = float(t)
-            r = run_internal_load_step(b)
-            results.append(r)
-        return {"status": "ok", "results": results, "multi_target": True}
+    all_targets = ([float(x) for x in targets_raw]
+                   if isinstance(targets_raw, list) else [float(targets_raw)])
 
-    # Single-target path.
     actuator = str(body.get("actuator", "token_budget"))
-    target_ttft = float(body.get("target_ttft_ms", 300.0))
+    # Mutable cell so feedback_loop sees target updates across target transitions.
+    target_ttft = [all_targets[0]]
     load_steps = list(body.get("load_steps", [
         {"qps": 2.0, "duration_s": 90.0},
         {"qps": 4.0, "duration_s": 90.0},
@@ -820,12 +814,18 @@ def run_internal_load_step(body):
             power_samples.append(sample)
             time.sleep(float(body.get("metric_period_s", 0.5)))
 
+    _last_alive_check = [0.0]
+    _alive_interval_s = 5.0  # don't block fast feedback loops with HTTP health checks
+
     def feedback_loop():
         while not stop.is_set():
-            if not check_alive():
-                log("load_step: vLLM backend down — stopping")
-                stop.set()
-                return
+            now_alive = time.perf_counter()
+            if now_alive - _last_alive_check[0] >= _alive_interval_s:
+                if not check_alive():
+                    log("load_step: vLLM backend down — stopping")
+                    stop.set()
+                    return
+                _last_alive_check[0] = now_alive
             with lock:
                 window = list(recent_ttfts)
                 cur_phase = phase_label[0]
@@ -834,18 +834,18 @@ def run_internal_load_step(body):
 
             if cur_phase != "warmup" and measured is not None:
                 if actuator == "dispatch_delay":
-                    e_norm = (target_ttft - measured) / max(target_ttft, 1.0)
+                    e_norm = (target_ttft[0] - measured) / max(target_ttft[0], 1.0)
                     at_floor = dispatch_delay_ms[0] <= 1e-6
                     at_ceil = dispatch_delay_ms[0] >= max_delay_ms - 1e-6
                     should_integrate = not (at_floor and e_norm < 0) and not (at_ceil and e_norm > 0)
                     if should_integrate:
                         delay_xi[0] = _clamp(delay_xi[0] + e_norm * feedback_period_s, -20.0, 20.0)
-                    delta_ms = (kp * e_norm + ki * delay_xi[0]) * target_ttft
+                    delta_ms = (kp * e_norm + ki * delay_xi[0]) * target_ttft[0]
                     dispatch_delay_ms[0] = _clamp(dispatch_delay_ms[0] + delta_ms, 0.0, max_delay_ms)
                 else:
                     write_scheduler_control({
                         "mode": "ttft",
-                        "target_ttft_ms": target_ttft,
+                        "target_ttft_ms": target_ttft[0],
                         "measured_ttft_ms": measured,
                         "enabled": True,
                         "kp": kp,
@@ -863,7 +863,7 @@ def run_internal_load_step(body):
                 "t": round(now - t_start, 3),
                 "phase": cur_phase,
                 "offered_qps": cur_qps,
-                "target_ttft_ms": target_ttft,
+                "target_ttft_ms": target_ttft[0],
                 "measured_ttft_ms": round(measured, 2) if measured is not None else None,
                 "actuator": actuator,
                 "dispatch_delay_ms": round(dispatch_delay_ms[0], 2),
@@ -872,6 +872,7 @@ def run_internal_load_step(body):
                 "token_cap": sched.get("scheduler_token_cap"),
                 "xi": sched.get("scheduler_xi"),
                 "gpu_power_w": gpu.get("gpu_power_w"),
+                "gpu_util_percent": gpu.get("gpu_util_percent"),
             })
             time.sleep(feedback_period_s)
 
@@ -998,7 +999,7 @@ def run_internal_load_step(body):
     if actuator == "token_budget":
         write_scheduler_control({
             "mode": "ttft",
-            "target_ttft_ms": target_ttft,
+            "target_ttft_ms": target_ttft[0],
             "measured_ttft_ms": None,
             "enabled": True,
             "kp": kp,
@@ -1009,16 +1010,23 @@ def run_internal_load_step(body):
             "timestamp": datetime.now().isoformat(),
         })
 
-    # Phase 2: closed-loop load steps (measured).
-    for i, step in enumerate(load_steps):
-        qps = float(step["qps"])
-        dur = float(step["duration_s"])
-        label = f"step_{i}_qps{qps:.0f}"
-        log(f"load_step: {label} qps={qps} dur={dur}s")
+    # Phase 2: closed-loop load steps — cycle through all targets sequentially.
+    # Controller state (delay_ms, delay_xi) carries over across target transitions
+    # so the timeseries shows the live re-settling transient.
+    for tgt_idx, tgt in enumerate(all_targets):
         with lock:
-            phase_label[0] = label
-            offered_qps[0] = qps
-        dispatch_phase(qps, dur, measure=True)
+            target_ttft[0] = tgt
+            recent_ttfts.clear()   # flush stale window so new target sees fresh measurements
+        log(f"load_step: → target {tgt:.0f}ms ({tgt_idx + 1}/{len(all_targets)})")
+        for i, step in enumerate(load_steps):
+            qps = float(step["qps"])
+            dur = float(step["duration_s"])
+            label = f"step_{i}_qps{qps:.0f}_t{int(tgt)}ms"
+            log(f"load_step: {label} qps={qps} dur={dur}s")
+            with lock:
+                phase_label[0] = label
+                offered_qps[0] = qps
+            dispatch_phase(qps, dur, measure=True)
 
     stop.set()
     feedback_thread.join(timeout=5)
@@ -1037,23 +1045,25 @@ def run_internal_load_step(body):
     energy = integrate_power(power_samples)
 
     step_summaries = []
-    for i, step in enumerate(load_steps):
-        label = f"step_{i}_qps{float(step['qps']):.0f}"
-        step_ok = [r for r in records if r.get("phase") == label and r["status"] == "ok"]
-        step_ttfts = [r["ttft_ms"] for r in step_ok if r["ttft_ms"] is not None]
-        step_summaries.append({
-            "step": i,
-            "qps": step["qps"],
-            "duration_s": step["duration_s"],
-            "requests_ok": len(step_ok),
-            "ttft_mean_ms": statistics.mean(step_ttfts) if step_ttfts else None,
-            "ttft_p95_ms": percentile(step_ttfts, 95),
-            "ttft_stdev_ms": statistics.stdev(step_ttfts) if len(step_ttfts) > 1 else None,
-        })
+    for tgt in all_targets:
+        for i, step in enumerate(load_steps):
+            label = f"step_{i}_qps{float(step['qps']):.0f}_t{int(tgt)}ms"
+            step_ok = [r for r in records if r.get("phase") == label and r["status"] == "ok"]
+            step_ttfts = [r["ttft_ms"] for r in step_ok if r["ttft_ms"] is not None]
+            step_summaries.append({
+                "target_ttft_ms": tgt,
+                "step": i,
+                "qps": step["qps"],
+                "duration_s": step["duration_s"],
+                "requests_ok": len(step_ok),
+                "ttft_mean_ms": statistics.mean(step_ttfts) if step_ttfts else None,
+                "ttft_p95_ms": percentile(step_ttfts, 95),
+                "ttft_stdev_ms": statistics.stdev(step_ttfts) if len(step_ttfts) > 1 else None,
+            })
 
     return {
         "status": "ok",
-        "target_ttft_ms": target_ttft,
+        "target_ttft_ms": all_targets,
         "actuator": actuator,
         "warmup_qps": warmup_qps,
         "warmup_s": warmup_s,
