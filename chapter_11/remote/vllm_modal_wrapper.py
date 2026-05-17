@@ -667,18 +667,22 @@ def run_internal_ttft_sweep(body):
 
 
 def run_internal_load_step(body):
-    """Disturbance rejection: fixed TTFT target with stepping offered load.
+    """Disturbance rejection: fixed TTFT target(s) with stepping offered load.
 
-    Experiment phases:
-      1. Warmup (open-loop, fixed fraction): builds queue steady-state so the
-         token-budget actuator has authority before the PI takes over.
-      2. Closed-loop load steps: PI adjusts admission_fraction (token_budget)
-         or dispatch_delay_ms (dispatch_delay) as QPS changes at step boundaries.
-
-    This demonstrates the same reconvergence story as Chapters 2b-9:
-      load↑ → TTFT spikes → controller increases throughput (raises fraction)
-              → queue drains → TTFT returns to target.
+    When target_ttft_ms is a list, each target is run sequentially and all
+    results are returned together so the client makes only one HTTP call.
     """
+    targets_raw = body.get("target_ttft_ms", 300.0)
+    if isinstance(targets_raw, list) and len(targets_raw) > 1:
+        results = []
+        for t in targets_raw:
+            b = dict(body)
+            b["target_ttft_ms"] = float(t)
+            r = run_internal_load_step(b)
+            results.append(r)
+        return {"status": "ok", "results": results, "multi_target": True}
+
+    # Single-target path.
     actuator = str(body.get("actuator", "token_budget"))
     target_ttft = float(body.get("target_ttft_ms", 300.0))
     load_steps = list(body.get("load_steps", [
