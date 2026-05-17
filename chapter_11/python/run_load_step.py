@@ -75,7 +75,7 @@ def main() -> None:
     ap.add_argument("--fraction-min", type=float, default=0.05)
     ap.add_argument("--fraction-max", type=float, default=1.0)
     ap.add_argument("--max-delay-ms", type=float, default=2000.0)
-    ap.add_argument("--ttft-window", type=int, default=10)
+    ap.add_argument("--ttft-window", type=int, default=3)
     ap.add_argument("--feedback-period-s", type=float, default=0.1)
     # Request shape
     ap.add_argument("--max-tokens", type=int, default=32)
